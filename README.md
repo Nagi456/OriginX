@@ -18,4 +18,4 @@ This repository is updated with every release.
 The name "OriginX" and the OriginX logo are not licensed under the GPL. If you
 distribute a modified version, give it a different name and logo, and do not
 present it as the official OriginX. The only official downloads are on
-https://originx.pages.dev.
+https://originx.originx-client.workers.dev.
