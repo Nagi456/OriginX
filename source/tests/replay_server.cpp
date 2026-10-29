@@ -87,7 +87,7 @@ int main()
     }
 
     // A recording: setup packets, StartGame (runtime id 7), a chunk, the mark, then movement and a chat line.
-    const char* path = "/tmp/claude-replay-server-test.mcrec";
+    const char* path = "/tmp/myclient-replay-server-test.mcrec";
     const std::string settings = Packet(Id::NetworkSettings, std::string("\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00", 10));
     const std::string info = Packet(Id::PacksInfo, "INFO"), stack = Packet(Id::PackStack, "STACK");
     Out sg; sg.VarU64(14); sg.VarU64(7); sg.Raw("rest-of-startgame");

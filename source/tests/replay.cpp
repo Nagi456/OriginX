@@ -4,7 +4,7 @@
 int main()
 {
     using namespace MyClientReplay;
-    const char* path = "/tmp/claude-replay-test.mcrec";
+    const char* path = "/tmp/myclient-replay-test.mcrec";
     {
         Writer w;
         assert(w.Open(path, 1700000000000ull, 1000, "26.51.1"));
