@@ -1,0 +1,104 @@
+# MyClientData.dll をGitHubのWindows環境でビルドします。
+# 使い方: Actionsタブ →「build-dll」→「Run workflow」。完了後、Artifactsを取得します。
+# publish を true にすると、ランチャーの自動更新用リリースも公開します（revision / sequence は前回より大きくすること）:
+#   1. myclient-26.51.1-r<revision> にDLL等を公開  2. client-catalog に catalog.json を最後に公開
+#   3. 新しい catalog.json（source/launcher と同梱用ルート）と SHA256SUMS.txt を実行したブランチへコミット
+name: build-dll
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the update release and catalog"
+        type: boolean
+        default: false
+      revision:
+        description: "DLL package revision (myclient-26.51.1-r<N>), used when publishing"
+        default: "13"
+      sequence:
+        description: "catalog.json sequence, used when publishing"
+        default: "36"
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        game: ["26.51.1"]   # only the current game version is supported for now
+    defaults:
+      run:
+        working-directory: source
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GAME: ${{ matrix.game }}
+      REVISION: ${{ inputs.revision }}
+      SEQUENCE: ${{ inputs.sequence }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Add LLVM to PATH
+        shell: bash
+        run: echo "C:\Program Files\LLVM\bin" >> "$GITHUB_PATH"
+      - name: Build MyClientData.dll
+        run: python tools/build_client.py --game ${{ matrix.game }}
+      - name: Collect output
+        shell: bash
+        run: |
+          d=build/client
+          mkdir -p out/mods/MyClientData
+          cp "$d/MyClientData.dll" "$d/manifest.json" out/mods/MyClientData/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MyClientData-${{ matrix.game }}
+          path: source/out
+      - name: Package release assets and catalog
+        if: inputs.publish
+        shell: bash
+        run: |
+          python tools/package_update.py --sdk-root build/client-sdk --output "$RUNNER_TEMP/release" \
+            --catalog launcher/catalog.json --revision "$REVISION" --sequence "$SEQUENCE" --game-version "$GAME"
+      - name: Publish DLL release
+        if: inputs.publish
+        shell: bash
+        run: |
+          tag="myclient-$GAME-r$REVISION"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; increment revision." >&2; exit 1
+          fi
+          gh release create "$tag" "$RUNNER_TEMP/release/$tag"/* --target "$GITHUB_SHA" \
+            --title "MyClient $GAME r$REVISION" --notes "MyClientData for Minecraft $GAME (revision $REVISION)." --latest=false
+      - name: Publish catalog (last)
+        if: inputs.publish
+        shell: bash
+        run: |
+          if ! gh release view client-catalog >/dev/null 2>&1; then
+            gh release create client-catalog --target "$GITHUB_SHA" --title "MyClient update catalog" \
+              --notes "Update list read by MyClientLauncher. Replaced on every release." --latest=false
+          fi
+          gh release upload client-catalog "$RUNNER_TEMP/release/catalog.json" --clobber
+      - name: Commit catalog back to the branch
+        if: inputs.publish
+        shell: bash
+        run: |
+          cp launcher/catalog.json ../catalog.json
+          cd ..
+          for f in catalog.json source/launcher/catalog.json; do
+            h=$(sha256sum "$f" | cut -d' ' -f1)
+            sed -i -E "s#^[0-9a-f]{64}  $f\$#$h  $f#" SHA256SUMS.txt
+          done
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          git add catalog.json source/launcher/catalog.json SHA256SUMS.txt
+          git commit -m "Publish $GAME r$REVISION (catalog sequence $SEQUENCE)"
+          git push origin "HEAD:$GITHUB_REF_NAME"
+      - uses: actions/upload-artifact@v4
+        if: inputs.publish
+        with:
+          name: release-assets-r${{ inputs.revision }}
+          path: ${{ runner.temp }}/release

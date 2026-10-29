@@ -1,0 +1,160 @@
+{
+  "schemaVersion": 1,
+  "gameVersion": "1.26.51.01",
+  "loaderVersion": "26.51.6",
+  "assets": [
+    {
+      "name": "LeviLamina",
+      "version": "26.51.6",
+      "sourceManifest": "https://raw.githubusercontent.com/LiteLDev/LeviLamina/v26.51.6/tooth.json",
+      "sourceManifestSha256": "5c2aace675dcce05cd31601eba581e80dc35cc9a74a76df98e2ad5b93a97ac27",
+      "url": "https://github.com/LiteLDev/LeviLamina/releases/download/v26.51.6/levilamina-v26.51.6-client-release-windows-x64.zip",
+      "cacheFile": "LeviLamina-26.51.6.zip",
+      "bytes": 11786423,
+      "sha256": "584b3057fb1642c298381888212c3e46c9651733a94df62e128ff249787361a7",
+      "archivePrefix": "",
+      "placements": [
+        {
+          "type": "dir",
+          "src": "LeviLamina/",
+          "dest": "mods/LeviLamina/"
+        }
+      ],
+      "installedFiles": {
+        "mods/LeviLamina/manifest.json": "1730a27366cb8ba1a2f01e89da914610a9331f5007d135df43c68e89462c2156",
+        "mods/LeviLamina/LeviLamina.pdb": "17af880e6b25f712a1b72ac6f303f4534419cf386a4a5ee8f93c3611f933fe20",
+        "mods/LeviLamina/LeviLamina.dll": "614cd905f3d4c63c921a37c4e644dae99f2eaba5321b2e12e59cc13303e02407"
+      }
+    },
+    {
+      "name": "PreLoader",
+      "version": "1.16.3",
+      "sourceManifest": "https://raw.githubusercontent.com/LiteLDev/PreLoader/v1.16.3/tooth.json",
+      "sourceManifestSha256": "a4b737545104deb445f16f895b886ccb297060e4b352368cb0412f7f46437f27",
+      "url": "https://github.com/LiteLDev/PreLoader/releases/download/v1.16.3/preloader-v1.16.3-windows-x64.zip",
+      "cacheFile": "PreLoader-1.16.3.zip",
+      "bytes": 4167010,
+      "sha256": "31dc9419d4a8c1c382d6c2629243757a28141c878b636d17b92b1b2fd0c3af1a",
+      "archivePrefix": "",
+      "placements": [
+        {
+          "type": "file",
+          "src": "bin/PreLoader.dll",
+          "dest": "PreLoader.dll"
+        }
+      ],
+      "installedFiles": {
+        "PreLoader.dll": "1b647d6d35e0da88e25209917d5bd5852c5afa3bd64ebcc7c987ab32ea42705f"
+      }
+    },
+    {
+      "name": "PeEditor",
+      "version": "3.9.1",
+      "sourceManifest": "https://raw.githubusercontent.com/LiteLDev/PeEditor/v3.9.1/tooth.json",
+      "sourceManifestSha256": "757abbe89316f4ce36dccc0b257315e31def8838da516d4a4e2132f3314d63c4",
+      "url": "https://github.com/LiteLDev/PeEditor/releases/download/v3.9.1/peeditor-windows-x64.zip",
+      "cacheFile": "PeEditor-3.9.1.zip",
+      "bytes": 1352725,
+      "sha256": "54fb57d99253eed28c5a4fdfc034e746f04c1d1786745aa5ecd9e4ab35d2b4fd",
+      "archivePrefix": "",
+      "placements": [
+        {
+          "type": "file",
+          "src": "PeEditor.exe",
+          "dest": "PeEditor.exe"
+        }
+      ],
+      "installedFiles": {
+        "PeEditor.exe": "b4688c3d76193332626dca3e5c901f92124320e69db226748d4cf673fa7a3efb"
+      }
+    },
+    {
+      "name": "bedrock-runtime-data",
+      "version": "26.51.1-client.7",
+      "sourceManifest": "https://raw.githubusercontent.com/LiteLDev/bedrock-runtime-data/v26.51.1-client.7/tooth.json",
+      "sourceManifestSha256": "8dbda5e494775404664ff940cb1391672e3800361e3785b42a5a0c4ee4c4b114",
+      "url": "https://github.com/LiteLDev/bedrock-runtime-data/releases/download/v26.51.1-client.7/bedrock-runtime-data-v26.51.1-client.7-windows-x64.zip",
+      "cacheFile": "bedrock-runtime-data-26.51.1-client.7.zip",
+      "bytes": 40778422,
+      "sha256": "95ed058e09e162e65ebd1970dceb506c96f29f59983332b183b8fbb7dc6fd50c",
+      "archivePrefix": "",
+      "placements": [
+        {
+          "type": "file",
+          "src": "bedrock_runtime_data",
+          "dest": "bedrock_runtime_data"
+        }
+      ],
+      "installedFiles": {
+        "bedrock_runtime_data": "74deb38b52e72bf1e78836177927bd52e034044f78e3b897e1ab1b07db951077"
+      }
+    },
+    {
+      "name": "CrashLogger",
+      "version": "1.3.3",
+      "sourceManifest": "https://raw.githubusercontent.com/LiteLDev/CrashLogger/v1.3.3/tooth.json",
+      "sourceManifestSha256": "54247f3bc0c484c6d50170d95a6765d471cb520135284e2835a0a502d9c00257",
+      "url": "https://github.com/LiteLDev/CrashLogger/releases/download/v1.3.3/CrashLogger-windows-x64.zip",
+      "cacheFile": "CrashLogger-1.3.3.zip",
+      "bytes": 828867,
+      "sha256": "ade3fc37affbc187020fd9ecb31883a70ab1f3f8238e447a43174343deb33156",
+      "archivePrefix": "",
+      "placements": [
+        {
+          "type": "file",
+          "src": "CrashLogger.exe",
+          "dest": "mods/LeviLamina/CrashLogger.exe"
+        }
+      ],
+      "installedFiles": {
+        "mods/LeviLamina/CrashLogger.exe": "915118bf3bb60fa99f5079410759b90e883e536b1dd6b16e47f11d4101cbe050"
+      }
+    },
+    {
+      "name": "levilamina-loc",
+      "version": "1.6.4",
+      "sourceManifest": "https://raw.githubusercontent.com/LiteLDev/levilamina-loc/v1.6.4/tooth.json",
+      "sourceManifestSha256": "808d770f129470d4d56b9540417921c1929ac63157e82b24ed744e80b691981a",
+      "url": "https://codeload.github.com/LiteLDev/levilamina-loc/zip/refs/tags/v1.6.4",
+      "cacheFile": "levilamina-loc-1.6.4.zip",
+      "bytes": 52103,
+      "sha256": "2ef188874a14154129b5997f3bd6cfc740f501a0d16c347906191f1236e42067",
+      "archivePrefix": "levilamina-loc-1.6.4/",
+      "placements": [
+        {
+          "type": "dir",
+          "src": "lang/",
+          "dest": "mods/LeviLamina/lang/"
+        }
+      ],
+      "installedFiles": {
+        "mods/LeviLamina/lang/de.json": "f57a96e0173e29af8d7523c2da28c4b5abd1a5080729e73ce0dd5b379d684f2b",
+        "mods/LeviLamina/lang/en.json": "1d12a2531712112651046c32da6c0ab255e8101108d8b7d24faabe8320d6a8e0",
+        "mods/LeviLamina/lang/fr.json": "e3d0d4f5206c4134dbe86b759898cffc9501161e59f04e94765d0e52b9fdd7f2",
+        "mods/LeviLamina/lang/id.json": "9ebef32c8cb1055de5b23457a06c30e770d9e68c9f45a621c4091fbe3ecad6a0",
+        "mods/LeviLamina/lang/it.json": "9353c9f05fc7dc24e6cc37752a12f98bf05a5bf67c2bda814badd35907da34ba",
+        "mods/LeviLamina/lang/ja.json": "787aeffedbe52d626755f1ce08aada9286b378d0ca41f606feecb1daea0dfcd6",
+        "mods/LeviLamina/lang/ko.json": "09f266e68b6a6bfd753487469115148ea5f8037dc23f6aad226891cc64d17255",
+        "mods/LeviLamina/lang/pt_BR.json": "34e31488e2e2e2f2e9ff8433fec52d3224b74c04fb96bcb4b75378ab35dc96f2",
+        "mods/LeviLamina/lang/ru.json": "ff6f6db4004339eb06180f0a11b32a09948f2e5940c1c945a8379392563a8796",
+        "mods/LeviLamina/lang/th.json": "c4f4cda337fdee76de9a19a541cfbe0d2859262b1ba5ad5aa9471727063bd677",
+        "mods/LeviLamina/lang/tr.json": "db51bf3cd06e59bfb712c3d02122e96c8074b0b4f552f2cd8f367d1e076ba6f4",
+        "mods/LeviLamina/lang/uk.json": "524e4dcedb81851f8192b91a10cc21a6db748169b7c279d6c2bd26ca6c080373",
+        "mods/LeviLamina/lang/vi.json": "cd619aa9073f0ba2eb528b0f38933c2804f5c51e63d0f146c898f6bb7af3c3b9",
+        "mods/LeviLamina/lang/zh_CN.json": "7c4de969cb554304ad0c80be5e97ea4ecdc44389c6227f439da8a3d89fbeeeb7",
+        "mods/LeviLamina/lang/zh_TW.json": "d6adc09d7ad1431d3768ff929b26279603170761733e0f1aa0932b3bb5d77109"
+      }
+    }
+  ],
+  "xmlDependency": {
+    "name": "tinyxml2",
+    "version": "11.0.0",
+    "url": "https://codeload.github.com/leethomason/tinyxml2/tar.gz/refs/tags/11.0.0",
+    "sha256": "5556deb5081fb246ee92afae73efd943c889cef0cafea92b0b82422d6a18f289",
+    "files": {
+      "tinyxml2.h": "0f3c6e5a91b6d65caca3cc7239926455f21e488cff80ac3d27c74f5262fd2602",
+      "tinyxml2.cpp": "95f64e4cb06c9e147d5b12e8860c88898944858dfbc38fed92ebf918f1436554",
+      "LICENSE.txt": "9332252e9b9e46db8285d4a3f0bf25f139bf1dca6781b956d57f2302efca6432"
+    }
+  }
+}

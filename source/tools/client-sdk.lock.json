@@ -1,0 +1,152 @@
+{
+  "schemaVersion": 1,
+  "gameVersion": "1.26.51",
+  "loaderVersion": "26.51.6",
+  "sdk": {
+    "url": "https://codeload.github.com/LiteLDev/LeviLamina/tar.gz/32fcaa02baa38371b705358801c7d185c284233e",
+    "sha256": "cffe0669dda072e4a16e7476f6b80834e602944052e9b5203be5e498de07fef4",
+    "commit": "32fcaa02baa38371b705358801c7d185c284233e"
+  },
+  "runtime": {
+    "url": "https://github.com/LiteLDev/LeviLamina/releases/download/v26.51.6/levilamina-v26.51.6-client-release-windows-x64.zip",
+    "sha256": "584b3057fb1642c298381888212c3e46c9651733a94df62e128ff249787361a7"
+  },
+  "headers": [
+    {
+      "name": "entt",
+      "repo": "skypjack/entt",
+      "ref": "v4.0.0",
+      "url": "https://codeload.github.com/skypjack/entt/tar.gz/v4.0.0",
+      "sha256": "32a2ff2c72cb047dfd57306006ef238820b70da7c6ce4e7e8a507ac63365212e",
+      "include": "src"
+    },
+    {
+      "name": "glm",
+      "repo": "g-truc/glm",
+      "ref": "1.0.1",
+      "url": "https://codeload.github.com/g-truc/glm/tar.gz/1.0.1",
+      "sha256": "9f3174561fd26904b23f0db5e560971cbf9b3cbda0b280f04d5c379d03bf234c",
+      "include": "."
+    },
+    {
+      "name": "gsl",
+      "repo": "microsoft/GSL",
+      "ref": "v4.2.0",
+      "url": "https://codeload.github.com/microsoft/GSL/tar.gz/v4.2.0",
+      "sha256": "2c717545a073649126cb99ebd493fa2ae23120077968795d2c69cbab821e4ac6",
+      "include": "include"
+    },
+    {
+      "name": "leveldb",
+      "repo": "google/leveldb",
+      "ref": "1.23",
+      "url": "https://codeload.github.com/google/leveldb/tar.gz/1.23",
+      "sha256": "9a37f8a6174f09bd622bc723b55881dc541cd50747cbd08831c2a82d620f6d76",
+      "include": "include"
+    },
+    {
+      "name": "rapidjson",
+      "repo": "Tencent/rapidjson",
+      "ref": "24b5e7a8b27f42fa16b96fc70aade9106cf7102f",
+      "url": "https://codeload.github.com/Tencent/rapidjson/tar.gz/24b5e7a8b27f42fa16b96fc70aade9106cf7102f",
+      "sha256": "2d2601a82d2d3b7e143a3c8d43ef616671391034bc46891a9816b79cf2d3e7a8",
+      "include": "include"
+    },
+    {
+      "name": "type_safe",
+      "repo": "foonathan/type_safe",
+      "ref": "v0.2.4",
+      "url": "https://codeload.github.com/foonathan/type_safe/tar.gz/v0.2.4",
+      "sha256": "a631d03c18c65726b3d1b7d41ac5806e9121367afe10dd2f408a2d75e144b734",
+      "include": "include"
+    },
+    {
+      "name": "debug_assert",
+      "repo": "foonathan/debug_assert",
+      "ref": "v1.3.3",
+      "url": "https://codeload.github.com/foonathan/debug_assert/tar.gz/v1.3.3",
+      "sha256": "bb76b03ab49b2e8dde2a3d099d9e1b8a7f23b399922895af3e40be98335cfc1b",
+      "include": "."
+    },
+    {
+      "name": "expected-lite",
+      "repo": "martinmoene/expected-lite",
+      "ref": "f339d2f73730f8fee4412f5e4938717866ecef48",
+      "url": "https://codeload.github.com/martinmoene/expected-lite/tar.gz/f339d2f73730f8fee4412f5e4938717866ecef48",
+      "sha256": "8fe5f192f68b2a5c216316a1abea19e94c49f10c13431fbcd16ba6a611b2231f",
+      "include": "include"
+    },
+    {
+      "name": "fmt",
+      "repo": "fmtlib/fmt",
+      "ref": "11.2.0",
+      "url": "https://codeload.github.com/fmtlib/fmt/tar.gz/11.2.0",
+      "sha256": "bc23066d87ab3168f27cef3e97d545fa63314f5c79df5ea444d41d56f962c6af",
+      "include": "include"
+    },
+    {
+      "name": "concurrentqueue",
+      "repo": "cameron314/concurrentqueue",
+      "ref": "v1.0.4",
+      "url": "https://codeload.github.com/cameron314/concurrentqueue/tar.gz/v1.0.4",
+      "sha256": "87fbc9884d60d0d4bf3462c18f4c0ee0a9311d0519341cac7cbd361c885e5281",
+      "include": "."
+    },
+    {
+      "name": "stb",
+      "repo": "nothings/stb",
+      "ref": "f0569113c93ad095470c54bf34a17b36646bbbb5",
+      "url": "https://codeload.github.com/nothings/stb/tar.gz/f0569113c93ad095470c54bf34a17b36646bbbb5",
+      "sha256": "4d05c96640ae3a8cbdafdad8d344b50ce610802f78aee80154acdb8e266282e0",
+      "include": "."
+    },
+    {
+      "name": "parallel-hashmap",
+      "repo": "greg7mdp/parallel-hashmap",
+      "ref": "v2.0.0",
+      "url": "https://codeload.github.com/greg7mdp/parallel-hashmap/tar.gz/v2.0.0",
+      "sha256": "4f462f51a3468166ea4cf87c80e001dc1999093264cf55cbda3492ca39a7730b",
+      "include": "."
+    },
+    {
+      "name": "json",
+      "repo": "nlohmann/json",
+      "ref": "v3.12.0",
+      "url": "https://codeload.github.com/nlohmann/json/tar.gz/v3.12.0",
+      "sha256": "4b92eb0c06d10683f7447ce9406cb97cd4b453be18d7279320f7b2f025c10187",
+      "include": "include"
+    },
+    {
+      "name": "pcg",
+      "repo": "imneme/pcg-cpp",
+      "ref": "428802d1a5634f96bcd0705fab379ff0113bcf13",
+      "url": "https://codeload.github.com/imneme/pcg-cpp/tar.gz/428802d1a5634f96bcd0705fab379ff0113bcf13",
+      "sha256": "79f23706ed0cbc1bb57ea35d50d0abed66898b8f7b0bcf2aaecdfd234863b060",
+      "include": "include"
+    },
+    {
+      "name": "pfr",
+      "repo": "boostorg/pfr",
+      "ref": "294a4976bd04829dd204aaf9e9fd30338a5d3199",
+      "url": "https://codeload.github.com/boostorg/pfr/tar.gz/294a4976bd04829dd204aaf9e9fd30338a5d3199",
+      "sha256": "26c0999c746ad9da2426b7fcbfc1d06582392c8adbfbf42c3151cc54bbcde7cd",
+      "include": "include"
+    },
+    {
+      "name": "magic_enum",
+      "repo": "Neargye/magic_enum",
+      "ref": "v0.9.7",
+      "url": "https://codeload.github.com/Neargye/magic_enum/tar.gz/v0.9.7",
+      "sha256": "b403d3dad4ef542fdc3024fa37d3a6cedb4ad33c72e31b6d9bab89dcaf69edf7",
+      "include": "include"
+    },
+    {
+      "name": "ctre",
+      "repo": "hanickadot/compile-time-regular-expressions",
+      "ref": "v3.8.1",
+      "url": "https://codeload.github.com/hanickadot/compile-time-regular-expressions/tar.gz/v3.8.1",
+      "sha256": "0ce8760d43b3b97b43364cd32ee663e5c8b8b4bfd58e7890042eff6ac52db605",
+      "include": "single-header"
+    }
+  ]
+}

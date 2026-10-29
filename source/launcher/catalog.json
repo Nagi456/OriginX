@@ -1,0 +1,147 @@
+{
+  "schemaVersion": 1,
+  "sequence": 36,
+  "versions": [
+    {
+      "id": "26.51.1",
+      "available": true,
+      "loader": "26.51.6",
+      "revision": 13,
+      "launcherApi": 1,
+      "bridgeAbi": 2,
+      "platform": "gdk-release-x64",
+      "files": {
+        "runtime.lock.json": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/runtime.lock.json",
+          "sha256": "ae3e572046e462d591fcaef87a8471c8730dff8cde25b7f10a2585125b5df3de",
+          "bytes": 7706
+        },
+        "mods/MyClientData/MyClientData.dll": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__MyClientData.dll",
+          "sha256": "1a30189db5f17e982446588aaae6b43dbfb0987d18acd806a506969f0ef43915",
+          "bytes": 386560
+        },
+        "mods/MyClientData/manifest.json": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__manifest.json",
+          "sha256": "92ba5c2d7e8729fd24eaa248e6bd6218edbab21d5bad807d4ecfd03b266ebb9e",
+          "bytes": 274
+        },
+        "mods/MyClientData/THIRD_PARTY_NOTICES.md": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__THIRD_PARTY_NOTICES.md",
+          "sha256": "47a23f5378d5f28925d047f317caaa723e0b363db9904f82cd589362e2ae173a",
+          "bytes": 3340
+        },
+        "mods/MyClientData/licenses/levilamina/COPYING": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__levilamina__COPYING",
+          "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+          "bytes": 35149
+        },
+        "mods/MyClientData/licenses/levilamina/COPYING.LESSER": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__levilamina__COPYING.LESSER",
+          "sha256": "e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118",
+          "bytes": 7652
+        },
+        "mods/MyClientData/licenses/entt/LICENSE": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__entt__LICENSE",
+          "sha256": "73547f6370ee16ea560665329bb62d4e2d8250f41eaa204b47a6c694ca3286ea",
+          "bytes": 1097
+        },
+        "mods/MyClientData/licenses/glm/copying.txt": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__glm__copying.txt",
+          "sha256": "62d2d642c7d054d4fb4c9b42faad617d6c88fcd91e317f8035aa9f277cc159c3",
+          "bytes": 2865
+        },
+        "mods/MyClientData/licenses/gsl/LICENSE": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__gsl__LICENSE",
+          "sha256": "4c21dc82a1c7186ea754fd59d504c00947953a3401fe8e24eaa44109ef8e2555",
+          "bytes": 1157
+        },
+        "mods/MyClientData/licenses/leveldb/LICENSE": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__leveldb__LICENSE",
+          "sha256": "ccc19f1da0798ed666609b65a5b44dd8b3abe6fc08b9c0592eb76e82e174db19",
+          "bytes": 1484
+        },
+        "mods/MyClientData/licenses/rapidjson/license.txt": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__rapidjson__license.txt",
+          "sha256": "a140e5d46fe734a1c78f1a3c3ef207871dd75648be71fdda8e309b23ab8b1f32",
+          "bytes": 5152
+        },
+        "mods/MyClientData/licenses/type_safe/LICENSE": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__type_safe__LICENSE",
+          "sha256": "c9b2c3b9c65bf163d4338d9f56edb0ce0846e91d7b89e1a1e35326abbc8997ae",
+          "bytes": 1078
+        },
+        "mods/MyClientData/licenses/debug_assert/LICENSE": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__debug_assert__LICENSE",
+          "sha256": "195c95c8dc2349255994fe270c623a79b058ede80e0484d3361ca394133e2306",
+          "bytes": 900
+        },
+        "mods/MyClientData/licenses/expected-lite/LICENSE.txt": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__expected-lite__LICENSE.txt",
+          "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566",
+          "bytes": 1338
+        },
+        "mods/MyClientData/licenses/fmt/LICENSE": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__fmt__LICENSE",
+          "sha256": "07580f2a3b35709ce703d523f447b242f6dfec7582a8c0df102c7fa2849375f8",
+          "bytes": 1431
+        },
+        "mods/MyClientData/licenses/concurrentqueue/LICENSE.md": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__concurrentqueue__LICENSE.md",
+          "sha256": "22331571e5e3dbe4c79ad715e23127bdf3beabd75052c953ddabf191ef799e14",
+          "bytes": 3266
+        },
+        "mods/MyClientData/licenses/stb/LICENSE": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__stb__LICENSE",
+          "sha256": "bebfe904b14301657e4e5d655c811d51fd31b97c455b9cc2d8600d6bac6cff63",
+          "bytes": 2510
+        },
+        "mods/MyClientData/licenses/parallel-hashmap/LICENSE": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__parallel-hashmap__LICENSE",
+          "sha256": "aac73b3148f6d1d7111dbca32099f68d26c644c6813ae1e4f05f6579aa2663fe",
+          "bytes": 11360
+        },
+        "mods/MyClientData/licenses/json/LICENSE.MIT": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__json__LICENSE.MIT",
+          "sha256": "46a65cffd1ea955132d95a8dd921640714a8d6b537d2e4e482d31145ae95b603",
+          "bytes": 1076
+        },
+        "mods/MyClientData/licenses/pcg/LICENSE-APACHE.txt": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__pcg__LICENSE-APACHE.txt",
+          "sha256": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1",
+          "bytes": 11357
+        },
+        "mods/MyClientData/licenses/pcg/LICENSE-MIT.txt": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__pcg__LICENSE-MIT.txt",
+          "sha256": "67cce7e631a9068dad37306bd8fbf51753c918bcbd3acaf312b8ecc4707a3dae",
+          "bytes": 1093
+        },
+        "mods/MyClientData/licenses/pcg/LICENSE.spdx": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__pcg__LICENSE.spdx",
+          "sha256": "dd1abad919cce6ed5e5da610787f31b1976d161a32f4005d2033652542522666",
+          "bytes": 210
+        },
+        "mods/MyClientData/licenses/pfr/LICENSE_1_0.txt": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__pfr__LICENSE_1_0.txt",
+          "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566",
+          "bytes": 1338
+        },
+        "mods/MyClientData/licenses/magic_enum/LICENSE": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__magic_enum__LICENSE",
+          "sha256": "bd227b8a5586dc73012262abfc0fc4eb84c2a91ad3f93b3591f8148fe17324d3",
+          "bytes": 1080
+        },
+        "mods/MyClientData/licenses/ctre/LICENSE": {
+          "url": "https://github.com/Nagi456/MyClient/releases/download/myclient-26.51.1-r13/mods__MyClientData__licenses__ctre__LICENSE",
+          "sha256": "9e45e856bedccee9f67254082ca11851d954de2fed7448c4bed19ad9aab99a91",
+          "bytes": 12262
+        }
+      }
+    },
+    {
+      "id": "26.52.3",
+      "available": false,
+      "reason": "この版に対応するLeviLaminaが公開されていないため、現在は起動できません。"
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+# ランチャー MyClientLauncher.exe を、GitHub上でビルドします（MinGW-w64 クロスコンパイル）。
+# std::thread を使うため posix スレッド版の MinGW を使います。
+# 使い方: Actionsタブ →「build-launcher」→「Run workflow」。完了後、Artifactsから MyClientLauncher.exe を取得します。
+name: build-launcher
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64 g++-mingw-w64-x86-64-posix
+      - name: Build MyClientLauncher.exe
+        run: |
+          mkdir -p build
+          x86_64-w64-mingw32-windres -O coff -o build/myclient_res.o myclient.rc
+          # Replacement game bootstrapper (GPLv3, launcher/vendor/gamelaunchhelper), embedded for the version switcher.
+          x86_64-w64-mingw32-windres -i launcher/vendor/gamelaunchhelper/Library.rc -o build/glh_res.o
+          x86_64-w64-mingw32-gcc -O3 -s -Wl,--gc-sections,--exclude-all-symbols,--wrap=memset -shared -nostdlib -e DllMain \
+            launcher/vendor/gamelaunchhelper/Library.c build/glh_res.o -DWIN32_LEAN_AND_MEAN \
+            -lntdll -lkernel32 -luser32 -lwtsapi32 -o build/gamelaunchhelper.dll
+          x86_64-w64-mingw32-windres -O coff -o build/helper_res.o launcher/helper.rc
+          x86_64-w64-mingw32-g++-posix -std=c++17 -O2 -Wall -Wextra -Wno-unknown-pragmas \
+            -DNOMINMAX -D_WIN32_WINNT=0x0601 -static -static-libgcc -static-libstdc++ \
+            -Ilauncher/vendor -I. \
+            launcher/MyClientLauncher.cpp launcher/vendor/tinyxml2/tinyxml2.cpp build/myclient_res.o build/helper_res.o \
+            -o build/MyClientLauncher.exe \
+            -municode -mwindows -luser32 -lgdi32 -lcomdlg32 -lshell32 -lole32 -luuid -lbcrypt -lversion -lwinhttp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MyClientLauncher
+          path: source/build/MyClientLauncher.exe

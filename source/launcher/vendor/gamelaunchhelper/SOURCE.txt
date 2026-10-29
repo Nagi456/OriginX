@@ -1,0 +1,5 @@
+Game Launch Helper (replacement PC Bootstrapper), copied unchanged from
+https://github.com/flarialmc/gamelaunchhelper at commit 7fc59f5755e3b9c9848f881ea6de6c8a276d6bf6.
+The fork is GPLv3 (LICENSE-GPL.md); the original by Aetopia is MIT (LICENSE-MIT.md).
+build-launcher compiles Library.c into gamelaunchhelper.dll and embeds it in MyClientLauncher.exe; after the
+launcher installs a Minecraft version it writes the DLL into the game folder, like Flarial's launcher does.

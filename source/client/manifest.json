@@ -1,0 +1,7 @@
+{
+  "name": "MyClientData",
+  "entry": "MyClientData.dll",
+  "type": "native",
+  "version": "0.5.0",
+  "description": "Arrows, block coordinates, render FPS, armor durability, hold-to-zoom, full bright and Hive party acceptance for MyClient HUD (Minecraft 26.51)."
+}

@@ -1,0 +1,27 @@
+# HUD本体 MyClient.exe を、GitHub上でビルドします（MinGW-w64 クロスコンパイル）。
+# 使い方: Actionsタブ →「build-hud」→「Run workflow」。完了後、Artifactsから MyClient.exe を取得します。
+name: build-hud
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MinGW-w64
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+      - name: Build MyClient.exe
+        run: |
+          mkdir -p build
+          x86_64-w64-mingw32-windres -O coff -o build/myclient_res.o myclient.rc
+          x86_64-w64-mingw32-g++ -std=c++17 -O2 -Wall -Wextra -Wno-unknown-pragmas \
+            -DNOMINMAX -D_WIN32_WINNT=0x0601 -static -static-libgcc -static-libstdc++ \
+            MyClient.cpp MinecraftDataProvider.cpp PingMonitor.cpp ReplayPlayer.cpp build/myclient_res.o -o build/MyClient.exe \
+            -mwindows -luser32 -lgdi32 -lshell32 -lws2_32 -lwinhttp -lwinmm -lole32 -luuid -lwindowscodecs -lmsimg32
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MyClient-hud
+          path: source/build/MyClient.exe
