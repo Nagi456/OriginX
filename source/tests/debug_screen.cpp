@@ -11,6 +11,14 @@ int main()
     // Facing: 0 south, 90 west, 180 / -180 north, -90 east, any number of turns.
     assert(Facing(0).rfind(L"south", 0) == 0 && Facing(90).rfind(L"west", 0) == 0 && Facing(180).rfind(L"north", 0) == 0);
     assert(Facing(-180).rfind(L"north", 0) == 0 && Facing(-90).rfind(L"east", 0) == 0 && Facing(270).rfind(L"east", 0) == 0);
+    // Coordinates: feet = camera - 1.62, floored (negative too), or one decimal; facing on its own line.
+    {
+        const auto c = CoordinateLines(-0.5f, 65.62f, 10.9f, 180, false, true);
+        assert(c.size() == 2 && c[0] == L"X: -1  Y: 64  Z: 10" && c[1] == L"Facing: North (-Z)");
+        const auto d = CoordinateLines(12.34f, 71.62f, -3.25f, -90, true, false);
+        assert(d.size() == 1 && (d[0] == L"X: 12.3  Y: 70.0  Z: -3.2" || d[0] == L"X: 12.3  Y: 70.0  Z: -3.3"));
+        assert(FacingShort(0) == L"South (+Z)" && FacingShort(90) == L"West (-X)" && FacingShort(-90) == L"East (+X)");
+    }
     assert(Facing(720 + 10).rfind(L"south", 0) == 0 && NormalYaw(190) == -170.f);
     Info i;
     i.title = L"T"; i.fpsKnown = true; i.fps = 230.4f;

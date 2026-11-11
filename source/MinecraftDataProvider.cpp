@@ -1,4 +1,5 @@
 #include "MinecraftDataProvider.h"
+#include "GameDataMirror.h"
 #include "BridgeChannel.h"
 #include "FeatureChannel.h"
 #include "PartyChannel.h"
@@ -6,6 +7,7 @@
 #include "ShulkerChannel.h"
 #include "TabListChannel.h"
 #include "SkinChannel.h"
+#include "ChatChannel.h"
 
 namespace MinecraftDataProvider {
 namespace {
@@ -33,6 +35,13 @@ uint32_t skinW = 0, skinH = 0;
 bool skinNoPicture = false;       // the game said: a persona / own-model skin (the default head is shown)
 MyClientSkin::RequestChannel skinRequests;   // the Closet: "wear this skin" (opened when needed)
 uint32_t skinRequestSerial = 0;              // of the last request written (0 = none)
+MyClientJavaChat::Channel javaChat;
+MyClientJavaChat::Snapshot lastJavaChat{};
+MyClientChat::Channel chatRequests;          // Command Hotkeys: "say this" (opened when needed)
+uint32_t chatRequestSerial = 0;
+MyClientItemCount::Channel itemCount;       // Item Counter (opened when needed)
+MyClientChat::Channel replayJoinRequests;    // Replay Mod: "join the replay server" (opened when needed)
+uint32_t replayJoinSerial = 0;
 MyClientParty::Shared partySnapshot{};
 ULONGLONG partyOpenAttempt = 0;
 MyClientFeatures::Telemetry featureSnapshot{};
@@ -113,6 +122,11 @@ void Shutdown()
     tabLists.Close(); tabListSnapshot = {}; tabListOpenAttempt = 0;
     skins.Close(); skinOpenAttempt = 0; skinSerial = 0;
     skinRequests.Close(); skinRequestSerial = 0;
+    javaChat.Close();
+    lastJavaChat = {};
+    chatRequests.Close(); chatRequestSerial = 0;
+    replayJoinRequests.Close(); replayJoinSerial = 0;
+    itemCount.Close();
     if (party.Data() && party.Lock()) { party.Data()->config = {}; party.Unlock(); }
     party.Close(); partySnapshot = {}; partyOpenAttempt = 0;
     channel.Close();
@@ -398,12 +412,70 @@ SkinRequestState SkinRequestAnswer() {
     if (!processId || !skinRequestSerial || !skinRequests.Data()) return SkinRequestState::None;
     switch (skinRequests.Answer(processId, skinRequestSerial)) {
     case MyClientSkin::Result::Sent: return SkinRequestState::Sent;
+    case MyClientSkin::Result::Saved: return SkinRequestState::Saved;
     case MyClientSkin::Result::NoPlayer: return SkinRequestState::NoPlayer;
     case MyClientSkin::Result::Failed: return SkinRequestState::Failed;
+    case MyClientSkin::Result::Unsupported: return SkinRequestState::Unsupported;
     default: return SkinRequestState::Waiting;
     }
 }
+SkinRequestState RequestCape(uint32_t id, const std::vector<uint8_t>& rgba) {
+    if (!processId) return SkinRequestState::NoGame;
+    if (!skinRequests.Data() && !skinRequests.Open(processId, false)) return SkinRequestState::OldDll;
+    uint32_t serial = 0;
+    if (!skinRequests.SendCape(processId, id, rgba, serial)) return SkinRequestState::Failed;
+    skinRequestSerial = serial;
+    return SkinRequestState::Waiting;
+}
+uint32_t CapeChoice() {
+    if (!processId || (!skinRequests.Data() && !skinRequests.Open(processId, false))) return 0;
+    return skinRequests.CapeChoice(processId);
+}
+bool JavaChatSnapshot(bool enabled, MyClientJavaChat::Snapshot& out) {
+    if (!processId || (!javaChat.IsOpen() && (!enabled || !javaChat.Open(processId, false)))) return false;
+    if (!javaChat.ReadAndRequest(processId, enabled, out)) return false;
+    lastJavaChat = out;
+    return true;
+}
+bool JavaChatReady() { return lastJavaChat.ready && MyClientJavaChat::Fresh(lastJavaChat.at, GetTickCount64()); }
 bool SkinHasNoPicture() { return skinNoPicture; }
+ChatRequestState SendChatLine(const std::string& utf8) {
+    if (!processId) return ChatRequestState::NoGame;
+    const std::string line = MyClientChat::Clean(utf8);
+    if (line.empty()) return ChatRequestState::Empty;
+    if (!chatRequests.IsOpen() && !chatRequests.Open(processId, false)) return ChatRequestState::OldDll;   // a DLL without Command Hotkeys
+    uint32_t serial = 0;
+    if (!chatRequests.Send(processId, line, serial)) return ChatRequestState::Busy;
+    chatRequestSerial = serial;
+    return ChatRequestState::Waiting;
+}
+ChatRequestState ChatLineAnswer() {
+    if (!processId || !chatRequestSerial || !chatRequests.IsOpen()) return ChatRequestState::None;
+    switch (chatRequests.Answer(processId, chatRequestSerial)) {
+    case MyClientChat::Result::Sent: return ChatRequestState::Sent;
+    case MyClientChat::Result::NoPlayer: return ChatRequestState::NoPlayer;
+    case MyClientChat::Result::Empty: return ChatRequestState::Empty;
+    case MyClientChat::Result::Failed: return ChatRequestState::Failed;
+    default: return ChatRequestState::Waiting;
+    }
+}
+ReplayJoinState RequestReplayJoin(uint16_t port) {
+    if (!processId) return ReplayJoinState::NoGame;
+    if (!replayJoinRequests.IsOpen() && !replayJoinRequests.Open(processId, false, MyClientChat::ReplayJoinName))
+        return ReplayJoinState::OldDll;   // a DLL that cannot join by itself: the HUD opens the link
+    uint32_t serial = 0;
+    if (!replayJoinRequests.Send(processId, "127.0.0.1:" + std::to_string(port), serial)) return ReplayJoinState::Busy;
+    replayJoinSerial = serial;
+    return ReplayJoinState::Waiting;
+}
+ReplayJoinState ReplayJoinAnswer() {
+    if (!processId || !replayJoinSerial || !replayJoinRequests.IsOpen()) return ReplayJoinState::None;
+    switch (replayJoinRequests.Answer(processId, replayJoinSerial)) {
+    case MyClientChat::Result::Sent: return ReplayJoinState::Joining;
+    case MyClientChat::Result::Failed: return ReplayJoinState::Failed;
+    default: return ReplayJoinState::Waiting;
+    }
+}
 void SetSkin(std::vector<uint8_t> rgba, uint32_t width, uint32_t height) {
     if (rgba.size() < static_cast<size_t>(width) * height * 4) return;
     skinRgba = std::move(rgba); skinW = width; skinH = height; skinChanges++;
@@ -423,6 +495,23 @@ bool GetShulkerHover(MyClientShulker::HoverBox& out) {
     if (!shulkerHoverSnapshot.active || !MyClientShulker::HoverFresh(shulkerHoverSnapshot.at, GetTickCount64())) return false;
     out = shulkerHoverSnapshot.box; return true;
 }
+// Item Counter: the DLL's channel, opened once it exists (retried at most twice a second).
+bool OpenItemCount() {
+    if (itemCount.IsOpen()) return true;
+    static uint64_t lastTry = 0;
+    const uint64_t now = GetTickCount64();
+    if (!processId || now - lastTry < 500) return false;
+    lastTry = now;
+    return itemCount.Open(processId, false);
+}
+void SetItemCounterWanted(bool on) {
+    if (on && OpenItemCount()) itemCount.SetWanted(processId, GetTickCount64());
+}
+bool GetItemCount(MyClientItemCount::Shared& out) {
+    out = {};
+    return OpenItemCount() && itemCount.Read(processId, GetTickCount64(), out);
+}
+bool ItemCounterReady() { return OpenItemCount(); }
 bool GetTabList(MyClientTabList::Shared& out) {
     out = {};
     if (!MyClientTabList::Fresh(tabListSnapshot.at, GetTickCount64())) return false;
@@ -475,6 +564,20 @@ std::wstring GameDirectory() {
     cached = GameDirectoryUncached();
     return cached;
 }
+std::wstring GameTextureDirectory() {
+    // The game folder, or the DLL's copy of its textures when the game folder cannot be read (GameDataMirror.h).
+    // Checked again every 5 s until the real folder is readable (the DLL makes its copy shortly after load).
+    static DWORD checkedFor = 0;
+    static ULONGLONG checkedAt = 0;
+    static std::wstring answer;
+    const std::wstring game = GameDirectory();
+    const ULONGLONG now = GetTickCount64();
+    if (processId == checkedFor && checkedAt && (answer == game ? !game.empty() : now - checkedAt < 5000)) return answer;
+    checkedFor = processId;
+    checkedAt = now;
+    answer = MyClientGameData::TextureFolder(game);
+    return answer;
+}
 std::wstring GameDirectoryUncached() {
     if (!processId) return {};
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
@@ -517,7 +620,7 @@ void WriteCommand() {
         features.Data()->command = {GetTickCount64(), zoomRequested ? 1u : 0u, zoomKey,
                                     fullbrightRequested ? 1u : 0u, nametagRequested ? 1u : 0u,
                                     outlineRequested ? 1u : 0u, outlineRgb,
-                                    texturesSeq, texturesRequested ? 1u : 0u, MyClientFeatures::EncodeAutoRqField(autoRqMode, renderChunks, renderCounter) | (leftHandRequested ? MyClientFeatures::LeftHandBit : 0u) | (hudMenuOpen ? MyClientFeatures::HudMenuBit : 0u) | (shulkerHoverRequested ? MyClientFeatures::ShulkerHoverBit : 0u) | frameGenBits, zoomFactorX100 | (hitboxRequested ? 0x10000u : 0u) | ((hitboxFilter & 0xFu) << 17) | (nickRequested ? 0x200000u : 0u) | (replayRequested ? 0x400000u : 0u) | (replayBuffer ? 0x20000000u : 0u) | (hitEffectCrit ? 0x40000000u : 0u) | (hitEffectMagic ? 0x80000000u : 0u) | entityDistanceBits};
+                                    texturesSeq, texturesRequested ? (MyClientFeatures::TexturesOn | (IsLiveTexturesAvailable() ? MyClientFeatures::TexturesLive : 0u)) : 0u, MyClientFeatures::EncodeAutoRqField(autoRqMode, renderChunks, renderCounter) | (leftHandRequested ? MyClientFeatures::LeftHandBit : 0u) | (hudMenuOpen ? MyClientFeatures::HudMenuBit : 0u) | (shulkerHoverRequested ? MyClientFeatures::ShulkerHoverBit : 0u) | frameGenBits, zoomFactorX100 | (hitboxRequested ? 0x10000u : 0u) | ((hitboxFilter & 0xFu) << 17) | (nickRequested ? 0x200000u : 0u) | (replayRequested ? 0x400000u : 0u) | (replayBuffer ? 0x20000000u : 0u) | (hitEffectCrit ? 0x40000000u : 0u) | (hitEffectMagic ? 0x80000000u : 0u) | entityDistanceBits};
     }
     features.Unlock();
 }
@@ -559,11 +662,12 @@ void SetAutoRq(uint32_t mode) { autoRqMode = mode; WriteCommand(); }
 void SetRenderDistance(uint32_t chunks, uint32_t counter) { renderChunks = chunks; renderCounter = counter; WriteCommand(); }
 // Texture-pack switching: the HUD only reports "on" and a request counter; the DLL does the reload.
 void SetTextures(bool on, uint32_t sequence) {
-    texturesRequested = on;
+    texturesRequested = on;   // the in-world apply bit is added when the DLL reports FlagLiveTextures (WriteCommand)
     texturesSeq = sequence;
     WriteCommand();
 }
 bool IsTexturesAvailable() { return MyClientFeatures::HasFlag(featureSnapshot.fullbrightAvailable, MyClientFeatures::FlagTextures); }
+bool IsLiveTexturesAvailable() { return MyClientFeatures::HasFlag(featureSnapshot.fullbrightAvailable, MyClientFeatures::FlagLiveTextures); }
 bool GetTextureReloads(uint32_t& count) {
     if (!MyClientFeatures::Fresh(statsSnapshot.at, GetTickCount64(), 3000)) return false;
     count = statsSnapshot.texReloads;
@@ -587,8 +691,8 @@ void SetOutlineRequested(bool requested, uint32_t rgb) {
 void SetEntityDistance(uint32_t blocks, bool players) {
     entityDistanceBits = MyClientFeatures::EncodeEntityDistance(blocks, players);
 }
-void SetOptimize(bool cullMobs, bool cullItems, bool cullMisc, bool hideNameTags, uint32_t playerBlocks) {
-    optimizeBits = MyClientFeatures::EncodeOptimize(cullMobs, cullItems, cullMisc, hideNameTags, playerBlocks);
+void SetOptimize(bool cullMobs, bool cullItems, bool cullMisc, bool hideNameTags, uint32_t playerBlocks, bool uncapFps, uint32_t extras) {
+    optimizeBits = MyClientFeatures::EncodeOptimize(cullMobs, cullItems, cullMisc, hideNameTags, playerBlocks, uncapFps) | extras;
 }
 void SetReplayRequested(bool requested) {
     replayRequested = requested;
@@ -608,8 +712,17 @@ void SetFrameGen(bool on, int multiplier, int method, bool pacing) {
 bool GetFrameGen(float& presentedFps, uint32_t& state) {
     presentedFps = 0; state = MyClientFeatures::FrameGenOff;
     if (!MyClientFeatures::Fresh(featureSnapshot.fpsAt, GetTickCount64()) || !std::isfinite(framePresentedFps) ||
-        framePresentedFps < 0 || framePresentedFps > 10000 || frameGenState > MyClientFeatures::FrameGenUnavailable) return false;
-    presentedFps = framePresentedFps; state = frameGenState; return true;
+        framePresentedFps < 0 || framePresentedFps > 10000 ||
+        MyClientFeatures::FrameGenStateOf(frameGenState) > MyClientFeatures::FrameGenUnavailable) return false;
+    presentedFps = framePresentedFps; state = MyClientFeatures::FrameGenStateOf(frameGenState); return true;
+}
+bool GetFrameGenReach(uint32_t& shownPerFrame, uint32_t& fitsPerFrame) {
+    float fps = 0; uint32_t state = 0;
+    shownPerFrame = fitsPerFrame = 0;
+    if (!GetFrameGen(fps, state) || state != MyClientFeatures::FrameGenRunning) return false;
+    shownPerFrame = MyClientFeatures::FrameGenShownOf(frameGenState);
+    fitsPerFrame = MyClientFeatures::FrameGenFitsOf(frameGenState);
+    return shownPerFrame != 0;   // 0 = an older DLL that does not send it
 }
 void SetShulkerHover(bool on) {
     shulkerHoverRequested = on;

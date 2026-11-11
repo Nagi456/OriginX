@@ -446,6 +446,9 @@ class Cache {
     std::map<std::string, std::unique_ptr<Image>> textures_;   // by pack path; null = missing
     std::map<std::string, ItemIcons::Icon> icons_;
     std::vector<std::string> misses_;   // "id: paths tried" for every id without a picture (icons_scan.txt)
+    std::string notes_;                 // where the lookup looked and what it found (top of icons_scan.txt)
+    int decoded_ = 0, unreadable_ = 0;  // texture files read / found but not decodable
+    std::string firstUnreadable_;
 
     void Reset(const std::wstring& gameDir, const std::vector<fs::path>& packs) {
         Clear();
@@ -458,6 +461,7 @@ class Cache {
         std::vector<fs::path> others;
         for (fs::directory_iterator it(all, ec), end; !ec && it != end; it.increment(ec))
             if (it->is_directory(ec) && it->path().filename() != L"vanilla") others.push_back(it->path());
+        const std::string listError = ec ? ec.message() : std::string();
         std::sort(others.rbegin(), others.rend());
         roots_.insert(roots_.end(), others.begin(), others.end());
         roots_.push_back(all / L"vanilla");
@@ -467,14 +471,30 @@ class Cache {
         const auto merge = [](Json& into, const Json* from) {
             if (from && from->type == Json::Object) into.members.insert(into.members.end(), from->members.begin(), from->members.end());
         };
+        int withItems = 0, withTerrain = 0, withBlocks = 0;
         for (const auto& root : roots_) {
             const Json items = ParseJson(ReadFile(root / L"textures" / L"item_texture.json"));
             const Json terrain = ParseJson(ReadFile(root / L"textures" / L"terrain_texture.json"));
             const Json blocks = ParseJson(ReadFile(root / L"blocks.json"));
+            withItems += items.Get("texture_data") ? 1 : 0;
+            withTerrain += terrain.Get("texture_data") ? 1 : 0;
+            withBlocks += blocks.type == Json::Object && !blocks.members.empty() ? 1 : 0;
             merge(data_.itemTextures, items.Get("texture_data"));
             merge(data_.terrainTextures, terrain.Get("texture_data"));
             merge(data_.blocks, &blocks);
         }
+        const auto narrow = [](const std::wstring& w) {
+            std::string out;
+            for (wchar_t c : w) out += c < 0x80 ? static_cast<char>(c) : '?';
+            return out;
+        };
+        notes_ = "Game folder: " + narrow(gameDir) + "\r\n" +
+                 "data\\resource_packs: " + (fs::is_directory(all, ec) ? "found" : "MISSING") +
+                 (listError.empty() ? "" : " (cannot list: " + listError + ")") + ", " + std::to_string(others.size()) + " packs besides vanilla, vanilla " +
+                 (fs::is_directory(all / L"vanilla", ec) ? "found" : "MISSING") + "\r\n" +
+                 "Active texture packs: " + std::to_string(packs.size()) + "\r\n" +
+                 "item_texture.json read in " + std::to_string(withItems) + ", terrain_texture.json in " + std::to_string(withTerrain) +
+                 ", blocks.json in " + std::to_string(withBlocks) + " of " + std::to_string(roots_.size()) + " packs\r\n";
     }
 
     // A texture by pack path ("textures/blocks/stone"), active packs first; nullptr when no pack has it.
@@ -490,9 +510,14 @@ class Cache {
         for (const auto& root : roots_) {
             const std::wstring base = (root / rel).wstring();
             Image image;
-            if (fs::is_regular_file(base + L".png", ec) && ItemIcons::DecodeWic(base + L".png", image, !straight)) {}
-            else if (fs::is_regular_file(base + L".tga", ec) && ItemIcons::DecodeTga(ReadFile(base + L".tga"), image, !straight)) {}
-            else continue;
+            const bool png = fs::is_regular_file(base + L".png", ec), tga = !png && fs::is_regular_file(base + L".tga", ec);
+            if (png && ItemIcons::DecodeWic(base + L".png", image, !straight)) {}
+            else if (tga && ItemIcons::DecodeTga(ReadFile(base + L".tga"), image, !straight)) {}
+            else {
+                if ((png || tga) && unreadable_++ == 0) firstUnreadable_ = path + (png ? ".png" : ".tga");
+                continue;
+            }
+            decoded_++;
             slot = std::make_unique<Image>(FirstFrame(image));
             break;
         }
@@ -532,15 +557,28 @@ public:
     ~Cache() { Clear(); }
     const std::vector<std::string>& Misses() const { return misses_; }
     const std::vector<fs::path>& Roots() const { return roots_; }
+    std::string Notes() const {
+        return notes_ + "Texture files read: " + std::to_string(decoded_) + ", found but unreadable: " + std::to_string(unreadable_) +
+               (firstUnreadable_.empty() ? std::string() : " (first: " + firstUnreadable_ + ")") + "\r\n";
+    }
     void Clear() {
         for (auto& [key, icon] : icons_) if (icon.bitmap) DeleteObject(icon.bitmap);
         icons_.clear();
         textures_.clear();
         misses_.clear();
+        notes_.clear();
+        decoded_ = unreadable_ = 0;
+        firstUnreadable_.clear();
     }
     // nullptr when the game has no picture for this item (the popup then shows a placeholder).
     const ItemIcons::Icon* Get(const std::wstring& gameDir, const std::vector<fs::path>& activePacks, const std::string& id, int size) {
-        if (gameDir.empty() || id.empty() || size <= 0) return nullptr;
+        if (id.empty() || size <= 0) return nullptr;
+        if (gameDir.empty()) {
+            // Noted once so icons_scan.txt says why every icon is a letter.
+            notes_ = "Game folder: unknown (the HUD could not read the game's exe path)\r\n";
+            if (misses_.empty()) misses_.push_back(id + ": no game folder");
+            return nullptr;
+        }
         if (gameDir != gameDir_ || activePacks != packs_) Reset(gameDir, activePacks);
         auto& icon = icons_[id + "|" + std::to_string(size)];
         if (!icon.tried) {

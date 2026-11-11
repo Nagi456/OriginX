@@ -1,8 +1,12 @@
 # MyClientData.dll をGitHubのWindows環境でビルドします。
 # 使い方: Actionsタブ →「build-dll」→「Run workflow」。完了後、Artifactsを取得します。
-# publish を true にすると、ランチャーの自動更新用リリースも公開します（revision / sequence は前回より大きくすること）:
-#   1. myclient-26.51.1-r<revision> にDLL等を公開  2. client-catalog に catalog.json を最後に公開
+# publish を true にすると、ランチャーの自動更新用に OriginX の R2 へ公開します（revision / sequence は前回より大きくすること）:
+#   1. 同じコミットの HUD（build-hud）も作り、DLL と一緒に stable/myclient-26.51.1-r<revision>/ へアップロード
+#   2. stable/catalog.json を最後にアップロード（誰でも https://originx.originx-client.workers.dev/dl/stable/... で取れる）
 #   3. 新しい catalog.json（source/launcher と同梱用ルート）と SHA256SUMS.txt を実行したブランチへコミット
+# channel=test にすると、一般向け（stable/）には何も触らず、モデレーター用のテスト版として test/myclient-<ゲーム版>-r<revision>-test<test_number>/ へ
+# 上げます（test/catalog.json を最後に。ブランチへのコミットもしません）。検証して OK ならワークフロー promote-build で先行版（early/）へ同じファイルを移します。
+# アップロードは GitHub Actions の OIDC トークンで Worker が本物の Nagi456/MyClient のワークフローか確かめるので、秘密の設定は要りません。
 name: build-dll
 on:
   workflow_dispatch:
@@ -13,19 +17,44 @@ on:
         default: false
       revision:
         description: "DLL package revision (myclient-26.51.1-r<N>), used when publishing"
-        default: "13"
+        default: "14"
       sequence:
         description: "catalog.json sequence, used when publishing"
-        default: "36"
+        default: "37"
+      game:
+        description: "Game version to build for (26.51.1, or one with source/tools/sdks/<game>.lock.json)"
+        default: "26.51.1"
+      channel:
+        description: "stable = a public release (default). test = the moderators' test channel: nothing public changes"
+        type: choice
+        options: [stable, test]
+        default: stable
+      test_number:
+        description: "channel=test only: the test build number N (the tag ends in -testN, e.g. myclient-26.51.1-r54-test1)"
+        default: ""
+      standalone:
+        description: "Build the DLL that runs without LeviLamina (launcherApi 2; launcher build 27 or newer starts it)"
+        type: boolean
+        default: false
+      loader_tag:
+        description: "LeviLamina tag (e.g. v26.60.0): makes source/tools/sdks/<game>.lock.json first when it is missing, and commits it"
+        default: ""
 permissions:
   contents: write
+  id-token: write   # the OIDC token that lets publish_r2.py upload to R2
 jobs:
+  hud:
+    if: inputs.publish
+    uses: ./.github/workflows/build-hud.yml
   build:
+    needs: hud
+    # runs when the HUD was built or skipped (no publish)
+    if: ${{ !failure() && !cancelled() }}
     runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
-        game: ["26.51.1"]   # only the current game version is supported for now
+        game: ["${{ inputs.game || '26.51.1' }}"]
     defaults:
       run:
         working-directory: source
@@ -34,6 +63,9 @@ jobs:
       GAME: ${{ matrix.game }}
       REVISION: ${{ inputs.revision }}
       SEQUENCE: ${{ inputs.sequence }}
+      CHANNEL: ${{ inputs.channel || 'stable' }}
+      TEST_NUMBER: ${{ inputs.test_number }}
+      STANDALONE: ${{ inputs.standalone && '--standalone' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -45,45 +77,83 @@ jobs:
       - name: Add LLVM to PATH
         shell: bash
         run: echo "C:\Program Files\LLVM\bin" >> "$GITHUB_PATH"
+      - name: Make the SDK lock for a new game version
+        if: inputs.loader_tag != ''
+        shell: bash
+        env:
+          TAG: ${{ inputs.loader_tag }}
+        run: |
+          if [ -f "tools/sdks/$GAME.lock.json" ]; then echo "tools/sdks/$GAME.lock.json exists"; exit 0; fi
+          python tools/generate_sdk_lock.py --game "$GAME" --tag "$TAG"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          git add "tools/sdks/$GAME.lock.json"
+          git commit -m "SDK lock for Minecraft $GAME (LeviLamina $TAG)"
+          git push origin "HEAD:$GITHUB_REF_NAME"
+      - name: Run feature, pack, and address-table regression tests
+        shell: pwsh
+        run: |
+          foreach ($testName in @('features', 'lite', 'game_rva', 'game_sigs', 'framegen', 'skin')) {
+            $testExe = Join-Path $env:RUNNER_TEMP "myclient-$testName.exe"
+            $testObj = Join-Path $env:RUNNER_TEMP "myclient-$testName.obj"
+            & clang-cl /nologo /std:c++20 /EHsc /utf-8 /I. /DNOMINMAX /DWIN32_LEAN_AND_MEAN "tests/$testName.cpp" "/Fe$testExe" "/Fo$testObj"
+            if ($LASTEXITCODE -ne 0) { throw "Compile failed: $testName" }
+            & $testExe
+            if ($LASTEXITCODE -ne 0) { throw "Test failed: $testName" }
+          }
       - name: Build MyClientData.dll
-        run: python tools/build_client.py --game ${{ matrix.game }}
+        shell: bash
+        run: python tools/build_client.py --game "$GAME" $STANDALONE
       - name: Collect output
         shell: bash
         run: |
           d=build/client
+          if [ "$GAME" != "26.51.1" ]; then d="build/client-$GAME"; fi
+          if [ -n "$STANDALONE" ]; then d="$d-standalone"; fi
           mkdir -p out/mods/MyClientData
           cp "$d/MyClientData.dll" "$d/manifest.json" out/mods/MyClientData/
+          cp "$d/MyClientData.map" out/ 2>/dev/null || true   # names for the hook patches the game image dump finds
       - uses: actions/upload-artifact@v4
         with:
           name: MyClientData-${{ matrix.game }}
           path: source/out
+      - uses: actions/download-artifact@v4
+        if: inputs.publish
+        with:
+          name: MyClient-hud
+          path: source/build/hud
       - name: Package release assets and catalog
         if: inputs.publish
         shell: bash
         run: |
-          python tools/package_update.py --sdk-root build/client-sdk --output "$RUNNER_TEMP/release" \
-            --catalog launcher/catalog.json --revision "$REVISION" --sequence "$SEQUENCE" --game-version "$GAME"
-      - name: Publish DLL release
+          sdk=build/client-sdk; if [ "$GAME" != "26.51.1" ]; then sdk="build/client-sdk-$GAME"; fi
+          if [ "$CHANNEL" = "test" ]; then
+            # A test build: the channel's last list is read back (so the other game versions stay in it); a file already
+            # stored under this tag with other bytes is refused by the Worker (publish.ts), the same bytes are fine.
+            [[ "$TEST_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "channel=test needs test_number (a positive integer)" >&2; exit 1; }
+            # (decided by the file, not by what the tool prints: Python's output ends in \r\n in Git Bash on Windows)
+            python tools/publish_r2.py fetch test/catalog.json "$RUNNER_TEMP/previous-test.json"
+            previous=(); if [ -s "$RUNNER_TEMP/previous-test.json" ]; then previous=(--catalog "$RUNNER_TEMP/previous-test.json"); fi
+            python tools/package_update.py --sdk-root "$sdk" --output "$RUNNER_TEMP/release" "${previous[@]}" \
+              --revision "$REVISION" --game-version "$GAME" --hud build/hud/MyClient.exe \
+              --channel test --test-number "$TEST_NUMBER" $STANDALONE
+          else
+            tag="myclient-$GAME-r$REVISION"
+            # (the DLL: every release has it; a standalone one has no runtime.lock.json)
+            code=$(curl -s -o /dev/null -w '%{http_code}' "https://originx.originx-client.workers.dev/dl/stable/$tag/mods__MyClientData__MyClientData.dll")
+            if [ "$code" != "404" ]; then
+              echo "stable/$tag already exists on R2 (HTTP $code); increment revision." >&2; exit 1
+            fi
+            python tools/package_update.py --sdk-root "$sdk" --output "$RUNNER_TEMP/release" \
+              --catalog launcher/catalog.json --revision "$REVISION" --sequence "$SEQUENCE" --game-version "$GAME" \
+              --hud build/hud/MyClient.exe $STANDALONE
+          fi
+      - name: Upload to R2 (catalog last)
         if: inputs.publish
         shell: bash
-        run: |
-          tag="myclient-$GAME-r$REVISION"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag already exists; increment revision." >&2; exit 1
-          fi
-          gh release create "$tag" "$RUNNER_TEMP/release/$tag"/* --target "$GITHUB_SHA" \
-            --title "MyClient $GAME r$REVISION" --notes "MyClientData for Minecraft $GAME (revision $REVISION)." --latest=false
-      - name: Publish catalog (last)
-        if: inputs.publish
-        shell: bash
-        run: |
-          if ! gh release view client-catalog >/dev/null 2>&1; then
-            gh release create client-catalog --target "$GITHUB_SHA" --title "MyClient update catalog" \
-              --notes "Update list read by MyClientLauncher. Replaced on every release." --latest=false
-          fi
-          gh release upload client-catalog "$RUNNER_TEMP/release/catalog.json" --clobber
+        run: python tools/publish_r2.py release "$RUNNER_TEMP/release" --prefix "$CHANNEL"
       - name: Commit catalog back to the branch
-        if: inputs.publish
+        if: inputs.publish && inputs.channel != 'test'
         shell: bash
         run: |
           cp launcher/catalog.json ../catalog.json
@@ -100,5 +170,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: inputs.publish
         with:
-          name: release-assets-r${{ inputs.revision }}
+          name: release-assets-r${{ inputs.revision }}${{ inputs.channel == 'test' && format('-test{0}', inputs.test_number) || '' }}
           path: ${{ runner.temp }}/release

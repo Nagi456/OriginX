@@ -1,6 +1,6 @@
 #pragma once
 // Replay playback: a tiny Bedrock server on 127.0.0.1 that plays a .mcrec recording back to the game.
-// The HUD starts it and opens minecraft://connect/?serverUrl=127.0.0.1&serverPort=<port>; the game joins it
+// The HUD starts it and the DLL takes the game there (or the HUD opens minecraft://connect/?serverUrl=127.0.0.1&serverPort=<port>); the game joins it
 // like any server and receives the recorded server packets with their original timing.
 //
 //   RakNet: offline handshake (ping/pong, open connection 1/2), then datagrams of frames. Everything we send is
@@ -165,7 +165,37 @@ constexpr uint32_t Login = 1, PlayStatus = 2, ServerToClientHandshake = 3, Disco
                    PackResponse = 8, StartGame = 11, MovePlayer = 19, PackDataInfo = 82, PackChunkData = 83, Transfer = 85,
                    NetworkSettings = 143, PlayerAuthInput = 144, RequestNetworkSettings = 193;
 }
-namespace PackStatus { constexpr uint32_t SendPacks = 2, HaveAllPacks = 3, Completed = 4; }
+namespace PackStatus { constexpr uint32_t SendPacks = 2, HaveAllPacks = 3, Completed = 4; }   // as numbered before 1.26.40
+
+// The status of a ResourcePackClientResponse, in the numbering above. Before 1.26.40 it is one byte (none, refused,
+// send packs, have all packs, completed). From 1.26.40 on it is a varint without "none" (refused 0 ... completed 3)
+// followed by the same status as a lowercase name; the name decides when it is there. 0 = not readable.
+inline uint32_t PackResponseStatus(In in) {
+    const uint32_t value = static_cast<uint32_t>(in.VarU64());
+    if (!in.ok) return 0;
+    In name = in;
+    const uint64_t length = name.VarU64();
+    if (name.ok && length > 0 && length <= 40 && name.Left() >= length) {
+        const std::string text(name.p + name.at, static_cast<size_t>(length));
+        if (text == "downloading") return PackStatus::SendPacks;
+        if (text == "downloadingfinished") return PackStatus::HaveAllPacks;
+        if (text == "resourcepackstackfinished") return PackStatus::Completed;
+        if (text == "cancel") return 1;
+    }
+    return value;   // the old one-byte form (a value below 128 reads the same as a varint)
+}
+
+// The recorded NetworkSettings with compression switched off in practice (threshold 65535): the game then sends its
+// pack answers uncompressed, which this server can read (it has no zlib). The answers to the recorded server's
+// threshold were compressed and only a 2.5 s timeout moved the join on, twice.
+inline std::string UncompressedSettings(std::string settings) {
+    In in(settings);
+    in.VarU64();
+    if (!in.ok || settings.size() < in.at + 2) return settings;
+    settings[in.at] = static_cast<char>(0xFF);
+    settings[in.at + 1] = static_cast<char>(0xFF);
+    return settings;
+}
 
 inline uint32_t GameId(const std::string& packet) { return MyClientReplay::PacketId(packet.data(), packet.size()); }
 // The packet body after its header varint.
@@ -177,11 +207,13 @@ inline std::string PlayStatus(uint32_t status) { Out o; o.Raw(Header(Id::PlaySta
 inline std::string DefaultNetworkSettings() {
     Out o; o.Raw(Header(Id::NetworkSettings)); o.U16le(0xFFFF); o.U16le(0); o.U8(0); o.U8(0); o.F32le(0.f); return o.b;
 }
-// Local player teleported to the recorded eye position (MovePlayer mode 2 = teleport).
+// Local player teleported to the recorded eye position (MovePlayer mode 2 = teleport). Since 1.26.40 the teleport
+// cause and source are behind a "present" byte (before, the mode alone said they follow); every game version
+// MyClient supports is newer, and the old layout was misread from 26.51 on.
 inline std::string MovePlayer(uint64_t runtimeId, float x, float y, float z, float pitch, float yaw, float headYaw, uint64_t tick) {
     Out o; o.Raw(Header(Id::MovePlayer));
     o.VarU64(runtimeId); o.F32le(x); o.F32le(y); o.F32le(z); o.F32le(pitch); o.F32le(yaw); o.F32le(headYaw);
-    o.U8(2); o.U8(1); o.VarU64(0); o.U32le(0); o.U32le(0); o.VarU64(tick);
+    o.U8(2); o.U8(1); o.VarU64(0); o.U8(1); o.U32le(0); o.U32le(0); o.VarU64(tick);
     return o.b;
 }
 struct Pose { float pitch, yaw, x, y, z, headYaw; };
@@ -195,6 +227,150 @@ inline bool ReadPose(const std::string& packet, Pose& p) {
 // StartGame: entity unique id (zigzag varint), then the runtime id of the local player.
 inline bool ReadRuntimeId(const std::string& packet, uint64_t& id) {
     In in = Body(packet); in.VarU64(); id = in.VarU64(); return in.ok;
+}
+
+// ---- Free camera (2026-11-11) ----
+// The viewer is not the recorded player any more: StartGame gives the viewer ids of its own and the spectator
+// game mode (it flies through everything, the recording's world around it), and the recorded player is added as
+// another player (its player-list entry from the recording, under a changed UUID, then AddPlayer) that the
+// recorded movement, swings and held items move. Layouts of 1.26.40 and later (the versions MyClient supports).
+namespace FreeCam {
+constexpr uint32_t LevelEvent = 25, PlaySound = 86, SpawnParticle = 118, LevelSoundEvent = 123, LevelEventGeneric = 124;
+constexpr uint32_t PlayerList = 63, AddPlayer = 12, SetPlayerGameType = 62, Respawn = 45, MobEquipment = 31, Animate = 44,
+                   CorrectPrediction = 161, UpdateAbilities = 187;
+constexpr uint64_t ViewerRuntimeId = 0x7FFFFFF0u;   // far above any id a server hands out, and within 32 bits (some fields are read as 32-bit varints)
+constexpr int64_t ViewerUniqueId = int64_t(1) << 40;
+constexpr int32_t Spectator = 6;
+inline uint64_t ZigZag(int64_t v) { return (static_cast<uint64_t>(v) << 1) ^ static_cast<uint64_t>(v >> 63); }
+inline int64_t UnZigZag(uint64_t v) { return static_cast<int64_t>(v >> 1) ^ -static_cast<int64_t>(v & 1); }
+
+struct Player { std::string uuid, name, record; size_t uuidAt = 0; };   // record: the raw PlayerList entry
+struct Start { int64_t uniqueId = 0; uint64_t runtimeId = 0; int32_t gameMode = 0; float x = 0, y = 0, z = 0, pitch = 0, yaw = 0; };
+
+inline bool ReadStart(const std::string& packet, Start& s) {
+    In in = Body(packet);
+    s.uniqueId = UnZigZag(in.VarU64()); s.runtimeId = in.VarU64();
+    s.gameMode = static_cast<int32_t>(UnZigZag(in.VarU64()));
+    s.x = in.F32le(); s.y = in.F32le(); s.z = in.F32le(); s.pitch = in.F32le(); s.yaw = in.F32le();
+    return in.ok;
+}
+// The same StartGame for the viewer: its own ids, spectator; everything after the game mode unchanged.
+inline std::string ViewerStartGame(const std::string& packet) {
+    In in = Body(packet);
+    in.VarU64(); in.VarU64(); in.VarU64();
+    if (!in.ok) return packet;
+    Out o; o.Raw(Header(Id::StartGame)); o.VarU64(ZigZag(ViewerUniqueId)); o.VarU64(ViewerRuntimeId); o.VarU64(ZigZag(Spectator));
+    o.Raw(packet.data() + in.at, packet.size() - in.at);
+    return o.b;
+}
+
+// Skips one Skin (1.26.40+ layout); false when the packet ends inside it.
+inline bool SkipString(In& in) { const uint64_t n = in.VarU64(); if (!in.ok || n > in.Left()) { in.ok = false; return false; } in.at += static_cast<size_t>(n); return true; }
+inline bool SkipImage(In& in) { in.U32le(); in.U32le(); return SkipString(in); }
+inline bool SkipSkin(In& in) {
+    for (int i = 0; i < 3; ++i) SkipString(in);
+    SkipImage(in);
+    for (uint64_t n = in.VarU64(); in.ok && n; --n) { SkipImage(in); in.VarU64(); in.F32le(); in.VarU64(); }
+    SkipImage(in);
+    for (int i = 0; i < 5; ++i) SkipString(in);
+    in.U8(); in.U32le();
+    for (uint64_t n = in.VarU64(); in.ok && n; --n) { SkipString(in); in.U32le(); in.Need(16); in.at += in.ok ? 16 : 0; in.U8(); SkipString(in); }
+    for (uint64_t n = in.VarU64(); in.ok && n; --n) { SkipString(in); for (int k = 0; k < 4; ++k) in.U32le(); }
+    for (int i = 0; i < 5; ++i) in.U8();
+    SkipString(in); SkipString(in);
+    return in.ok;
+}
+// The PlayerList "add" entry of the player whose unique id is `uniqueId`, raw (to be sent again under another UUID).
+inline bool FindPlayer(const std::string& packet, int64_t uniqueId, Player& out) {
+    In in = Body(packet);
+    const uint64_t count = in.VarU64();
+    for (uint64_t i = 0; in.ok && i < count && in.Left() > 0; ++i) {
+        const size_t start = in.at;
+        const uint64_t type = in.VarU64(); in.U8();
+        if (!in.Need(16)) return false;
+        const size_t uuidAt = in.at; in.at += 16;
+        if (type != 1) continue;   // remove: only the UUID
+        const int64_t id = UnZigZag(in.VarU64());
+        const uint64_t nameLength = in.VarU64();
+        if (!in.ok || nameLength > in.Left()) return false;
+        const std::string name(in.p + in.at, static_cast<size_t>(nameLength)); in.at += static_cast<size_t>(nameLength);
+        SkipString(in); SkipString(in); in.U32le();
+        if (!SkipSkin(in)) return false;
+        in.U8(); in.U8(); in.U8(); in.U32le();
+        if (!in.ok) return false;
+        if (id == uniqueId) {
+            out.record.assign(in.p + start, in.at - start);
+            out.uuidAt = uuidAt - start;
+            out.uuid.assign(in.p + uuidAt, 16);
+            out.name = name;
+            return true;
+        }
+    }
+    return false;
+}
+// The recorded player under a UUID of its own (the viewer signs in as the same person: the game would take an entry
+// with its own UUID for itself).
+inline std::string ReplayedUuid(std::string uuid) { if (uuid.size() == 16) uuid[15] = static_cast<char>(uuid[15] ^ 0x5A); return uuid; }
+inline std::string ReplayedPlayerList(const Player& p) {
+    std::string record = p.record;
+    if (p.uuidAt + 16 <= record.size()) record.replace(p.uuidAt, 16, ReplayedUuid(p.uuid));
+    Out o; o.Raw(Header(PlayerList)); o.VarU64(1); o.Raw(record);
+    return o.b;
+}
+inline std::string AddRecordedPlayer(const Player& p, const Start& s) {
+    Out o; o.Raw(Header(AddPlayer));
+    o.Raw(ReplayedUuid(p.uuid));
+    o.VarU64(p.name.size()); o.Raw(p.name);
+    o.VarU64(s.runtimeId);
+    o.VarU64(0);                                                     // platform chat id
+    o.F32le(s.x); o.F32le(s.y); o.F32le(s.z);
+    o.F32le(0); o.F32le(0); o.F32le(0);                              // velocity
+    o.F32le(s.pitch); o.F32le(s.yaw); o.F32le(s.yaw);
+    o.U16le(0); o.U16le(0); o.VarU64(0); o.U8(0); o.VarU64(0); o.VarU64(0);   // held item: air
+    o.VarU64(ZigZag(s.gameMode == 5 ? 0 : s.gameMode));
+    o.VarU64(0);                                                     // metadata (the recording's own set_entity_data follows)
+    o.VarU64(0); o.VarU64(0);                                        // entity properties
+    o.U32le(static_cast<uint32_t>(s.uniqueId)); o.U32le(static_cast<uint32_t>(static_cast<uint64_t>(s.uniqueId) >> 32));
+    o.U8(1); o.U8(0);                                                // member, normal commands
+    o.U8(0);                                                         // ability layers
+    o.VarU64(0);                                                     // links
+    o.VarU64(0);                                                     // device id
+    o.U32le(7);                                                      // Win10
+    return o.b;
+}
+// The viewer may fly through everything (the spectator mode asks for it; this says it outright).
+inline std::string ViewerAbilities() {
+    Out o; o.Raw(Header(UpdateAbilities));
+    o.U32le(static_cast<uint32_t>(ViewerUniqueId)); o.U32le(static_cast<uint32_t>(static_cast<uint64_t>(ViewerUniqueId) >> 32));
+    o.U8(1); o.U8(0); o.U8(1);
+    o.U16le(1);                                                      // base layer
+    o.U32le(0xFFFFFu);                                               // every ability is set by this layer
+    o.U32le((1u << 8) | (1u << 9) | (1u << 10) | (1u << 17));        // invulnerable, flying, may fly, no clip
+    o.F32le(0.05f); o.F32le(1.f); o.F32le(0.1f);
+    return o.b;
+}
+// The recorded player moved to the recorded pose (MovePlayer mode 0: a smooth move of another player).
+// Moves the viewer back to where its camera was (after a jump back, the new connection starts it at the beginning).
+inline std::string MoveViewer(const Pose& p, uint64_t tick);
+inline std::string MoveRecorded(uint64_t runtimeId, float x, float y, float z, float pitch, float yaw, float headYaw, uint64_t tick) {
+    Out o; o.Raw(Header(Id::MovePlayer));
+    o.VarU64(runtimeId); o.F32le(x); o.F32le(y); o.F32le(z); o.F32le(pitch); o.F32le(yaw); o.F32le(headYaw);
+    o.U8(0); o.U8(1); o.VarU64(0); o.U8(0); o.VarU64(tick);   // no teleport data
+    return o.b;
+}
+// A seek jumps over these (sounds and particles of the skipped time would all play at once).
+inline bool Transient(uint32_t id) {
+    return id == LevelEvent || id == PlaySound || id == SpawnParticle || id == LevelSoundEvent || id == LevelEventGeneric || id == Animate;
+}
+// Transfer to this same server without reloading the world (reload_world false, no gathering info): the game connects
+// again and the recording is played from its start, fast, up to the time asked for.
+inline std::string TransferHere(uint16_t port) {
+    Out o; o.Raw(Header(Id::Transfer)); o.VarU64(9); o.Raw("127.0.0.1"); o.U16le(port); o.U8(0); o.U8(0);
+    return o.b;
+}
+}  // namespace FreeCam
+inline std::string FreeCam::MoveViewer(const Pose& p, uint64_t tick) {
+    return MovePlayer(ViewerRuntimeId, p.x, p.y, p.z, p.pitch, p.yaw, p.headYaw, tick);
 }
 
 // A batch (0xFE game message): each packet behind its varint length. `prefix`: compression is on (0xFF = none).
@@ -239,6 +415,10 @@ public:
     std::string networkSettings, packsInfo, packStack;   // first recorded copies (full packets)
     bool hasStartGame = false, hasMark = false;
     uint64_t runtimeId = 0;
+    FreeCam::Start start;          // the recorded player as StartGame gave it
+    FreeCam::Player self;          // its PlayerList entry (free camera); empty = not found, playback from its eyes
+    bool HasSelf() const { return !self.record.empty(); }
+    std::vector<std::string> lists;   // PlayerList packets seen while opening (only until the entry is found)
     uint64_t markMs = 0, totalMs = 0;   // record mark, end (ms from the first record); played length = total - mark
     std::string error;
 
@@ -276,11 +456,13 @@ public:
                 const uint32_t id = MyClientReplay::PacketId(idBytes, got);
                 std::string* keep = id == Id::NetworkSettings ? &networkSettings : id == Id::PacksInfo ? &packsInfo :
                                     id == Id::PackStack ? &packStack : nullptr;
-                if ((keep && keep->empty() && size <= (1u << 20)) || (id == Id::StartGame && !hasStartGame)) {
+                const bool list = id == FreeCam::PlayerList && lists.size() < 16 && size <= (16u << 20);
+                if ((keep && keep->empty() && size <= (1u << 20)) || (id == Id::StartGame && !hasStartGame) || list) {
                     std::string packet(size, '\0');
                     if (!Seek(file_, at) || std::fread(&packet[0], 1, size, file_) != size) break;
                     if (keep) *keep = packet;
-                    else { hasStartGame = true; ReadRuntimeId(packet, runtimeId); }
+                    else if (list) lists.push_back(std::move(packet));
+                    else { hasStartGame = true; ReadRuntimeId(packet, runtimeId); FreeCam::ReadStart(packet, start); }
                 }
             }
             at += size;
@@ -288,11 +470,15 @@ public:
             totalMs = ms;
         }
         if (!hasStartGame) { error = "This recording has no world data (StartGame)."; return false; }
+        for (const auto& packet : lists)   // the recorded player's own entry (the list may come before StartGame)
+            if (FreeCam::FindPlayer(packet, start.uniqueId, self)) break;
+        lists.clear();
         if (packsInfo.empty() || packStack.empty()) { error = "This recording started mid-connection (no pack list); it cannot be played."; return false; }
         if (!hasMark) markMs = 0;
         return Seek(file_, sizeof header);
     }
     uint64_t LengthMs() const { return totalMs > markMs ? totalMs - markMs : 0; }
+    bool Rewind() { return file_ && Seek(file_, sizeof header); }
     // Next record; false at the end (or a damaged tail).
     bool Next(Record& r) {
         uint32_t head[2];
@@ -325,6 +511,33 @@ public:
     float Speed() const { return speed_; }
     void SetSpeed(float s) { speed_ = s < 0.25f ? 0.25f : s > 8.f ? 8.f : s; }
     bool PacksRequested() const { return packsRequested_; }
+    // Free camera (default): the viewer flies as a spectator and the recorded player is shown as another player.
+    // Off, or when the recording has no PlayerList entry of its player: seen from the recorded player's eyes.
+    void SetFreeCamera(bool on) { freeCamera_ = on; }
+    bool FreeCamera() const { return freeCamera_ && rec_.HasSelf(); }
+
+    // Jumps to `ms` (from the record mark). Forward: the records up to there go out at once (without their sounds and
+    // particles). Back: the game is sent to this same server again (Transfer, the world kept on screen) and the
+    // recording is played from its start up to there; the viewer's camera is put back where it was.
+    void SeekTo(uint64_t ms, uint64_t now) {
+        if (ms > rec_.LengthMs()) ms = rec_.LengthMs();
+        if (state_ != State::Playing && state_ != State::Finished) { seekTo_ = static_cast<double>(ms); return; }
+        if (static_cast<double>(ms) >= playMs_) { seekTo_ = static_cast<double>(ms); if (state_ == State::Finished) state_ = State::Playing; return; }
+        SendGame({FreeCam::TransferHere(port)});
+        Flush(now);
+        Restart(static_cast<double>(ms));
+    }
+    bool Rewinding() const { return rewinding_; }
+    // The camera changed while playing: the game connects again and the playback goes on from the same time.
+    void SwitchCamera(bool free, uint64_t now) {
+        freeCamera_ = free;
+        if (state_ != State::Playing && state_ != State::Finished) return;
+        const double at = playMs_;
+        SendGame({FreeCam::TransferHere(port)});
+        Flush(now);
+        Restart(at);
+    }
+    bool HasViewerPose() const { return haveViewerPose_; }
     uint16_t port = 0;   // our port (shown in the ping answer)
 
     // Ends the connection (the game shows its disconnected screen).
@@ -343,6 +556,8 @@ public:
         const uint32_t id = in.U8();
         if (!(id & 0x80)) { Offline(id, in, ip, clientPort, now); return; }
         if (state_ == State::Waiting) return;
+        // Only the connection being served: after a jump back the old one still says goodbye from its own port.
+        if (ip != clientIp_ || clientPort != clientPort_) return;
         lastHeard_ = now;
         if (id & 0x40) {   // ACK
             for (uint32_t s : ReadAck(in)) unacked_.erase(s);
@@ -411,6 +626,22 @@ private:
     uint64_t lastPlayAt_ = 0;
     bool paused_ = false; float speed_ = 1.f;
     uint64_t tick_ = 0;
+    bool freeCamera_ = true, selfShown_ = false;
+    double seekTo_ = -1;            // a jump forward still to make (ms after the mark); -1 = none
+    double skipUntil_ = -1;         // records up to here are a jump's: no sounds and particles
+    bool rewinding_ = false, haveViewerPose_ = false;
+    Pose viewerPose_{};
+
+    // Back to waiting for the game, the recording from its start (a jump back; see SeekTo).
+    void Restart(double target) {
+        state_ = State::Waiting; stateAt_ = 0; lastHeard_ = 0; clientIp_ = 0; clientPort_ = 0;
+        datagramSeq_ = reliableIndex_ = orderIndex_ = 0; splitId_ = 0;
+        queue_.clear(); queuedBytes_ = 0; unacked_.clear(); acks_.clear(); seenReliable_.clear(); splits_.clear();
+        compression_ = false;
+        rec_.Rewind();
+        hasPending_ = ended_ = false; fileMs_ = 0; playMs_ = 0; selfShown_ = false;
+        seekTo_ = target; rewinding_ = true;
+    }
 
     void Offline(uint32_t id, In& in, uint32_t ip, uint16_t clientPort, uint64_t now) {
         Out o;
@@ -418,7 +649,7 @@ private:
             const uint64_t time = in.U64be();
             if (!HasMagic(in)) return;
             const std::string p = std::to_string(port);
-            const std::string motd = "MCPE;MyClient Replay;0;0.0.0;0;1;" + std::to_string(guid_) + ";Replay;Survival;1;" + p + ";" + p + ";0;";
+            const std::string motd = "MCPE;OriginX Replay;0;0.0.0;0;1;" + std::to_string(guid_) + ";Replay;Survival;1;" + p + ";" + p + ";0;";
             o.U8(Msg::UnconnectedPong); o.U64be(time); o.U64be(guid_); PutMagic(o); o.U16be(static_cast<uint32_t>(motd.size())); o.Raw(motd);
         }
         else if (id == Msg::OpenRequest1) {
@@ -490,7 +721,7 @@ private:
             for (const auto& p : packets)
                 if (GameId(p) == Id::RequestNetworkSettings) {
                     // The answer to RequestNetworkSettings is the last uncompressed batch.
-                    SendGame({rec_.networkSettings.empty() ? DefaultNetworkSettings() : rec_.networkSettings});
+                    SendGame({rec_.networkSettings.empty() ? DefaultNetworkSettings() : UncompressedSettings(rec_.networkSettings)});
                     compression_ = true;
                     state_ = State::Login; stateAt_ = now;
                 }
@@ -505,11 +736,17 @@ private:
             state_ = State::Packs; stateAt_ = now;
             return;
         }
+        if (state_ == State::Playing || state_ == State::Finished) {
+            for (const auto& p : packets) {
+                Pose pose;
+                if (GameId(p) == Id::PlayerAuthInput && ReadPose(p, pose)) { viewerPose_ = pose; haveViewerPose_ = true; }
+            }
+            return;
+        }
         for (const auto& p : packets) {
             if (GameId(p) != Id::PackResponse) continue;
-            In in = Body(p);
-            const uint32_t status = in.U8();
-            if (!in.ok) continue;
+            const uint32_t status = PackResponseStatus(Body(p));
+            if (!status) continue;
             if (status == PackStatus::SendPacks) packsRequested_ = true;
             if (state_ == State::Packs && (status == PackStatus::HaveAllPacks || status == PackStatus::SendPacks)) SendStack(now);
             else if (state_ == State::Stack && status == PackStatus::Completed) StartPlaying(now);
@@ -528,6 +765,10 @@ private:
         const auto flushBatch = [&] { if (!batch.empty()) { SendGame(batch); batch.clear(); batchBytes = 0; } };
         bool reachedMark = !rec_.hasMark || fileMs_ >= rec_.markMs;
         if (reachedMark && !paused_) playMs_ += static_cast<double>(step) * speed_;
+        if (seekTo_ >= 0) {   // a jump: everything up to there is due now
+            if (seekTo_ > playMs_) { skipUntil_ = seekTo_; playMs_ = seekTo_; }
+            seekTo_ = -1;
+        }
         // Back-pressure: no more than ~4 MB on the way (the setup burst can be tens of MB).
         while (Backlog() < (4u << 20)) {
             if (!hasPending_) {
@@ -540,14 +781,33 @@ private:
             fileMs_ = at;
             hasPending_ = false;
             if (pending_.mark) continue;
+            const bool free = FreeCamera();
+            const uint32_t id = GameId(pending_.data);
+            if (!pending_.sent && reachedMark && static_cast<double>(at - rec_.markMs) <= skipUntil_ && FreeCam::Transient(id)) continue;
             if (pending_.sent) {
                 Pose pose;
-                if (GameId(pending_.data) == Id::PlayerAuthInput && ReadPose(pending_.data, pose))
-                    batch.push_back(MovePlayer(rec_.runtimeId, pose.x, pose.y, pose.z, pose.pitch, pose.yaw, pose.headYaw, ++tick_));
+                if (id == Id::PlayerAuthInput && ReadPose(pending_.data, pose))
+                    batch.push_back(free ? FreeCam::MoveRecorded(rec_.runtimeId, pose.x, pose.y, pose.z, pose.pitch, pose.yaw, pose.headYaw, ++tick_)
+                                         : MovePlayer(rec_.runtimeId, pose.x, pose.y, pose.z, pose.pitch, pose.yaw, pose.headYaw, ++tick_));
+                // the recorded player's own swings and held items, for the others to see (same layout both ways)
+                else if (free && selfShown_ && (id == FreeCam::Animate || id == FreeCam::MobEquipment))
+                    batch.push_back(std::move(pending_.data));
+            }
+            else if (free && (id == FreeCam::SetPlayerGameType || id == FreeCam::CorrectPrediction || id == FreeCam::Respawn)) {
+                // about the local player, who is the viewer now: they would take its free camera away
             }
             else if (Replayed(pending_.data)) {
+                const bool spawn = id == Id::PlayStatus;
                 batchBytes += pending_.data.size();
-                batch.push_back(std::move(pending_.data));
+                batch.push_back(free && id == Id::StartGame ? FreeCam::ViewerStartGame(pending_.data) : std::move(pending_.data));
+                if (free && spawn && !selfShown_) {
+                    selfShown_ = true;
+                    batch.push_back(FreeCam::ReplayedPlayerList(rec_.self));
+                    batch.push_back(FreeCam::AddRecordedPlayer(rec_.self, rec_.start));
+                    batch.push_back(FreeCam::ViewerAbilities());
+                    if (rewinding_ && haveViewerPose_) batch.push_back(FreeCam::MoveViewer(viewerPose_, ++tick_));
+                }
+                if (spawn) rewinding_ = false;
             }
             if (batchBytes > (256u << 10)) flushBatch();
         }

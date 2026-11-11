@@ -169,6 +169,55 @@ inline bool DecodeWicMemory(const void* data, size_t size, int w, int h, Image& 
     return ok;
 }
 
+// A pack picture of any shape and size (pack_icon.png is often a wide screenshot, e.g. 1280x720): the centred
+// square of it, scaled by WIC to at most `size` pixels, as premultiplied BGRA. DecodeWic refuses pictures over
+// 1024 pixels, so wide or large icons used to show the letter tile instead.
+inline bool DecodeWicSquare(const std::wstring& path, int size, Image& out)
+{
+    static const bool com = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED)) || true;
+    (void)com;
+    IWICImagingFactory* factory = nullptr;
+    IWICBitmapDecoder* decoder = nullptr;
+    IWICBitmapFrameDecode* frame = nullptr;
+    IWICBitmapClipper* clipper = nullptr;
+    IWICBitmapScaler* scaler = nullptr;
+    IWICBitmapSource* converted = nullptr;
+    bool ok = false;
+    UINT w = 0, h = 0;
+    if (size > 0 && size <= 1024 &&
+        SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) &&
+        SUCCEEDED(factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &decoder)) &&
+        SUCCEEDED(decoder->GetFrame(0, &frame)) &&
+        SUCCEEDED(frame->GetSize(&w, &h)) && w > 0 && h > 0 && w <= 16384 && h <= 16384) {
+        const UINT side = std::min(w, h);
+        const WICRect square{static_cast<INT>((w - side) / 2), static_cast<INT>((h - side) / 2), static_cast<INT>(side), static_cast<INT>(side)};
+        const UINT target = std::min<UINT>(side, static_cast<UINT>(size));
+        IWICBitmapSource* source = frame;
+        if (w != h && SUCCEEDED(factory->CreateBitmapClipper(&clipper)) && SUCCEEDED(clipper->Initialize(frame, &square)))
+            source = clipper;
+        if (source == frame && w != h) source = nullptr;   // could not cut the square: give up (no stretched picture)
+        if (source && target != side &&
+            SUCCEEDED(factory->CreateBitmapScaler(&scaler)) &&
+            SUCCEEDED(scaler->Initialize(source, target, target, WICBitmapInterpolationModeFant)))
+            source = scaler;
+        else if (source && target != side)
+            source = nullptr;
+        if (source && SUCCEEDED(WICConvertBitmapSource(GUID_WICPixelFormat32bppPBGRA, source, &converted))) {
+            out.w = out.h = static_cast<int>(target);
+            out.bgra.assign(static_cast<size_t>(target) * target, 0);
+            ok = SUCCEEDED(converted->CopyPixels(nullptr, target * 4, target * target * 4, reinterpret_cast<BYTE*>(out.bgra.data())));
+        }
+    }
+    if (converted) converted->Release();
+    if (scaler) scaler->Release();
+    if (clipper) clipper->Release();
+    if (frame) frame->Release();
+    if (decoder) decoder->Release();
+    if (factory) factory->Release();
+    if (!ok) out = {};
+    return ok;
+}
+
 // One loaded icon plus the bitmap used to draw it (created on first use).
 struct Icon { Image image; HBITMAP bitmap = nullptr; bool tried = false; };
 
@@ -266,8 +315,8 @@ public:
     }
 };
 
-// Pictures by file path (pack_icon.png of each resource pack), shrunk once to `size` pixels with an
-// area average so large photos stay smooth. Misses are remembered too.
+// Pictures by file path (pack_icon.png of each resource pack): the centred square, shrunk once to `size`
+// pixels (WIC's Fant filter, so large photos stay smooth). Misses are remembered too.
 class FileCache {
     std::map<std::wstring, Icon> icons_;
 public:
@@ -278,8 +327,7 @@ public:
         if (!icon.tried) {
             icon.tried = true;
             std::error_code ec;
-            if (!fs::is_regular_file(file, ec) || !DecodeWic(file.wstring(), icon.image)) icon.image = {};
-            else if (icon.image.w > size || icon.image.h > size) icon.image = Shrink(icon.image, size);
+            if (!fs::is_regular_file(file, ec) || !DecodeWicSquare(file.wstring(), size, icon.image)) icon.image = {};
         }
         return MakeBitmap(icon) ? &icon : nullptr;
     }

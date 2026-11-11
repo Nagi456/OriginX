@@ -1,6 +1,8 @@
 #include "../LitePack.h"
+#include "../TexturePacks.h"
 #include <cassert>
 #include <iostream>
+#include <utility>
 int main()
 {
     namespace fs = std::filesystem;
@@ -48,9 +50,25 @@ int main()
         assert(LitePack::Write(dir, b));
         std::ifstream in(dir / "manifest.json");
         const std::string m((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        assert(m.find("\"version\": [1, 0, " + std::to_string(vb) + "]") != std::string::npos);
+        TexturePacks::Pack generated;
+        assert(TexturePacks::ParseManifest(m, generated));
+        assert(generated.version[0] == 1 && generated.version[1] <= 65535 && generated.version[2] <= 65535);
+        assert((generated.version[1] << 16 | generated.version[2]) == vb);
         assert(LitePack::Write(dir, LitePack::NothingOn()));
         assert(!fs::exists(dir / "animations/player_firstperson.animation.json") && !fs::exists(dir / "textures/environment/clouds.png"));
+    }
+    // Bedrock's SemVersion components are uint16_t. The observed r40 patch 897878 must survive the HUD's
+    // manifest parsing without exceeding that limit; header and module must use the same split version.
+    for (const auto& [content, expected] : std::vector<std::pair<int, std::string>>{
+             {65535, "[1, 0, 65535]"}, {65536, "[1, 1, 0]"}, {897878, "[1, 13, 45910]"}}) {
+        const auto manifest = LitePack::Manifest(content);
+        const auto first = manifest.find("\"version\": " + expected);
+        assert(first != std::string::npos);
+        assert(manifest.find("\"version\": " + expected, first + 1) != std::string::npos);
+        TexturePacks::Pack parsed;
+        assert(TexturePacks::ParseManifest(manifest, parsed));
+        assert(parsed.version[1] <= 65535 && parsed.version[2] <= 65535);
+        assert((parsed.version[1] << 16 | parsed.version[2]) == content);
     }
     // Particles: identifiers found by keyword, silenced only while switched on
     {

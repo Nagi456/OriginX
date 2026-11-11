@@ -22,8 +22,10 @@
 #include "FrameGen.h"
 #include "FrameGenPacing.h"
 #include "FeatureData.h"
+#include "PresentPolicy.h"
 
 #include <windows.h>
+#include <psapi.h>
 #include <d3d12.h>
 #include <d3d11.h>
 #include <dxgi1_5.h>
@@ -91,7 +93,6 @@ std::mutex renderMutex;   // Present / ResizeBuffers may come from different thr
 std::mutex inputMutex;
 Camera camera; uint64_t cameraAt = 0;
 Matrices matrices{}; float matricesPos[3] = {}; uint64_t matricesAt = 0;
-std::atomic<uint64_t> outlineDrawnAt{0};
 std::vector<MyClientTabList::Box> boxes; uint64_t boxesAt = 0;
 std::vector<float> boxShifts;   // 3 per box of `boxes`, or empty (no shift known yet)
 bool hasTarget = false; int targetX = 0, targetY = 0, targetZ = 0; uint64_t targetAt = 0;
@@ -456,7 +457,6 @@ void Render(IDXGISwapChain* swap) {
     Camera cam{}; bool haveCamera = false;
     Matrices mats{}; bool haveMatrices = false; float matPos[3] = {};
     std::vector<MyClientTabList::Box> lineBoxes;
-    bool outline = false; int ox = 0, oy = 0, oz = 0;
     {
         std::lock_guard in(inputMutex);
         haveCamera = MyClientHudFrame::Fresh(cameraAt, now, 250);
@@ -474,10 +474,8 @@ void Render(IDXGISwapChain* swap) {
                         lineBoxes[i].max[k] += boxShifts[i * 3 + k];
                     }
         }
-        outline = haveCamera && MyClientGame::OutlineWanted() && hasTarget && MyClientHudFrame::Fresh(targetAt, now, 1000);
-        ox = targetX; oy = targetY; oz = targetZ;
     }
-    if (!showHud && lineBoxes.empty() && !outline) return;
+    if (!showHud && lineBoxes.empty()) return;
 
     ComPtr<IDXGISwapChain3> swap3;
     if (FAILED(swap->QueryInterface(IID_PPV_ARGS(&swap3)))) { Fail("IDXGISwapChain3", E_NOINTERFACE); return; }
@@ -521,10 +519,6 @@ void Render(IDXGISwapChain* swap) {
         uint32_t colors[4];
         MyClientGame::HitboxColors(colors);
         AddHitboxes(builder, projector, lineBoxes.data(), static_cast<uint32_t>(lineBoxes.size()), MyClientGame::HitboxFilter(), thickness, colors);
-    }
-    if (outline) {
-        AddBlockOutline(builder, projector, ox, oy, oz, MyClientGame::OutlineRgb(), thickness);
-        outlineDrawnAt.store(now);
     }
     if (showHud && textureFilled) builder.Picture();   // last: the HUD sits on top of the lines
     if (vertices.empty() && !copyRows) return;
@@ -613,22 +607,28 @@ void CountPresent() {
     presentedFps.store(presents.Value(now));
     presentedAt.store(GetTickCount64());
 }
-// Where a game frame's time goes (Present thread), logged every 60 s: the game's own work between two
-// Presents, our HUD drawing, and the time the real Present blocks (waiting for the display shows up here).
+// CPU wall time with FG off. Separate proxy/fence waits from HUD work and the native Present call.
+// GPU execution can also show up in the game's interval; these are not GPU timestamp measurements.
+void ReportMemoryUsage();
 struct PresentTiming {
-    double start = 0, lastExit = 0, game = 0, hud = 0, wait = 0;
+    double start = 0, lastExit = 0, game = 0, presenter = 0, copy = 0, hud = 0, wait = 0;
     uint32_t frames = 0, sync = 0, flags = 0;
-    void Frame(double entry, double hudDone, double exit, UINT s, UINT f) {
+    void Frame(double entry, double presenterDone, double copyDone, double hudDone, double exit,
+               UINT s, UINT f, bool proxy, bool uncap) {
         if (start <= 0) start = entry;
         if (lastExit > 0 && entry > lastExit) game += entry - lastExit;
-        hud += hudDone - entry;
+        presenter += presenterDone - entry;
+        copy += copyDone - presenterDone;
+        hud += hudDone - copyDone;
         wait += exit - hudDone;
         lastExit = exit; sync = s; flags = f;
-        if (++frames >= 30 && exit - start >= 60000) {
-            char text[220];
-            std::snprintf(text, sizeof text, "Present timing (60 s): %u frames (%.0f FPS), per frame game=%.2f ms hud=%.2f ms present=%.2f ms (sync %u, flags 0x%X)",
-                          frames, frames * 1000.0 / (exit - start), game / frames, hud / frames, wait / frames, sync, flags);
+        if (++frames >= 30 && exit - start >= 10000) {
+            char text[380];
+            std::snprintf(text, sizeof text, "Present timing (10 s, native path): %u frames (%.0f FPS), per frame game=%.2f ms waitPresenter=%.2f ms copy=%.2f ms hud=%.2f ms present=%.2f ms (sync %u, effectiveFlags=0x%X proxy=%s optimizeUncap=%s)",
+                          frames, frames * 1000.0 / (exit - start), game / frames, presenter / frames, copy / frames,
+                          hud / frames, wait / frames, sync, flags, proxy ? "true" : "false", uncap ? "true" : "false");
             Info(text);
+            ReportMemoryUsage();
             *this = {};
             lastExit = exit;
         }
@@ -656,6 +656,76 @@ void WaitPrecise(double ms, const std::atomic<bool>* stop = nullptr) {
 
 MyClientFrameGen::Gpu FrameGenGpu() {
     return {device.Get(), gameQueue.load(), executeOrig, &Warn};
+}
+
+void ReportMemoryUsage() {
+    MEMORYSTATUSEX system{}; system.dwLength = sizeof(system);
+    PROCESS_MEMORY_COUNTERS_EX process{}; process.cb = sizeof(process);
+    using MemoryFn = BOOL(WINAPI*)(HANDLE, PPROCESS_MEMORY_COUNTERS, DWORD);
+    static const auto readMemory = Proc<MemoryFn>(GetModuleHandleW(L"kernel32.dll"), "K32GetProcessMemoryInfo");
+    const bool haveSystem = GlobalMemoryStatusEx(&system) != FALSE;
+    const bool haveProcess = readMemory && readMemory(GetCurrentProcess(),
+        reinterpret_cast<PPROCESS_MEMORY_COUNTERS>(&process), sizeof(process));
+    uint64_t proxyBytes = 0, hudBytes = 0, fgBytes = 0;
+    DXGI_QUERY_VIDEO_MEMORY_INFO local{}, shared{};
+    bool haveLocal = false, haveShared = false;
+    {
+        std::lock_guard guard(renderMutex);
+        if (device) {
+            const auto allocationBytes = [](ID3D12Device* dev, ID3D12Resource* resource) -> uint64_t {
+                if (!dev || !resource) return 0;
+                const auto desc = resource->GetDesc();
+                const auto info = dev->GetResourceAllocationInfo(0, 1, &desc);
+                return info.SizeInBytes != UINT64_MAX ? info.SizeInBytes : 0;
+            };
+            // proxyMutex is never held while its other callers take renderMutex.
+            {
+                std::lock_guard proxyGuard(proxyMutex);
+                for (const auto& proxy : proxies)
+                    for (const auto& buffer : proxy.buffers) proxyBytes += allocationBytes(device.Get(), buffer.Get());
+            }
+            hudBytes += allocationBytes(device.Get(), texture.Get());
+            for (const auto& frame : frames) {
+                hudBytes += allocationBytes(device.Get(), frame.upload.Get());
+                hudBytes += allocationBytes(device.Get(), frame.vertexBuffer.Get());
+            }
+            fgBytes = MyClientFrameGen::TextureBytes();
+            static ComPtr<IDXGIAdapter3> memoryAdapter;
+            if (!memoryAdapter) {
+                auto create = Proc<CreateFactoryFn>(GetModuleHandleW(L"dxgi.dll"), "CreateDXGIFactory1");
+                ComPtr<IDXGIFactory4> factory;
+                if (create && SUCCEEDED(create(IID_PPV_ARGS(&factory))) && factory)
+                    factory->EnumAdapterByLuid(device->GetAdapterLuid(), IID_PPV_ARGS(&memoryAdapter));
+            }
+            if (memoryAdapter) {
+                haveLocal = SUCCEEDED(memoryAdapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local));
+                haveShared = SUCCEEDED(memoryAdapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared));
+            }
+        }
+    }
+    constexpr double mib = 1024.0 * 1024.0;
+    char text[640];
+    std::snprintf(text, sizeof text,
+        "Memory usage (MiB): processKnown=%s private=%.1f workingSet=%.1f systemKnown=%s available=%.1f commitFree=%.1f; ownedGpuBuffers proxy=%.1f hud=%.1f fgTextures=%.1f; localKnown=%s localUsage=%.1f localBudget=%.1f sharedKnown=%s sharedUsage=%.1f sharedBudget=%.1f",
+        haveProcess ? "true" : "false", process.PrivateUsage / mib, process.WorkingSetSize / mib,
+        haveSystem ? "true" : "false", system.ullAvailPhys / mib, system.ullAvailPageFile / mib,
+        proxyBytes / mib, hudBytes / mib, fgBytes / mib,
+        haveLocal ? "true" : "false", local.CurrentUsage / mib, local.Budget / mib,
+        haveShared ? "true" : "false", shared.CurrentUsage / mib, shared.Budget / mib);
+    Info(text);
+}
+
+void TrimDisabledFrameGen() {
+    if (!MyClientFrameGen::HasResources()) return;
+    uint64_t bytes = 0;
+    bool trimmed = false;
+    {
+        std::lock_guard guard(renderMutex);
+        bytes = MyClientFrameGen::TextureBytes();
+        trimmed = MyClientFrameGen::Trim();
+    }
+    if (trimmed) Info("Frame Generation OFF: released GPU resources (texture heaps " +
+                      std::to_string(bytes / (1024 * 1024)) + " MiB; re-created on next enable).");
 }
 // The current back buffer of `swap` (renderMutex held, Prepare done).
 Frame* CurrentFrame(IDXGISwapChain* swap) {
@@ -770,6 +840,7 @@ struct Job {
     double spacingMs = 0;   // between two presents of the job
     double intervalMs = 0;  // the game's own frame time: the job must be done before its next frame
     bool generate = false;  // in-between pictures first (else only the game frame)
+    bool resetEstimates = false; // first playable frame after a menu: menu present costs are not game costs
 };
 std::mutex jobMutex;
 std::condition_variable jobReady, jobDone;
@@ -788,14 +859,57 @@ std::atomic<uint32_t> plainMenu{0}, plainLate{0}, plainCapture{0};
 MyClientFrameGen::Cost presenterCost;        // presenter thread only
 MyClientFrameGen::Extras presenterExtras;    // presenter thread only
 MyClientFrameGen::Tuner presenterTuner;      // presenter thread only
-std::atomic<uint32_t> presenterChoice{0};    // made-up frames per game frame chosen last (for the log)
+std::atomic<uint32_t> presenterChoice{0};    // made-up frames per game frame chosen last (for the log and the HUD)
+std::atomic<uint32_t> presenterFits{0};      // the most made-up frames the measured cost fits, any multiplier (HUD)
+// Timings cross the presenter/game thread boundary through atomics, never by reading Cost concurrently.
+std::atomic<double> presenterMadeMs{0}, presenterRealMs{0};
+struct PresenterStage {
+    std::atomic<uint64_t> us{0}, calls{0};
+    void Note(double start) {
+        const double elapsed = NowMs() - start;
+        if (elapsed >= 0) us.fetch_add(static_cast<uint64_t>(elapsed * 1000));
+        calls.fetch_add(1);
+    }
+    double TakeMs() {
+        const auto elapsed = us.exchange(0);
+        const auto count = calls.exchange(0);
+        return count ? static_cast<double>(elapsed) / (1000.0 * count) : 0;
+    }
+};
+PresenterStage synthStage, restoreStage, hudStage, nativePresentStage;
+std::atomic<UINT> presenterFlags{0};
+std::atomic<HRESULT> presenterHr{S_OK};
+HRESULT PresentJobPicture(const Job& job, IDXGISwapChain* swap) {
+    if (!swap || !presentOrig) return E_POINTER;
+    const double hudStart = NowMs();
+    Render(swap);
+    hudStage.Note(hudStart);
+    const UINT flags = job.flags | job.tearing;
+    const double nativeStart = NowMs();
+    const HRESULT hr = presentOrig(swap, 0u, flags);
+    nativePresentStage.Note(nativeStart);
+    presenterFlags.store(flags);
+    presenterHr.store(hr);
+    return hr;
+}
 
 HRESULT RunJob(const Job& job) {
     IDXGISwapChain* swap = job.swap.Get();
     if (!swap || !presentOrig) return S_OK;
+    if (job.resetEstimates) {
+        presenterCost = {};
+        presenterMadeMs.store(0);
+        presenterRealMs.store(0);
+        presenterExtras = {};
+        presenterTuner = {};
+        presenterChoice.store(0);
+        presenterFits.store(0);
+    }
     const double start = NowMs();
     if (job.generate) {
         // As many made-up frames as fit (MyClientFrameGen::Extras), spread evenly over the game's frame time.
+        presenterFits.store(MyClientFrameGen::FitCount(MyClientFeatures::FrameGenMaxMultiplier - 1, job.intervalMs,
+                                                       presenterCost, start));
         const uint32_t extra = presenterTuner.Choose(
             job.multiplier, presenterExtras.Plan(job.multiplier, job.intervalMs, presenterCost, start), start);
         presenterChoice.store(extra);
@@ -816,12 +930,13 @@ HRESULT RunJob(const Job& job) {
                 made = frame && MyClientFrameGen::Generate(FrameGenGpu(), frame->back.Get(), frame->rtv,
                                                            MyClientFrameGen::FramePhase(k, steps), job.method);
             }
+            synthStage.Note(madeStart);
             if (!made) { madeFailed.fetch_add(1); break; }
-            Render(swap);
-            const HRESULT hr = presentOrig(swap, 0u, job.flags | job.tearing);
+            const HRESULT hr = PresentJobPicture(job, swap);
             CountPresent();
             presenterTuner.Present();
             presenterCost.Made(NowMs(), NowMs() - madeStart);
+            presenterMadeMs.store(presenterCost.made);
             if (FAILED(hr)) return hr;
         }
         // The game frame goes at its slot, or at once when the game's next Present is already waiting.
@@ -835,12 +950,13 @@ HRESULT RunJob(const Job& job) {
         Frame* frame = Prepare(swap) ? CurrentFrame(swap) : nullptr;
         restored = frame && MyClientFrameGen::Restore(FrameGenGpu(), frame->back.Get());
     }
+    restoreStage.Note(realStart);
     if (!restored) return S_OK;   // Frame Generation failed: the next Present copies the game's picture itself
-    Render(swap);
-    const HRESULT hr = presentOrig(swap, 0u, job.flags | job.tearing);   // V-Sync off while Frame Generation is on
+    const HRESULT hr = PresentJobPicture(job, swap); // V-Sync off while Frame Generation is on
     CountPresent();
     if (job.generate) presenterTuner.Present();
     MyClientFrameGen::Cost::Note(presenterCost.real, NowMs() - realStart);
+    presenterRealMs.store(presenterCost.real);
     return hr;
 }
 void PresenterLoop() {
@@ -917,8 +1033,15 @@ struct FrameGenTiming {
                           frames, presentCount.load() - presentsAtStart, multiplier, madeSkipped.exchange(0),
                           madeFailed.exchange(0), jobsPlain.exchange(0), plainMenu.exchange(0), plainLate.exchange(0),
                           plainCapture.exchange(0), presenterChoice.load(), game / frames,
-                          wait / frames, capture / frames, presenterCost.made, presenterCost.real);
+                          wait / frames, capture / frames, presenterMadeMs.load(), presenterRealMs.load());
             Info(text);
+            char stages[300];
+            std::snprintf(stages, sizeof stages,
+                          "Frame Generation stages: synth=%.2f ms restore=%.2f ms hud=%.2f ms nativePresent=%.2f ms (sync=0 flags=0x%x hr=0x%08x)",
+                          synthStage.TakeMs(), restoreStage.TakeMs(), hudStage.TakeMs(), nativePresentStage.TakeMs(),
+                          presenterFlags.load(), static_cast<unsigned>(presenterHr.load()));
+            Info(stages);
+            ReportMemoryUsage();
             *this = {};
             lastExit = exit;
         }
@@ -943,6 +1066,9 @@ HRESULT PresentProxied(IDXGISwapChain* swap, UINT sync, UINT flags, ID3D12Resour
     const uint32_t multiplier = MyClientGame::FrameGenMultiplier(field);
     const uint32_t method = MyClientFeatures::FrameGenMethodOf(field);
     const bool on = multiplier >= 2 && enabled.load() && !failed && !MyClientFrameGen::Failed();
+    static bool wasPaused = true; // game present thread; estimators themselves reset on their owner thread
+    const bool resume = wasPaused && !paused;
+    wasPaused = paused || !on;
     if (on) {
         pacer.Frame(entry);
         pacer.Held(waited - entry);
@@ -957,6 +1083,7 @@ HRESULT PresentProxied(IDXGISwapChain* swap, UINT sync, UINT flags, ID3D12Resour
                 if (!usable) MyClientFrameGen::Forget();   // after a pause or a hitch, start again from this frame
                 const bool captured = MyClientFrameGen::Capture(gpu, drawn, method == MyClientFeatures::FrameGenMotion);
                 job.generate = captured && usable;
+                job.resetEstimates = resume;
                 if (paused) plainMenu.fetch_add(1);
                 else if (late) plainLate.fetch_add(1);
                 else if (!captured) plainCapture.fetch_add(1);
@@ -979,6 +1106,7 @@ HRESULT PresentProxied(IDXGISwapChain* swap, UINT sync, UINT flags, ID3D12Resour
             job.spacingMs = generate ? pacer.WaitMs(multiplier, MyClientFeatures::FrameGenPacingOf(field), 0u) : 0;
             job.intervalMs = pacer.AverageMs();
             if (StartJob(std::move(job))) {
+                presentTiming = {}; // FG-on intervals must not be charged to the next FG-off game frame
                 frameGenState.store(generate ? MyClientFeatures::FrameGenRunning : MyClientFeatures::FrameGenPaused);
                 frameGenTiming.Frame(entry, waited, NowMs(), multiplier);
                 return S_OK;
@@ -987,24 +1115,29 @@ HRESULT PresentProxied(IDXGISwapChain* swap, UINT sync, UINT flags, ID3D12Resour
     }
     frameGenState.store(on ? MyClientFeatures::FrameGenUnavailable : MyClientFeatures::FrameGenOff);
     if (pacer.AverageMs() > 0) { pacer.Reset(); std::lock_guard guard(renderMutex); MyClientFrameGen::Forget(); }
+    if (!on) TrimDisabledFrameGen(); // presenter was joined above; never trim merely for a pause/menu
     UINT tearing = 0;
     bool copied = false;
     {
         std::lock_guard guard(renderMutex);
         copied = Prepare(swap) && CopyDrawn(swap, drawn);
         if (!copied) copied = CopyDrawnDirect(swap, drawn);
-        // The game's own V-Sync off (sync 0) only reaches past the refresh rate in a window with ALLOW_TEARING.
-        if (sync == 0 && swap == boundSwap && boundTearing) tearing = DXGI_PRESENT_ALLOW_TEARING;
+        // Honor the game's V-Sync OFF even with every OriginX optimization disabled.
+        // boundTearing already checks the chain capability and excludes exclusive fullscreen.
+        if (MyClientPresentation::AllowNativeTearing(sync, swap == boundSwap && boundTearing))
+            tearing = DXGI_PRESENT_ALLOW_TEARING;
     }
     static bool toldCopy = false;
     if (!copied && !toldCopy) {
         toldCopy = true;
         Warn("In-game drawing: the game's picture could not be copied to the screen (one frame shows an old picture).");
     }
+    const double copyDone = NowMs();
     Render(swap);
     const double hudDone = NowMs();
     const HRESULT hr = present(sync, tearing);
-    presentTiming.Frame(entry, hudDone, NowMs(), sync, flags);
+    presentTiming.Frame(entry, waited, copyDone, hudDone, NowMs(), sync, flags | tearing, true,
+                        MyClientGame::UncapFpsWanted());
     CountPresent();
     return hr;
 }
@@ -1026,7 +1159,11 @@ HRESULT PresentFrame(IDXGISwapChain* swap, UINT sync, UINT flags, PresentCall pr
         }
     }
     if (drawn) return PresentProxied(swap, sync, flags, drawn.Get(), present);
-    WaitPresenterIdle();   // the presenter may still be showing another swap chain's last frame
+    const double entry = NowMs();
+    HRESULT failure = S_OK;
+    if (!WaitPresenterIdle(&failure)) return S_OK; // do not retire resources used by a busy presenter
+    if (FAILED(failure)) return failure;
+    const double waited = NowMs();
     bool paused = false;
     const uint32_t field = MyClientGame::FrameGenField(paused);
     const bool on = MyClientGame::FrameGenMultiplier(field) >= 2 && enabled.load() && !failed;
@@ -1034,21 +1171,24 @@ HRESULT PresentFrame(IDXGISwapChain* swap, UINT sync, UINT flags, PresentCall pr
     static bool toldNoProxies = false;
     if (on && !toldNoProxies) {
         toldNoProxies = true;
-        Info("Frame Generation unavailable: the game took its back buffers before MyClient's hooks. Resizing the game "
+        Info("Frame Generation unavailable: the game took its back buffers before OriginX's hooks. Resizing the game "
              "window once (or F11 twice) turns it on.");
     }
     if (pacer.AverageMs() > 0) { pacer.Reset(); std::lock_guard guard(renderMutex); MyClientFrameGen::Forget(); }
-    // The game's own V-Sync off (sync 0) only reaches past the refresh rate in a window with ALLOW_TEARING.
+    if (!on) TrimDisabledFrameGen();
+    // The game's V-Sync setting also applies when no proxy/FG path is available.
     UINT tearing = 0;
     if (sync == 0) {
         std::lock_guard guard(renderMutex);
-        if (swap == boundSwap && boundTearing) tearing = DXGI_PRESENT_ALLOW_TEARING;
+        if (MyClientPresentation::AllowNativeTearing(sync, swap == boundSwap && boundTearing))
+            tearing = DXGI_PRESENT_ALLOW_TEARING;
     }
-    const double entry = NowMs();
+    const double copyDone = NowMs(); // includes setup; this path does not copy a proxy image
     Render(swap);
     const double hudDone = NowMs();
     const HRESULT hr = present(sync, tearing);
-    presentTiming.Frame(entry, hudDone, NowMs(), sync, flags);
+    presentTiming.Frame(entry, waited, copyDone, hudDone, NowMs(), sync, flags | tearing, false,
+                        MyClientGame::UncapFpsWanted());
     CountPresent();
     return hr;
 }
@@ -1162,7 +1302,7 @@ ComPtr<ID3D12Resource> MakeProxies(IDXGISwapChain* swap, UINT index) {
         if (proxies.size() >= 4) proxies.erase(proxies.begin());   // swap chains the game has dropped
         proxies.push_back(std::move(made));
     }
-    Info("In-game drawing: the game draws into MyClient's copies of its " + std::to_string(desc.BufferCount) + " back buffers (" +
+    Info("In-game drawing: the game draws into OriginX's copies of its " + std::to_string(desc.BufferCount) + " back buffers (" +
          std::to_string(rd.Width) + "x" + std::to_string(rd.Height) + "), so Frame Generation does not hold the game.");
     return out;
 }
@@ -1352,7 +1492,7 @@ bool FindFactoryTargets(std::string& why) {
         why = "CreateDXGIFactory1 failed (" + Hex(hr) + ")";
         return false;
     }
-    if (!HookCreation(factory.Get(), "a DXGI factory of MyClient's")) { why = "the creation functions could not be hooked"; return false; }
+    if (!HookCreation(factory.Get(), "a DXGI factory of OriginX's")) { why = "the creation functions could not be hooked"; return false; }
     return true;
 }
 
@@ -1602,10 +1742,6 @@ void SetMatrices(const float view[16], const float proj[16], float x, float y, f
     matricesAt = GetTickCount64();
 }
 
-bool DrawingOutline() {
-    return enabled.load() && !failed && MyClientHudFrame::Fresh(outlineDrawnAt.load(), GetTickCount64(), 300);
-}
-
 void SetBoxes(const MyClientTabList::Box* list, uint32_t count) {
     std::lock_guard in(inputMutex);
     boxes.assign(list, list + count);
@@ -1628,12 +1764,33 @@ bool GpuInfo(Gpu& out) {
 void FrameGenStatus(float& fps, uint32_t& state) {
     const bool fresh = MyClientHudFrame::Fresh(presentedAt.load(), GetTickCount64(), 2000);
     fps = fresh ? presentedFps.load() : 0.f;
-    state = fresh ? frameGenState.load() : MyClientFeatures::FrameGenOff;
+    const uint32_t now = fresh ? frameGenState.load() : MyClientFeatures::FrameGenOff;
+    // While running, also what the multiplier really gives: it is only an upper limit (the made-up frames that do
+    // not fit in the game's frame time are not made), so x3..x10 can all show the same.
+    const bool running = now == MyClientFeatures::FrameGenRunning;
+    state = MyClientFeatures::EncodeFrameGenStatus(now, running ? presenterChoice.load() + 1 : 0u,
+                                                   running ? presenterFits.load() + 1 : 0u);
 }
 
 void SetTarget(bool has, int x, int y, int z) {
     std::lock_guard in(inputMutex);
     hasTarget = has; targetX = x; targetY = y; targetZ = z;
     targetAt = GetTickCount64();
+}
+bool DrainGameGpu() {
+    std::lock_guard guard(renderMutex);
+    auto* queue = gameQueue.load();
+    if (!queue) return false;
+    ComPtr<ID3D12Device> dev;
+    ComPtr<ID3D12Fence> barrier;
+    if (FAILED(queue->GetDevice(IID_PPV_ARGS(&dev))) || !dev ||
+        FAILED(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&barrier))) || !barrier) return false;
+    HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event) return false;
+    const bool queued = SUCCEEDED(queue->Signal(barrier.Get(), 1)) &&
+                        SUCCEEDED(barrier->SetEventOnCompletion(1, event));
+    const bool done = queued && WaitForSingleObject(event, 250) == WAIT_OBJECT_0;
+    CloseHandle(event);
+    return done;
 }
 }  // namespace MyClientCompositor

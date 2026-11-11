@@ -23,7 +23,6 @@ void SetCamera(float x, float y, float z, float yaw, float pitch, float fov);   
 // The game's own view/projection matrices of the frame (column-major) and the camera position
 // (LevelRendererPlayer::setupCamera). Preferred over SetCamera when fresh: exact, bobbing included.
 void SetMatrices(const float view[16], const float proj[16], float x, float y, float z);
-bool DrawingOutline();   // the coloured Block Outline was drawn recently (the game's own can be skipped)
 void SetBoxes(const MyClientTabList::Box* boxes, uint32_t count);               // game tick
 // Every rendered frame: how far each box of the last SetBoxes must move (x, y, z each) to sit where the game
 // draws its actor this frame. Ignored unless count matches that list; SetBoxes clears it.
@@ -35,4 +34,7 @@ void FrameGenStatus(float& presentedFps, uint32_t& state);
 // Debug Menu: the GPU the game draws with (see MyClientFeatures::Shared.gpuName...); false before its first frame.
 struct Gpu { char name[128]; uint32_t directX, featureLevel, videoMb, vendor; uint64_t driver; };
 bool GpuInfo(Gpu& out);
+// At a pack-switch boundary only: finish commands submitted before resources are replaced.
+// Bounded wait; failure means the caller must leave the live resources untouched.
+bool DrainGameGpu();
 }

@@ -16,7 +16,7 @@ enum Site : int { Frame, Fov, Light, Outline, TessColor, ActorRender, NameTag, N
 inline constexpr const char* kNames[Count] = {"frame", "fov", "light", "outline", "tessColor", "actorRender",
                                               "nameTag", "nick", "hit", "replay", "tick", "screen", "chat",
                                               "gameFrame", "uiUpdate", "uiRender", "hudTick", "itemUpdate", "itemRender"};
-struct Counter { std::atomic<uint64_t> calls{0}, ticks{0}; };
+struct Counter { std::atomic<uint64_t> calls{0}, ticks{0}, peak{0}; };
 inline Counter counters[Count];
 
 inline uint64_t Now() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return static_cast<uint64_t>(t.QuadPart); }
@@ -40,7 +40,12 @@ struct GameScope {
     explicit GameScope(Site s) : site(s) { if (Depth(s)++ == 0) start = Now(); }
     ~GameScope() {
         if (--Depth(site) != 0) return;
-        counters[site].ticks.fetch_add(Now() - start, std::memory_order_relaxed);
+        const auto elapsed = Now() - start;
+        counters[site].ticks.fetch_add(elapsed, std::memory_order_relaxed);
+        if (site == GameFrame) {
+            auto peak = counters[site].peak.load(std::memory_order_relaxed);
+            while (peak < elapsed && !counters[site].peak.compare_exchange_weak(peak, elapsed, std::memory_order_relaxed)) {}
+        }
         counters[site].calls.fetch_add(1, std::memory_order_relaxed);
     }
     GameScope(const GameScope&) = delete;
@@ -63,6 +68,11 @@ inline std::string Summary(uint64_t nowMs, uint64_t periodMs = 10000) {
         char part[96];
         std::snprintf(part, sizeof part, " %s=%.0f calls/%.2f ms", kNames[i], calls / seconds, ms);
         out += part;
+        if (i == GameFrame) {
+            const auto peak = counters[i].peak.exchange(0);
+            std::snprintf(part, sizeof part, " gameFramePeak=%.2f ms", peak * 1000.0 / static_cast<double>(f.QuadPart));
+            out += part;
+        }
     }
     since = nowMs; frames = 0;
     return out;

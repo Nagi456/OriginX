@@ -20,6 +20,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <atomic>
+#include <initializer_list>
 
 namespace MyClientFrameGen {
 namespace {
@@ -143,6 +145,7 @@ float4 blitPs(VsOut i) : SV_Target { return float4(t0.Load(int3(int2(i.pos.xy), 
 struct Texture {
     ComPtr<ID3D12Resource> resource;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+    uint64_t bytes = 0;
 };
 // Descriptor sets: 4 SRVs (t0..t3) then 2 UAVs (u0..u1), one set per pass and history parity.
 enum Set : UINT { LumaSet0, LumaSet1, MotionSet0, MotionSet1, SmoothSet, SynthSet0, SynthSet1, BlitSet, SetCount };
@@ -152,6 +155,7 @@ struct Slot { ComPtr<ID3D12CommandAllocator> allocator; UINT64 fenceValue = 0; }
 
 bool failed = false;
 bool objectsReady = false;
+std::atomic<bool> resourcesResident{false};
 ComPtr<ID3D12RootSignature> rootSignature;
 ComPtr<ID3D12PipelineState> lumaPso, motionPso, smoothPso, synthPso, blitPso;
 DXGI_FORMAT blitFormat = DXGI_FORMAT_UNKNOWN;
@@ -238,6 +242,7 @@ bool ComputePso(const Gpu& gpu, CompileFn compile, const char* entry, ComPtr<ID3
 
 bool CreateObjects(const Gpu& gpu) {
     if (objectsReady) return true;
+    resourcesResident.store(true); // includes partial setup if creation later fails
     ID3D12Device* device = gpu.device;
     // Root signature: 12 constants (b0), one table of 4 SRVs + 2 UAVs, a linear/clamp sampler.
     D3D12_DESCRIPTOR_RANGE ranges[2] = {
@@ -265,7 +270,9 @@ bool CreateObjects(const Gpu& gpu) {
     hr = device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&rootSignature));
     if (FAILED(hr)) { Fail(gpu, "CreateRootSignature", hr); return false; }
 
-    auto compile = Proc<CompileFn>(LoadLibraryW(L"d3dcompiler_47.dll"), "D3DCompile");
+    HMODULE compiler = GetModuleHandleW(L"d3dcompiler_47.dll");
+    if (!compiler) compiler = LoadLibraryW(L"d3dcompiler_47.dll");
+    auto compile = Proc<CompileFn>(compiler, "D3DCompile");
     if (!compile) { Fail(gpu, "loading d3dcompiler_47.dll", E_NOINTERFACE); return false; }
     if (!ComputePso(gpu, compile, "luma", lumaPso) || !ComputePso(gpu, compile, "motion", motionPso) ||
         !ComputePso(gpu, compile, "smooth", smoothPso) || !ComputePso(gpu, compile, "synth", synthPso))
@@ -321,8 +328,11 @@ bool MakeTexture(const Gpu& gpu, Texture& t, UINT w, UINT h, DXGI_FORMAT f, bool
     d.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
     const auto heapProps = HeapOf(D3D12_HEAP_TYPE_DEFAULT);
     t.resource.Reset();
+    t.bytes = 0;
     const HRESULT hr = gpu.device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &d, initial, nullptr, IID_PPV_ARGS(&t.resource));
     if (FAILED(hr)) { Fail(gpu, "creating a Frame Generation texture", hr); return false; }
+    const auto allocation = gpu.device->GetResourceAllocationInfo(0, 1, &d);
+    if (allocation.SizeInBytes != UINT64_MAX) t.bytes = allocation.SizeInBytes;
     t.state = initial;
     return true;
 }
@@ -529,4 +539,36 @@ void Release() {
     width = height = 0; format = DXGI_FORMAT_UNKNOWN;
     Forget();
 }
+
+uint64_t TextureBytes() {
+    uint64_t bytes = 0;
+    for (const auto* t : {&history[0], &history[1], &luma[0], &luma[1], &rawMotion, &motionField, &generated})
+        if (t && t->resource) bytes += t->bytes;
+    return bytes;
+}
+
+bool Trim() {
+    if (!rootSignature && !heap && !fence && !history[0].resource) {
+        resourcesResident.store(false);
+        return false;
+    }
+    // The presenter must already be idle (the caller owns the Compositor lock).
+    // A timed-out fence is NOT permission to destroy resources still used by the GPU.
+    WaitFor(fenceValue);
+    if (fence && fence->GetCompletedValue() < fenceValue) return false;
+    Release();
+    list.Reset();
+    for (auto& slot : slots) slot = {};
+    lumaPso.Reset(); motionPso.Reset(); smoothPso.Reset(); synthPso.Reset(); blitPso.Reset();
+    blitVsBlob.Reset(); blitPsBlob.Reset(); heap.Reset(); rootSignature.Reset(); fence.Reset();
+    if (fenceEvent) { CloseHandle(fenceEvent); fenceEvent = nullptr; }
+    fenceValue = 0; slotIndex = 0; heapStep = 0;
+    lumaW = lumaH = blocksW = blocksH = 0;
+    blitFormat = DXGI_FORMAT_UNKNOWN;
+    objectsReady = false;
+    resourcesResident.store(false);
+    return true;
+}
+
+bool HasResources() { return resourcesResident.load(); }
 }  // namespace MyClientFrameGen

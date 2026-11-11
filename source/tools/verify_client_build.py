@@ -18,12 +18,21 @@ def verify(readobj, sdk):
     imports = {}
     for name, body in re.findall(r"Import \{\n  Name: (.+?)\n(.*?)\n\}", result, re.DOTALL):
         imports[name] = set(re.findall(r"  Symbol: (.+?) \(\d+\)", body))
-    required = ["getInventory@Player", "getTypeName@ItemStackBase", "getOffhandSlot@Actor",
-                "getClientInstance@bedrock", "getMultiPlayerLevel@bedrock",
-                "getDefaultAllocator@memory", "getGameVersion@ll", "addListener@EventBus",
-                "resolve@SymbolView", "getArmor@Actor", "hookEx@memory"]
+    required = ["getDefaultAllocator@memory", "getGameVersion@ll",
+                "resolve@SymbolView"]
+    # Game object reads LeviLamina wrote itself are MyClient's own now (client/GameAccess.h).
+    for name in ["getClientInstance@bedrock", "getMultiPlayerLevel@bedrock",
+                 "getInventory@Player", "getSelectedItem@Player", "getUuid@Player", "getTypeName@ItemStackBase",
+                 "getTypeName@BlockType", "getOffhandSlot@Actor", "getArmor@Actor", "getAABB@Actor", "getHeadPos@Actor",
+                 "getEntityContext@Actor", "isPlayer@Actor", "isEnchanted@ItemStackBase", "random@UUID",
+                 "rebuildAllRenderChunkGeometry@LevelRenderer"]:
+        assert not any(name in symbol for symbol in imports["LeviLamina.dll"]), name + " is still LeviLamina's"
     for name in required:
         assert any(name in symbol for symbol in imports["LeviLamina.dll"]), name
+    # Hooks are MyClient's own (client/OwnHook.h, MinHook) since 2026-11-05, not LeviLamina's.
+    assert not any("hookEx@memory" in symbol for symbol in imports["LeviLamina.dll"]), "a hook still goes through LeviLamina"
+    # The world tick / exit are MyClient's own hooks too (MyClientData.cpp LevelTickHook / LevelExitHook), not EventBus.
+    assert not any("EventBus" in symbol for symbol in imports["LeviLamina.dll"]), "a world event still goes through LeviLamina"
     official = subprocess.check_output([readobj, "--coff-exports",
                                         str(sdk / "runtime/LeviLamina/LeviLamina.dll")], text=True)
     official_exports = set(re.findall(r"^  Name: (.+)$", official, re.MULTILINE))

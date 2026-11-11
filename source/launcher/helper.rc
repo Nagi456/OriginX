@@ -1,2 +1,4 @@
 // Only build-launcher compiles this: build/gamelaunchhelper.dll is made from launcher/vendor/gamelaunchhelper first.
 GAMELAUNCHHELPER RCDATA "build/gamelaunchhelper.dll"
+// The loader preparation script, written out when the launcher runs without the folder it ships in.
+PREPARERUNTIME RCDATA "launcher/PrepareRuntime.ps1"

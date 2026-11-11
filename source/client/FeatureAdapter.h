@@ -10,6 +10,7 @@ void DisableFeatures();
 uint32_t HitboxFilter();  // which hitboxes: 1 players, 2 items, 4 entities, 8 mobs
 void HitboxColors(uint32_t out[4]);   // their colours by kind (player, item, entity, mob), 0xRRGGBB
 bool ShulkerHoverWanted();   // Shulker Preview is on: hide the game's tooltip over shulker boxes (bit 26 of command.autoRq)
+bool UncapFpsWanted();       // Optimization is on: presents with V-Sync off use ALLOW_TEARING (Shared.optimize UncapFpsBit)
 bool HitboxRequested();   // the HUD wants Hitbox data (bit 16 of the command record)
 // Frame Generation request: bits 27..31 of command.autoRq (MyClientFeatures::FrameGenMultiplierOf...), 0 = off or
 // lease expired. `paused`: not playing right now (menu, loading, title screen) - no made-up frames then.
@@ -27,4 +28,9 @@ void ApplyRenderDistance();  // applies a Render Distance request from the HUD; 
 void SampleArmor();
 void SampleClock(int time, const MyClientFeatures::Debug& debug, const MyClientFeatures::Look& look, uint32_t health);
 void ClearArmor();
+// A texture reload in a world left your arms transparent (2026-11-03): true once after such a reload, when your skin
+// should be handed to the game again so it makes its picture with the new packs.
+bool TakeSkinRefresh();
+bool TextureReloadHeld(); // model/atlas resources are being replaced; do not override UI skin builds
+uint64_t AvatarResourceEpoch(); // pack/atlas replacement invalidates cached menu model readiness
 }

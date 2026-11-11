@@ -74,18 +74,24 @@ void Run()
                 if (ioctlsocket(sock, FIONREAD, &pending) != 0 || pending == 0) break;
             }
         }
-        if (session->GetState() == State::Waiting && Now() - startedAt > 30000) {
-            last.error = L"Minecraft did not join the replay (is it on the home screen?).";
+        if (session->GetState() == State::Waiting && Now() - startedAt > 60000) {
+            last.error = L"Minecraft did not join the replay within a minute.";
             break;
         }
         session->Pump(Now());
         if (haveClient) Send(session->out, client);
         session->out.clear();
+        if (haveClient && session->GetState() == State::Waiting) {   // a jump back: the game connects again
+            haveClient = false;
+            startedAt = Now();
+        }
         last.phase = PhaseOf(session->GetState());
         last.positionMs = session->PositionMs();
         last.paused = session->Paused();
         last.speed = session->Speed();
         last.packsRequested = session->PacksRequested();
+        last.freeCamera = session->FreeCamera();
+        last.rewinding = session->Rewinding();
         if (session->GetState() == State::Closed) break;
     }
     std::lock_guard guard(mutex);
@@ -156,6 +162,19 @@ bool Start(const std::wstring& path, std::wstring& error)
     }
     running.store(true);
     worker = std::thread(Run);
+    return true;
+}
+
+uint16_t Port()
+{
+    std::lock_guard guard(mutex);
+    return session ? session->port : 0;
+}
+
+bool OpenJoinLink(std::wstring& error)
+{
+    const uint16_t port = Port();
+    if (!port) { error = L"The replay server is not running."; return false; }
     const std::wstring uri = L"minecraft://connect/?serverUrl=127.0.0.1&serverPort=" + std::to_wstring(port);
     if (reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", uri.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32) {
         Shutdown();
@@ -163,6 +182,13 @@ bool Start(const std::wstring& path, std::wstring& error)
         return false;
     }
     return true;
+}
+
+void Fail(const std::wstring& error)
+{
+    Shutdown();
+    std::lock_guard guard(mutex);
+    last.error = error;
 }
 
 void Stop() { Shutdown(); }
@@ -183,6 +209,18 @@ void SetPaused(bool paused)
 {
     std::lock_guard guard(mutex);
     if (session) { session->SetPaused(paused); last.paused = session->Paused(); }
+}
+
+void SeekTo(uint64_t positionMs)
+{
+    std::lock_guard guard(mutex);
+    if (session) session->SeekTo(positionMs, Now());
+}
+
+void SetFreeCamera(bool on)
+{
+    std::lock_guard guard(mutex);
+    if (session) session->SwitchCamera(on, Now());
 }
 
 void SetSpeed(float speed)

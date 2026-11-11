@@ -22,7 +22,7 @@ std::string Hash(const fs::path& path) {
 Catalog Parse(const Json& value) { return ParseCatalog(Json::parse(value.dump())); }
 int main() {
     const auto catalog = ParseCatalog(ReadJson("launcher/catalog.json"));
-    assert(catalog.releases.size() == 2);
+    assert(catalog.releases.size() >= 2);   // (was == 2; the list has grown, the entries checked below are still its first two)
     // Only 26.51.1 is supported; 26.52.3 is listed as unavailable (with a reason).
     assert(catalog.releases[0].target.id == "26.51.1" && catalog.releases[0].available);
     assert(catalog.releases[1].target.id == "26.52.3" && !catalog.releases[1].available);
@@ -43,6 +43,17 @@ int main() {
         changed = catalog.document; changed["versions"][0]["files"]["runtime.lock.json"]["url"] = url;
         Reject([&] { Parse(changed); });
     }
+    // OriginX's public R2 downloads are allowed too, with the same character rules.
+    assert(ReleaseUrl(std::string(PublicDownloads) + "myclient-26.51.1-r14/hud__MyClient.exe"));
+    assert(ReleaseUrl(CatalogUrl));
+    for (const auto& url : {"https://originx.originx-client.workers.dev/dl/beta/catalog.json", "https://originx.originx-client.workers.dev/dl/stable/../x",
+                            "https://evil.example/dl/stable/x", "http://originx.originx-client.workers.dev/dl/stable/x"})
+        assert(!ReleaseUrl(url));
+    // The HUD may ride along with the DLL.
+    changed = catalog.document; changed["versions"][0]["files"][HudFile] = changed["versions"][0]["files"]["runtime.lock.json"];
+    assert(Parse(changed).releases[0].files.contains(HudFile));
+    changed = catalog.document; changed["versions"][0]["files"]["MyClient.exe"] = changed["versions"][0]["files"]["runtime.lock.json"];
+    Reject([&] { Parse(changed); });
     changed = catalog.document; changed["versions"][0]["files"]["runtime.lock.json"]["bytes"] = -1;
     Reject([&] { Parse(changed); });
     changed = catalog.document; changed["versions"][0]["files"]["runtime.lock.json"]["sha256"] = "bad";
@@ -133,5 +144,24 @@ int main() {
     }, folder2);
     assert(local2 != local && fs::is_directory(local));
     Reject([&] { std::string f; LocalRelease(catalog.releases[0], [&](const std::string& key) { return root / "missing" / key; }, Hash, f); });
-    std::cout << "PASS: catalog versions/compatibility/URL/path/rollback guards, staged download failure, cache reuse, versioned updates, extra-file/link rejection, hand-rebuilt bundled files.\n";
+    {   // Which HUD runs: a downloaded one is copied to the managed folder (settings beside the launcher once).
+        const auto package = root / "hud-package", managed = root / "hud-managed", bundle = root / "hud-bundle", empty = root / "hud-empty";
+        Write(package / HudFile, "hud-1");
+        Write(bundle / "MyClient.exe", "bundled-hud");
+        Write(bundle / "myclient_config.txt", "settings");
+        fs::create_directories(empty);
+        assert(PlaceHud(package, managed, bundle, true, Hash) == bundle / "MyClient.exe");    // shipped beside the launcher
+        assert(PlaceHud({}, managed, bundle, false, Hash) == bundle / "MyClient.exe");        // no package yet
+        Reject([&] { PlaceHud({}, managed, empty, false, Hash); });                            // nothing anywhere
+        const auto placed = PlaceHud(package, managed, bundle, false, Hash);
+        assert(placed == managed / "MyClient.exe" && Hash(placed) == Hash(package / HudFile));
+        assert(Hash(managed / "myclient_config.txt") == Hash(bundle / "myclient_config.txt"));
+        Write(managed / "myclient_config.txt", "changed in the managed HUD");
+        Write(package / HudFile, "hud-2");                                                     // an update
+        assert(PlaceHud(package, managed, bundle, false, Hash) == placed && Hash(placed) == Hash(package / HudFile));
+        std::ifstream kept(managed / "myclient_config.txt"); std::string text; std::getline(kept, text);
+        assert(text == "changed in the managed HUD");                                          // never overwritten
+        assert(PlaceHud({}, managed, empty, false, Hash) == placed);                           // the last downloaded one
+    }
+    std::cout << "PASS: R2 download URLs, the HUD in packages and where it runs, catalog versions/compatibility/URL/path/rollback guards, staged download failure, cache reuse, versioned updates, extra-file/link rejection, hand-rebuilt bundled files.\n";
 }

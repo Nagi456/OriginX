@@ -89,7 +89,15 @@ inline void SoftenInk(uint32_t* px, int width, int height, const std::vector<Tra
 // inside), so Convert above can find them by colour. Their corners are smoothed afterwards here: a corner
 // pixel that still holds exactly what the hard drawing left becomes the box blended with what lies under
 // it (another glass shape or nothing). Pixels drawn over since (text, icons) are left alone.
-struct Glass { int left, top, right, bottom, radius; uint32_t color; uint8_t alpha; };   // color = 0x00RRGGBB
+// `corners`: the shape of each corner, 2 bits each (corner 0 top left, 1 top right, 2 bottom left, 3 bottom
+// right; bits 2k..2k+1): 0 square, 1 round (radius), 2 cut off at 45 degrees (`radius` along each edge).
+enum Corner : uint8_t { Square = 0, Round = 1, Cut = 2 };
+constexpr uint8_t AllRound = 0x55;
+constexpr uint8_t Corners(Corner topLeft, Corner topRight, Corner bottomLeft, Corner bottomRight)
+{
+    return static_cast<uint8_t>(topLeft | (topRight << 2) | (bottomLeft << 4) | (bottomRight << 6));
+}
+struct Glass { int left, top, right, bottom, radius; uint32_t color; uint8_t alpha; uint8_t corners = AllRound; };   // color = 0x00RRGGBB
 
 // How much of pixel (x, y) the box covers, 0..255 (8x8 samples in the corners).
 inline uint32_t GlassCoverage(const Glass& g, int x, int y)
@@ -99,11 +107,16 @@ inline uint32_t GlassCoverage(const Glass& g, int x, int y)
     const int cx = x < g.left + r ? g.left + r : (x >= g.right - r ? g.right - r : x);
     const int cy = y < g.top + r ? g.top + r : (y >= g.bottom - r ? g.bottom - r : y);
     if (r <= 0 || (cx == x && cy == y)) return 255;
+    const int corner = (x < g.left + r ? 0 : 1) + (y < g.top + r ? 0 : 2);
+    const int shape = (g.corners >> (2 * corner)) & 3;
+    if (shape == Square) return 255;
     int inside = 0;
     for (int sy = 0; sy < 8; sy++)
         for (int sx = 0; sx < 8; sx++) {
             const float dx = x + (sx + 0.5f) / 8 - cx, dy = y + (sy + 0.5f) / 8 - cy;
-            if (dx * dx + dy * dy <= static_cast<float>(r) * r) inside++;
+            if (shape == Cut ? (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy) <= static_cast<float>(r)
+                             : dx * dx + dy * dy <= static_cast<float>(r) * r)
+                inside++;
         }
     return static_cast<uint32_t>(inside * 255 / 64);
 }

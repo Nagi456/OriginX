@@ -23,6 +23,21 @@ int main()
     assert(pack.uuid == "abcdef01-2345-6789-abcd-ef0123456789");             // header uuid, lower-cased (not the module's)
     assert(pack.version[0] == 1 && pack.version[1] == 2 && pack.version[2] == 3);
     assert(pack.name == "Fancy \xE3\x83\x86\xE3\x82\xAF\xE3\x82\xB9\xE3\x83\x81\xE3\x83\xA3");   // \u escapes -> UTF-8
+    assert(pack.description == "x");
+    // description: the header's (not a module's), Minecraft's \u00a7 colour codes removed, translation keys dropped
+    {
+        Pack d;
+        assert(ParseManifest(R"({"header":{"name":"\u00a7bBlue \u00a7lPack","description":"\u00a7716x \u00a7rPvP\nby me","uuid":"abcdef01-2345-6789-abcd-ef0123456789","version":[1,0,0]},
+                                 "modules":[{"description":"module text","type":"resources","uuid":"11111111-2222-3333-4444-555555555555","version":[1,0,0]}]})", d));
+        assert(d.name == "Blue Pack");
+        assert(d.description == "16x PvP by me");   // line breaks become spaces
+        Pack k;
+        assert(ParseManifest(R"({"header":{"name":"x","description":"pack.description","uuid":"abcdef01-2345-6789-abcd-ef0123456789","version":[1,0,0]},"modules":[{"description":"m","type":"resources"}]})", k));
+        assert(k.description.empty());
+        Pack none;
+        assert(ParseManifest(R"({"header":{"name":"x","uuid":"abcdef01-2345-6789-abcd-ef0123456789","version":[1,0,0]},"modules":[{"description":"module only","type":"resources"}]})", none));
+        assert(none.description.empty());
+    }
     // refused manifests
     Pack other;
     assert(!ParseManifest("not json", other));

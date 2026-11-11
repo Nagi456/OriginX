@@ -1,6 +1,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <algorithm>
+#include "AccountWin.h"   // before <windows.h>: it brings winsock2.h
 #include <windows.h>
 #include <commdlg.h>
 #include <shellapi.h>
@@ -11,8 +13,14 @@
 #include "RuntimeWin.h"
 #include "DownloadWin.h"
 #include "GameVersions.h"
+#include "SwitchErrors.h"
+#include "StandaloneWin.h"
+#include "SelfUpdate.h"
 #include "../BridgeChannel.h"
 #include <atomic>
+#include <cstdio>
+#include <fstream>
+#include <iterator>
 #include <cmath>
 #include <thread>
 #include <vector>
@@ -30,7 +38,8 @@ constexpr COLORREF ColBg = RGB(5, 6, 10), ColPanel = RGB(14, 17, 25), ColSide = 
                    ColError = RGB(255, 112, 132);
 constexpr UINT PreparedMessage = WM_APP + 1;
 constexpr UINT UpdatedMessage = WM_APP + 2, PackageMessage = WM_APP + 3, CheckMessage = WM_APP + 4, VersionDbMessage = WM_APP + 5,
-           SwitchedMessage = WM_APP + 6;
+           SwitchedMessage = WM_APP + 6, LauncherUpdateMessage = WM_APP + 7, ApplyLauncherMessage = WM_APP + 8, LoginMessage = WM_APP + 9,
+           NormalVersionMessage = WM_APP + 10;
 enum class State { Idle, Preparing, Installing, Waiting, Checking, Fetching, Attaching, Switching };
 // Attach mode: the protected GDK executable is never copied or edited. The game is
 // started normally and PreLoader.dll is injected into the running process.
@@ -59,11 +68,13 @@ Instance pending;
 Catalog catalog, bundledCatalog;
 Release selected;
 fs::path packageRoot;
+bool packageLocal = false;   // packageRoot holds the files shipped beside the launcher
 Json sources = Json::object();
 struct UpdateResult { Catalog catalog; std::string error; };
-struct PackageResult { fs::path root; std::string error; };
+struct PackageResult { fs::path root; bool local = false; std::string error; std::string note; Channel channel = Channel::Stable; std::optional<AccountStatus> status; unsigned epoch = 0; };
 // Version switching: folders the user added, what was found on this PC and the public list of released versions.
 Json imports = Json::array();
+std::string xboxSeen;   // the Xbox app install's version when the launcher last looked (launcher.json)
 std::map<std::string, fs::path> installedGames;   // version id -> Minecraft.Windows.exe
 std::vector<std::string> publishedVersions;
 std::map<std::string, std::vector<std::string>> versionLinks;   // version id -> Microsoft's package links
@@ -73,17 +84,43 @@ struct VersionDbResult { std::vector<std::string> versions; std::map<std::string
 // Changing the installed game (Flarial's way): Microsoft's package is downloaded and Windows installs it
 // over the Store copy, so Gaming Services decrypts it with the user's own licence.
 std::thread switchThread;
+// Self-update (SelfUpdate.h): the newer launcher, downloaded and checked, waits here until nothing is running.
+HANDLE singleInstance = nullptr;
+fs::path launcherExe, readyLauncher;
+uint64_t readyLauncherBuild = 0;
+std::thread selfUpdateThread;
+struct LauncherUpdateResult { fs::path file; uint64_t build = 0; std::string error; };
 std::string switchingId;
 std::atomic<int> switchPhase{0};   // 0 = checking, 1 = downloading, 2 = installing
 std::atomic<unsigned long long> switchDone{0}, switchTotal{0};
-struct SwitchResult { std::string id, error, warning; };
+struct SwitchResult { std::string id, error, warning; bool launchAfter = false; };
 
 void ApplyClient();
+void StartAccount(bool interactive);
+void ReloadAvatar();
 void RefreshVersions(const std::string& preferred);
 void CheckForUpdates();
 void PollSwitchProgress();
+void StartSwitch(const std::string& id, bool launchAfter = false);
+void SelectUserVersion(const std::string& id);
+void SyncVersionCards();
+void GoTo(int target);
+LRESULT CALLBACK VersionSelectorProc(HWND handle, UINT message, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK VersionListProc(HWND handle, UINT message, WPARAM wParam, LPARAM lParam);
 
 ULONGLONG startedAt = 0;
+// Launch pressed: the update list is fetched first, then the newest DLL / HUD is taken and the game started.
+// (Before, Launch used the list fetched when the launcher opened, so a release made while it stayed open was missed.)
+bool launchAfterCheck = false;
+// Launch continues when Windows' normal-launch version could not be changed (2026-11-09): the note is shown with the launch result.
+std::wstring launchNote;
+// The release channel chosen for Launch (launcher.json "channel"; only stable unless the account may use another)
+// and what /launcher/status last said about the logged-in account (nullopt = not logged in / not asked yet).
+Channel wantedChannel = Channel::Stable;
+std::optional<AccountStatus> accountStatus;
+AccountEpoch accountEpoch;   // Logout() invalidates it: results that started before are not adopted (Channels.h)
+StoredAccount storedAccount;   // account.json as last read / written (the home screen draws from it)
+bool accountExpired = false;   // /launcher/status said 401 for the saved key: the login button is shown again
 std::vector<HWND> editable;
 
 // ---- Reskinned UI state (sidebar + cards). Behaviour of the controls is unchanged. ----
@@ -91,10 +128,24 @@ struct LogLine { std::wstring time, text; bool error = false, live = false; };
 std::vector<LogLine> history;
 int page = 0;                       // 0 = Home, 1 = Settings (below Home)
 int settingsTab = 0;                // 0 = General, 1 = Version, 2 = Logs
+constexpr int VersionCardsShown = 1, VersionCardControl = 300;
+HWND versionCardControls[VersionCardsShown] = {};
+WNDPROC nativeVersionSelectorProc = nullptr, nativeVersionListProc = nullptr;
+std::vector<VersionFamilyRows> versionFamilies;
+bool syncNormal = true;       // Settings > General: Launch / Versions cards also switch Windows' normal-launch version (user, 2026-11-09)
+std::string normalVersionId; // What Windows starts normally: read with switch-game.ps1 -Mode query, or the last successful switch.
+// Reading it runs PowerShell on a thread at startup and after every switch (NormalVersionMessage).
+enum class NormalRead { Unknown, Reading, Known, Missing };
+NormalRead normalRead = NormalRead::Unknown;
+std::wstring normalReadNote;          // why it could not be read
+bool normalQueryAgain = false;        // asked again while a read was running
+std::thread normalQueryThread;
+struct NormalQueryResult { std::string id, error; };
 double scroll = 0, scrollFrom = 0;  // 0 = Home in view, 1 = Settings in view
 ULONGLONG scrollStart = 0;
 bool scrolling = false;
 HFONT heroFont = nullptr, symFont = nullptr, titleFont = nullptr, greetFont = nullptr;
+HFONT versionLabelFont = nullptr;
 HICON logoIcon = nullptr;
 std::wstring NowText()
 {
@@ -120,9 +171,26 @@ void PushLog(const std::wstring& text, bool error, bool live)
 std::wstring Wide(const std::string& value)
 {
     const int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), nullptr, 0);
-    if (!size && !value.empty()) return L"文字列の形式が不正です。";
-    std::wstring result(size, L'\0');
-    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), result.data(), size);
+    if (size || value.empty())
+    {
+        std::wstring result(size, L'\0');
+        MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()), result.data(), size);
+        return result;
+    }
+    // Not UTF-8: text written by Windows PowerShell / the system in the ANSI code page (CP932 on Japanese Windows),
+    // or a UTF-8 text cut in the middle of a character. Show it anyway (2026-11-09: the install failure's real reason
+    // was replaced by "文字列の形式が不正です" and the user could not see it); invalid bytes become U+FFFD.
+    const int ansi = MultiByteToWideChar(CP_ACP, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
+    if (ansi > 0)
+    {
+        std::wstring result(ansi, L'\0');
+        MultiByteToWideChar(CP_ACP, 0, value.data(), static_cast<int>(value.size()), result.data(), ansi);
+        return result;
+    }
+    const int lax = MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), nullptr, 0);
+    if (lax <= 0) return L"（文字を読み取れませんでした）";
+    std::wstring result(lax, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value.data(), static_cast<int>(value.size()), result.data(), lax);
     return result;
 }
 
@@ -157,6 +225,35 @@ void Status(const std::wstring& text)
     std::string utf8(size, '\0');
     WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), utf8.data(), size, nullptr, nullptr);
     log << utf8 << '\n';
+}
+
+// launcher.log keeps only the last 3 runs of the launcher (2026-11-03 user request: it piled up). Each run starts with
+// a "=== OriginX Launcher started ..." line (before 2026-11-05 "=== MyClient Launcher started ..."); a log from before these lines counts as one run.
+void TrimLauncherLog()
+{
+    const auto path = privateDirectory / "launcher.log";
+    std::string text;
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (in) text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    const std::string marker = "=== OriginX Launcher started ";
+    std::vector<size_t> starts;
+    for (const std::string& head : {marker, std::string("=== MyClient Launcher started ")})
+        for (size_t at = text.find(head); at != std::string::npos; at = text.find(head, at + 1))
+            if (at == 0 || text[at - 1] == '\n') starts.push_back(at);
+    std::sort(starts.begin(), starts.end());
+    if (starts.empty() || starts.front() != 0) starts.insert(starts.begin(), 0);
+    constexpr size_t keepOld = 2;   // plus this run = 3
+    if (starts.size() > keepOld) text.erase(0, starts[starts.size() - keepOld]);
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    char stamp[64];
+    std::snprintf(stamp, sizeof stamp, "%04d-%02d-%02d %02d:%02d:%02d ===\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    if (!text.empty() && text.back() != '\n') text += '\n';
+    text += marker + stamp;
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (out) out << text;
 }
 
 int Px(int value);
@@ -263,20 +360,104 @@ void Busy(State next)
 {
     state = next;
     for (HWND control : editable) EnableWindow(control, state == State::Idle);
+    for (HWND control : versionCardControls) if (control) EnableWindow(control, state == State::Idle);
     SetWindowTextW(GetDlgItem(window, Apply), state == State::Idle ? L"Launch" : L"Working\u2026");
     Refresh();
+    if (state == State::Idle && !readyLauncher.empty()) PostMessageW(window, ApplyLauncherMessage, 0, 0);
+}
+
+// Asks the site whether a newer launcher is out and, if so, downloads and checks it (in the background).
+void CheckLauncherUpdate()
+{
+    if (!LauncherBuild || launcherExe.empty()) return;
+    selfUpdateThread = std::thread([] {
+        auto result = new LauncherUpdateResult;
+        const auto list = privateDirectory / "launcher.json.download";
+        const auto folder = privateDirectory / "launcher-update";
+        try
+        {
+            DownloadHttps(LauncherListUrl, list, 64 * 1024);
+            const auto info = ParseLauncherInfo(ReadJson(list));
+            if (LauncherUpdateWanted(LauncherBuild, info))
+            {
+                fs::create_directories(folder);
+                const auto file = folder / "MyClientLauncher.exe";
+                DownloadHttps(info.url, file, info.bytes);
+                if (fs::file_size(file) != info.bytes || Sha256File(file) != info.sha256)
+                    throw std::runtime_error("ダウンロードした新しいランチャーの SHA256 が一致しません。");
+                RequireX64Pe(file);
+                result->file = file;
+                result->build = info.build;
+            }
+        }
+        catch (const std::exception& error) { result->error = error.what(); }
+        std::error_code ignored; fs::remove(list, ignored);
+        if (!PostMessageW(window, LauncherUpdateMessage, 0, reinterpret_cast<LPARAM>(result))) delete result;
+    });
+}
+
+// Puts the downloaded launcher in this one's place and starts it. Only while nothing is being prepared.
+void ApplyLauncherUpdate()
+{
+    if (readyLauncher.empty() || state != State::Idle) return;
+    const auto file = readyLauncher;
+    const auto build = readyLauncherBuild;
+    readyLauncher.clear();
+    const auto staged = fs::path(launcherExe.native() + L".new");
+    try
+    {
+        std::error_code ec;
+        fs::copy_file(file, staged, fs::copy_options::overwrite_existing, ec);   // the cache may be on another drive
+        if (ec) throw std::runtime_error("新しいランチャーを置けません（フォルダーに書き込めない可能性があります）: " + ec.message());
+        SwapLauncher(launcherExe, staged);
+    }
+    catch (const std::exception& error)
+    {
+        std::error_code ignored; fs::remove(staged, ignored);
+        Status(L"ランチャーを自動で更新できませんでした。サイトから新しいランチャーを入れ直してください。\r\n" + Wide(error.what()));
+        return;
+    }
+    Status(L"ランチャーを build " + std::to_wstring(build) + L" に更新しました。再起動します…");
+    // The new launcher must be able to take the single-instance lock.
+    if (singleInstance) { CloseHandle(singleInstance); singleInstance = nullptr; }
+    std::wstring command = L"\"" + launcherExe.wstring() + L"\"";
+    STARTUPINFOW startup{}; startup.cb = sizeof startup;
+    PROCESS_INFORMATION process{};
+    if (!CreateProcessW(launcherExe.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                        launcherExe.parent_path().c_str(), &startup, &process))
+    {
+        Status(L"新しいランチャーは置けましたが、起動できませんでした。もう一度ランチャーを開いてください。");
+        return;
+    }
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    DestroyWindow(window);
 }
 
 void Save()
 {
     sources[selected.target.id] = fs::path(Text(Game)).u8string();
-    Json config{{"sources", sources}, {"selectedVersion", selected.target.id}, {"imports", imports}, {"schemaVersion", 3}};
+    Json config{{"sources", sources}, {"selectedVersion", selected.target.id}, {"imports", imports}, {"xboxSeen", xboxSeen}, {"channel", ChannelKey(wantedChannel)}, {"syncNormal", syncNormal}, {"schemaVersion", 3}};
     const auto temporary = privateDirectory / "launcher.json.tmp";
     std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
     output << config.dump(2);
     output.close();
     if (!output || !MoveFileExW(temporary.c_str(), (privateDirectory / "launcher.json").c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
         throw std::runtime_error("ランチャー設定を保存できません。");
+}
+
+// Remember what /launcher/status said about the account: the home screen reads accountStatus, and the renewed
+// login key (the Worker renews it when under 30 days are left) and the name / icon link are kept on this PC.
+void NoteAccountStatus(const AccountStatus& status)
+{
+    accountStatus = status;
+    accountExpired = false;
+    StoredAccount stored = LoadAccount(privateDirectory);
+    if (!status.token.empty()) stored.token = status.token;
+    stored.name = status.name;
+    stored.avatarUrl = status.avatarUrl;
+    storedAccount = stored;
+    try { if (!stored.token.empty()) SaveAccount(privateDirectory, stored); } catch (const std::exception&) { /* the old key still works */ }
 }
 
 void Pick(int id)
@@ -410,6 +591,39 @@ bool Ready(DWORD pid)
     return valid;
 }
 
+fs::path HudExecutable()
+{
+    return PlaceHud(packageRoot, privateDirectory / "hud", bundle, packageLocal, Sha256File);
+}
+
+// PrepareRuntime.ps1 (fetches the loader): beside the launcher when shipped in a folder, otherwise the copy
+// built into the launcher, written to the private folder.
+fs::path RuntimeScript()
+{
+    if (fs::is_regular_file(bundle / "PrepareRuntime.ps1")) return bundle / "PrepareRuntime.ps1";
+    HRSRC found = FindResourceW(nullptr, L"PREPARERUNTIME", MAKEINTRESOURCEW(10));
+    HGLOBAL loaded = found ? LoadResource(nullptr, found) : nullptr;
+    const char* bytes = loaded ? static_cast<const char*>(LockResource(loaded)) : nullptr;
+    const DWORD size = found ? SizeofResource(nullptr, found) : 0;
+    if (!bytes || !size) throw std::runtime_error("ローダーの準備スクリプト（PrepareRuntime.ps1）が見つかりません。");
+    const std::string wanted(bytes, size);
+    const auto path = privateDirectory / "PrepareRuntime.ps1";
+    std::string current;
+    if (fs::is_regular_file(path))
+    {
+        std::ifstream in(path, std::ios::binary);
+        current.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    if (current != wanted)
+    {
+        fs::create_directories(privateDirectory);
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out.write(wanted.data(), static_cast<std::streamsize>(wanted.size()));
+        if (!out) throw std::runtime_error("ローダーの準備スクリプトを書き込めません。");
+    }
+    return path;
+}
+
 void StartHud(DWORD pid)
 {
     if (hudProcess)
@@ -423,14 +637,29 @@ void StartHud(DWORD pid)
         CloseHandle(hudProcess);
         hudProcess = nullptr;
     }
-    hudProcess = Start(bundle / "MyClient.exe", {L"--minecraft-pid=" + std::to_wstring(pid)}, bundle);
+    const auto hud = HudExecutable();
+    hudProcess = Start(hud, {L"--minecraft-pid=" + std::to_wstring(pid)}, hud.parent_path());
     hudGamePid = pid;
     Busy(State::Idle);
-    Status(L"DLLへの接続を確認し、HUDを起動しました。\r\nワールドに入り、G → Arrow Counter / Block OutlineをONにしてください。");
+    Status(L"DLLへの接続を確認し、HUDを起動しました。\r\nワールドに入り、G → Arrow Counter / Block OutlineをONにしてください。" +
+           (launchNote.empty() ? std::wstring{} : L"\r\n" + launchNote));
+}
+
+// Developer diagnostics of the DLL (client/GameImageDump.cpp, SignatureDump.cpp: the game image and the real
+// addresses of the functions it looks up) run only when ORIGINX_DIAGNOSTICS=1 was set before the game started and
+// the folder %LOCALAPPDATA%\\MyClient\\dumps exists. Making that folder is the user's whole part: the launcher
+// then sets the variable for the game it starts (a child inherits it). Without the folder nothing changes.
+void DiagnosticsEnvironment()
+{
+    std::error_code error;
+    const bool wanted = fs::is_directory(privateDirectory / "dumps", error);
+    SetEnvironmentVariableW(L"ORIGINX_DIAGNOSTICS", wanted ? L"1" : nullptr);
+    if (wanted) PushLog(L"診断モードで起動します（dumps フォルダーがあるため）。結果は " + (privateDirectory / "dumps").wstring() + L" に書かれます。", false, false);
 }
 
 void LaunchGame()
 {
+    DiagnosticsEnvironment();
     RequireExecutableVersion(pending.directory / "Minecraft.Windows.exe", selected.target);
     RequireRuntime(pending.directory, packageRoot / "runtime.lock.json", selected.target);
     const DWORD pid = GamePid(pending.directory);
@@ -449,7 +678,8 @@ void LaunchGame()
     gameProcess = Start(pending.directory / "Minecraft.Windows.exe", {}, pending.directory);
     startedAt = GetTickCount64();
     Busy(State::Waiting);
-    Status(L"Minecraftを直接起動しました。DLLへの接続を待っています…\r\n接続を確認するとHUDを自動で起動します。");
+    Status(L"Minecraftを直接起動しました。DLLへの接続を待っています…\r\n接続を確認するとHUDを自動で起動します。" +
+           (launchNote.empty() ? std::wstring{} : L"\r\n" + launchNote));
 }
 
 // Any running Minecraft.Windows.exe, regardless of its install folder.
@@ -512,6 +742,35 @@ InjectResult InjectDll(DWORD pid, const fs::path& dll)
     return result;
 }
 
+// A release that runs without LeviLamina (StandaloneWin.h): the untouched exe is started suspended, the DLL of
+// the package is loaded into it, then the game goes on. Nothing is installed into the game's folder.
+fs::path StandaloneDll() { return packageRoot / "mods/MyClientData/MyClientData.dll"; }
+
+void LaunchStandalone()
+{
+    DiagnosticsEnvironment();
+    const DWORD pid = GamePid(pending.directory);
+    if (pid)
+    {
+        if (!Ready(pid))
+            throw std::runtime_error("Minecraftが起動中です。DLLを読み込むには一度ゲームを終了してください。");
+        StartHud(pid);
+        return;
+    }
+    RequireStandaloneDll(StandaloneDll());
+    UseOriginalExe(pending.directory);
+    RequireExecutableVersion(pending.directory / "Minecraft.Windows.exe", selected.target);
+    if (gameProcess) { CloseHandle(gameProcess); gameProcess = nullptr; }
+    const auto started = StartSuspendedWithDll(pending.directory / "Minecraft.Windows.exe", pending.directory, StandaloneDll(),
+        [](DWORD target, const fs::path& dll) { const auto result = InjectDll(target, dll); return result.ok ? std::string{} : result.message; });
+    gameProcess = started.process;
+    startedAt = GetTickCount64();
+    Busy(State::Waiting);
+    Status(std::wstring(L"Minecraftを起動し、OriginXのDLLを読み込みました（LeviLaminaなし）。DLLへの接続を待っています…") +
+           (started.loadedSignal ? L"" : L"\r\nDLLからの開始の合図がまだありません。接続できない場合はログを確認してください。") +
+           (launchNote.empty() ? std::wstring{} : L"\r\n" + launchNote));
+}
+
 // UWP/GDK processes cannot always load DLLs from a user folder; allow app packages to read it.
 void GrantAppPackageAccess(const fs::path& directory)
 {
@@ -528,12 +787,18 @@ void GrantAppPackageAccess(const fs::path& directory)
 
 void LaunchAttach()
 {
-    RequireAttachRuntime(attachDir, packageRoot / "runtime.lock.json", selected.target);
+    DiagnosticsEnvironment();
+    const bool standalone = selected.target.standalone;
+    if (standalone) RequireStandaloneDll(StandaloneDll());
+    else RequireAttachRuntime(attachDir, packageRoot / "runtime.lock.json", selected.target);
     const DWORD pid = GamePidAny();
     if (pid && Ready(pid)) { StartHud(pid); return; }
-    const auto backup = InstallMod(packageRoot / "mods/MyClientData", attachDir, selected.target);
-    if (!backup.empty()) Status(L"以前のMODをバックアップしました:\r\n" + backup.wstring());
-    GrantAppPackageAccess(attachDir);
+    if (!standalone)
+    {
+        const auto backup = InstallMod(packageRoot / "mods/MyClientData", attachDir, selected.target);
+        if (!backup.empty()) Status(L"以前のMODをバックアップしました:\r\n" + backup.wstring());
+    }
+    GrantAppPackageAccess(standalone ? StandaloneDll().parent_path() : attachDir);
     injectedPid = seenPid = 0;
     seenAt = 0;
     injectFails = 0;
@@ -544,7 +809,8 @@ void LaunchAttach()
             L"shell:AppsFolder\\Microsoft.MinecraftUWP_8wekyb3d8bbwe!Game", nullptr, nullptr, SW_SHOWNORMAL));
         if (result <= 32)
             throw std::runtime_error("Minecraftを起動できません。Xboxアプリから一度起動できるか確認してください。(ShellExecute " + std::to_string(result) + ")");
-        Status(L"Minecraftを通常起動しました。起動後にローダーを注入します…\r\n接続を確認するとHUDを自動で起動します。");
+        Status(L"Minecraftを通常起動しました。起動後にローダーを注入します…\r\n接続を確認するとHUDを自動で起動します。" +
+               (launchNote.empty() ? std::wstring{} : L"\r\n" + launchNote));
     }
     else Status(L"起動中のMinecraftへローダーを注入します…");
     Busy(State::Attaching);
@@ -565,6 +831,7 @@ void ApplyAttach(const fs::path& source)
         output.close();
         if (!output) throw std::runtime_error("注入用フォルダーの情報を保存できません。");
     }
+    if (selected.target.standalone) { LaunchAttach(); return; }   // no loader to prepare: the DLL itself is loaded
     bool ready = false;
     try { RequireAttachRuntime(attachDir, packageRoot / "runtime.lock.json", selected.target); ready = true; }
     catch (const std::exception&) { /* First use or interrupted preparation. */ }
@@ -575,7 +842,7 @@ void ApplyAttach(const fs::path& source)
     const auto powershell = fs::path(std::wstring(systemPath.data(), length)) / "WindowsPowerShell/v1.0/powershell.exe";
     installer = Start(powershell,
         {L"-NoLogo", L"-NoProfile", L"-NonInteractive", L"-ExecutionPolicy", L"Bypass", L"-File",
-         (bundle / "PrepareRuntime.ps1").wstring(), L"-ManifestPath", (packageRoot / "runtime.lock.json").wstring(),
+         RuntimeScript().wstring(), L"-ManifestPath", (packageRoot / "runtime.lock.json").wstring(),
          L"-ExpectedGameVersion", Wide(selected.target.runtimeGame), L"-ExpectedLoaderVersion", Wide(selected.target.loader),
          L"-GameDirectory", attachDir.wstring(), L"-CacheDirectory", (privateDirectory / "cache").wstring(), L"-Attach"},
          attachDir, privateDirectory / "runtime-setup.log");
@@ -586,6 +853,7 @@ void ApplyAttach(const fs::path& source)
 
 void PrepareRuntimeOrLaunch()
 {
+    if (selected.target.standalone) { LaunchStandalone(); return; }   // no loader to prepare, the exe stays as it is
     RequireExecutableVersion(pending.directory / "Minecraft.Windows.exe", selected.target);
     if (GamePid(pending.directory)) throw std::runtime_error("ローダーの導入前にMinecraftを終了してください。");
     bool ready = false;
@@ -601,7 +869,7 @@ void PrepareRuntimeOrLaunch()
     const auto powershell = fs::path(std::wstring(systemPath.data(), length)) / "WindowsPowerShell/v1.0/powershell.exe";
     installer = Start(powershell,
         {L"-NoLogo", L"-NoProfile", L"-NonInteractive", L"-ExecutionPolicy", L"Bypass", L"-File",
-         (bundle / "PrepareRuntime.ps1").wstring(), L"-ManifestPath", (packageRoot / "runtime.lock.json").wstring(),
+         RuntimeScript().wstring(), L"-ManifestPath", (packageRoot / "runtime.lock.json").wstring(),
          L"-ExpectedGameVersion", Wide(selected.target.runtimeGame), L"-ExpectedLoaderVersion", Wide(selected.target.loader),
          L"-GameDirectory", pending.directory.wstring(), L"-CacheDirectory", (privateDirectory / "cache").wstring()},
          pending.directory, privateDirectory / "runtime-setup.log");
@@ -623,7 +891,7 @@ void ApplyClient()
             if (entry.is_directory() && entry.path().filename() != selected.target.id && GamePid(entry.path()))
                 throw std::runtime_error("別バージョンのMinecraftを終了してから切り替えてください。");
     RequireMod(packageRoot / "mods/MyClientData", selected.target);
-    RequireX64Pe(bundle / "MyClient.exe");
+    RequireX64Pe(HudExecutable());
     const auto destination = privateDirectory / "game" / selected.target.id;
     if (fs::exists(destination))
     {
@@ -708,11 +976,12 @@ void Tick()
             if (seenPid != pid) { seenPid = pid; seenAt = now; }
             if (now - seenAt >= 1500)
             {
-                const auto result = InjectDll(pid, attachDir / "PreLoader.dll");
+                const auto result = InjectDll(pid, selected.target.standalone ? StandaloneDll() : attachDir / "PreLoader.dll");
                 if (result.ok)
                 {
                     injectedPid = pid;
-                    Status(L"PreLoader.dllを注入しました。DLLへの接続を待っています…");
+                    Status(selected.target.standalone ? L"OriginXのDLLを読み込みました。DLLへの接続を待っています…"
+                                                      : L"PreLoader.dllを注入しました。DLLへの接続を待っています…");
                 }
                 else if (++injectFails >= 20)
                 {
@@ -841,9 +1110,9 @@ void DrawButton(const DRAWITEMSTRUCT& item)
                    (item.itemState & ODS_SELECTED) != 0, (item.itemState & ODS_FOCUS) != 0, ButtonUnder(item.CtlID, middle.y));
 }
 HWND Control(const wchar_t* type, const wchar_t* text, int x, int y, int w, int h,
-             int id = 0, DWORD style = 0, bool large = false)
+             int id = 0, DWORD style = 0, bool large = false, bool visible = true)
 {
-    HWND handle = CreateWindowExW(0, type, text, WS_CHILD | WS_VISIBLE | style,
+    HWND handle = CreateWindowExW(0, type, text, WS_CHILD | (visible ? WS_VISIBLE : 0) | style,
         Sc(x), Sc(y), Sc(w), Sc(h), window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
     if (!handle) throw std::runtime_error("画面を作成できません。");
     SendMessageW(handle, WM_SETFONT, reinterpret_cast<WPARAM>(large ? heading : font), TRUE);
@@ -1049,6 +1318,7 @@ void RefreshVersions(const std::string& preferred)
     }
     SendDlgItemMessageW(window, Version, CB_SETCURSEL, chosen, 0);
     SelectVersion();
+    SyncVersionCards();
 }
 
 // A folder holding a game the user installed some other way (LeviLauncher, a backup copy...).
@@ -1090,16 +1360,12 @@ void ImportFolder()
     for (size_t i = 0; i < catalog.releases.size(); ++i)
         if (catalog.releases[i].target.id == id)
         {
-            SendDlgItemMessageW(window, Version, CB_SETCURSEL, i, 0);
-            SelectVersion();
-            Save();
-            Status(L"Minecraft " + Wide(id) + L"を追加しました:\r\n" + game.wstring() +
-                   (catalog.releases[i].available ? L"\r\nホームでこの版を選んで起動できます。" : L"\r\nこの版のMyClient DLLはまだありません（対応待ち）。"));
+            SelectUserVersion(id);
             Refresh();
             return;
         }
     Status(L"Minecraft " + Wide(id) + L"を追加しました:\r\n" + game.wstring() +
-           L"\r\nMyClientはこの版にまだ対応していません。対応版が出ると一覧に追加されます。");
+           L"\r\nOriginXはこの版にまだ対応していません。対応版が出ると一覧に追加されます。");
     Refresh();
 }
 
@@ -1141,17 +1407,55 @@ void FetchVersionDb()
 
 // ---- Changing the installed Minecraft to another released version ----
 // Checks run before the download; the install is Windows' own Add-AppxPackage.
-constexpr const char* SwitchScript = R"ps(param([string]$Mode, [string]$Package, [string]$Helper)
+constexpr const char* SwitchScript = R"ps(param([string]$Mode, [string]$Package, [string]$Helper, [string]$ExpectedId)
+function Get-MinecraftVersionId([version]$Version) {
+    $parts = @($Version.Major, $Version.Minor, $Version.Build, $Version.Revision)
+    if ($parts[0] -ge 26) { $parts = $parts[0..2] }
+    elseif ($parts[3] -eq 0 -and $parts[2] -ge 100) {
+        $parts = @($parts[0], $parts[1], [int][math]::Floor($parts[2] / 100), ($parts[2] % 100))
+    }
+    if ($parts.Count -eq 4 -and $parts[0] -eq 1 -and $parts[1] -ge 26) { $parts = $parts[1..3] }
+    return ($parts -join '.')
+}
 $ErrorActionPreference = 'Stop'
 try {
     if (-not (Get-AppxPackage -Name Microsoft.GamingServices)) { Write-Output 'Gaming Services is not installed.'; exit 2 }
     $game = Get-AppxPackage -Name Microsoft.MinecraftUWP | Select-Object -First 1
     if (-not $game) { Write-Output 'Minecraft is not installed.'; exit 3 }
     Write-Output ('Installed: ' + $game.Version + ' (' + $game.SignatureKind + ')')
-    if ("$($game.SignatureKind)" -ne 'Store') { exit 4 }
-    if ($Mode -ne 'install') { exit 0 }
-    Add-AppxPackage -Path $Package -ForceUpdateFromAnyVersion -ForceApplicationShutdown
+    if ($Mode -eq 'query') { Write-Output ('NormalId: ' + (Get-MinecraftVersionId $game.Version)); exit 0 }
+    # Not only the Xbox app / Store: Minecraft bought elsewhere (e.g. a code from Amazon) can report another kind.
+    # Windows itself refuses the install below when the installed package cannot be replaced.
+    if ("$($game.SignatureKind)" -ne 'Store') { Write-Output ('Not from the Store: ' + $game.SignatureKind) }
+    if ($Mode -ne 'install') {
+        if ($Mode -eq 'check' -and $ExpectedId -and (Get-MinecraftVersionId $game.Version) -eq $ExpectedId) {
+            Write-Output ('Normal launch is already ' + $ExpectedId)
+            exit 10
+        }
+        exit 0
+    }
+    if (-not $ExpectedId) { throw 'Expected Minecraft version is missing.' }
+    if (Get-Process -Name Minecraft.Windows -ErrorAction SilentlyContinue) { throw 'Close Minecraft before changing the normal-launch version.' }
+    try { Add-AppxPackage -Path $Package -ForceUpdateFromAnyVersion }
+    catch {
+        # Windows' own reason: the error code and, through the ActivityId in the message, its install log.
+        $message = $_.Exception.Message
+        Write-Output $message
+        Write-Output ('HRESULT: ' + ('0x{0:X8}' -f $_.Exception.HResult))
+        if ($message -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+            $activity = $Matches[1]
+            Write-Output ('ActivityId: ' + $activity)
+            try {
+                Get-AppPackageLog -ActivityID $activity -ErrorAction Stop | Select-Object -Last 25 |
+                    ForEach-Object { Write-Output ('  [' + $_.Id + '] ' + ("$($_.Message)" -replace '\s+', ' ')) }
+            } catch { Write-Output ('Could not read the Windows install log: ' + $_.Exception.Message) }
+        }
+        exit 4
+    }
     $game = Get-AppxPackage -Name Microsoft.MinecraftUWP | Select-Object -First 1
+    if (-not $game -or (Get-MinecraftVersionId $game.Version) -ne $ExpectedId) {
+        throw ('Windows did not register the requested normal-launch version ' + $ExpectedId)
+    }
     Write-Output ('Now: ' + $game.Version + ' at ' + $game.InstallLocation)
     if ($Helper) {
         try { Copy-Item -LiteralPath $Helper -Destination (Join-Path $game.InstallLocation 'gamelaunchhelper.dll') -Force }
@@ -1166,23 +1470,30 @@ try {
 )ps";
 
 // The last lines PowerShell wrote, for error messages.
-std::string LogTail(const fs::path& log)
+std::string LogTail(const fs::path& log, size_t limit = 600)
 {
     std::ifstream input(log, std::ios::binary);
     std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) text.pop_back();
-    if (text.size() > 600) text = "…" + text.substr(text.size() - 600);
-    return text;
+    if (text.size() > limit)
+    {
+        size_t from = text.size() - limit;
+        while (from < text.size() && (static_cast<unsigned char>(text[from]) & 0xC0) == 0x80) ++from;   // not inside a UTF-8 character
+        text = "…" + text.substr(from);
+    }
+    return text + "\n（ログ: " + log.u8string() + "）";
 }
 
-DWORD RunSwitchScript(const fs::path& script, const std::wstring& mode, const fs::path& package, const fs::path& helper, const fs::path& log)
+DWORD RunSwitchScript(const fs::path& script, const std::wstring& mode, const fs::path& package, const fs::path& helper,
+                      const fs::path& log, const std::string& expectedId)
 {
     std::vector<wchar_t> systemPath(32768);
     const UINT length = GetSystemDirectoryW(systemPath.data(), static_cast<UINT>(systemPath.size()));
     if (!length || length >= systemPath.size()) throw std::runtime_error("Windowsのシステムフォルダーを取得できません。");
     const auto powershell = fs::path(std::wstring(systemPath.data(), length)) / "WindowsPowerShell/v1.0/powershell.exe";
     HANDLE process = Start(powershell, {L"-NoLogo", L"-NoProfile", L"-NonInteractive", L"-ExecutionPolicy", L"Bypass", L"-File",
-                                        script.wstring(), L"-Mode", mode, L"-Package", package.wstring(), L"-Helper", helper.wstring()},
+                                        script.wstring(), L"-Mode", mode, L"-Package", package.wstring(), L"-Helper", helper.wstring(),
+                                        L"-ExpectedId", Wide(expectedId)},
                            script.parent_path(), log);
     if (!process) throw std::runtime_error("PowerShellを起動できません。");
     WaitForSingleObject(process, INFINITE);
@@ -1192,19 +1503,60 @@ DWORD RunSwitchScript(const fs::path& script, const std::wstring& mode, const fs
     return exitCode;
 }
 
+fs::path WriteSwitchScript(const fs::path& folder, const char* name)
+{
+    fs::create_directories(folder);
+    const auto path = folder / name;
+    std::ofstream script(path, std::ios::binary | std::ios::trunc);
+    script << SwitchScript;
+    if (!script) throw std::runtime_error("版の変更の準備ファイルを書き込めません。");
+    return path;
+}
+
+// Which version Windows starts normally (Start menu / Xbox app). Only reads; ends in NormalVersionMessage.
+void QueryNormalVersion()
+{
+    if (normalQueryThread.joinable()) { normalQueryAgain = true; return; }
+    const auto folder = privateDirectory / "cache" / "game-switch";
+    fs::path script;
+    try { script = WriteSwitchScript(folder, "query-game.ps1"); }
+    catch (const std::exception& error) { normalRead = NormalRead::Missing; normalReadNote = Wide(error.what()); Refresh(); return; }
+    normalRead = NormalRead::Reading;
+    normalQueryAgain = false;
+    Refresh();
+    normalQueryThread = std::thread([folder, script] {
+        auto* result = new NormalQueryResult;
+        try
+        {
+            const auto log = folder / "switch-query.log";
+            const DWORD code = RunSwitchScript(script, L"query", {}, {}, log, {});
+            std::ifstream input(log, std::ios::binary);
+            const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+            result->id = code == 0 ? NormalIdFromLog(text) : std::string{};
+            if (code == 2) result->error = "Gaming Servicesが入っていません";
+            else if (code == 3) result->error = "Minecraftが入っていません";
+            else if (result->id.empty()) result->error = "読み取れません（" + std::to_string(code) + "）: " + LogTail(log, 300);
+        }
+        catch (const std::exception& error) { result->error = error.what(); }
+        if (!PostMessageW(window, NormalVersionMessage, 0, reinterpret_cast<LPARAM>(result))) delete result;
+    });
+}
+
 void SwitchGame(const std::string& id, const std::vector<std::string>& urls, const fs::path& folder, const fs::path& helper,
                 std::string& warning)
 {
     const auto script = folder / "switch-game.ps1";
     switchPhase = 0;
-    switch (const DWORD code = RunSwitchScript(script, L"check", {}, {}, folder / "switch-check.log"))
+    switch (const DWORD code = RunSwitchScript(script, L"check", {}, {}, folder / "switch-check.log", id))
     {
     case 0: break;
+    case 10: return; // already registered: no download/install, also safe when that game is running
     case 2: throw std::runtime_error("Gaming Servicesが入っていません。Microsoft Storeで「Gaming Services」を入れてから、もう一度押してください。");
     case 3: throw std::runtime_error("Minecraftが入っていません。先にXboxアプリかMicrosoft StoreからMinecraftを入れてください（購入済みのMinecraftを別の版に置き換える仕組みです）。");
-    case 4: throw std::runtime_error("今のMinecraftはストア以外（LeviLauncherなど）で入れたものなので置き換えられません。XboxアプリからMinecraftを入れ直してください。");
     default: throw std::runtime_error("Minecraftの状態を確認できませんでした（" + std::to_string(code) + "）: " + LogTail(folder / "switch-check.log"));
     }
+    if (GamePidAny()) throw std::runtime_error("Minecraftを終了してから版を変更してください。起動中のゲームは終了しません。");
+    if (urls.empty()) throw std::runtime_error("通常起動の版を変更するためのダウンロード先を取得できません。公開版の一覧を更新してから選び直してください。");
     switchPhase = 1;
     const auto package = folder / ("Microsoft.MinecraftUWP_" + id + ".msixvc");
     struct Remove { fs::path path; ~Remove() { std::error_code ignored; fs::remove(path, ignored); } } removeLater{package};
@@ -1222,41 +1574,33 @@ void SwitchGame(const std::string& id, const std::vector<std::string>& urls, con
     }
     if (!downloaded) throw std::runtime_error("Minecraft " + id + " をダウンロードできませんでした: " + errors);
     switchPhase = 2;
-    const DWORD code = RunSwitchScript(script, L"install", package, helper, folder / "switch-install.log");
+    const DWORD code = RunSwitchScript(script, L"install", package, helper, folder / "switch-install.log", id);
     if (code == 5)
         warning = "起動役（gamelaunchhelper.dll）を差し替えられませんでした。Xboxアプリから起動すると最新版への更新を求められることがあります: " +
                   LogTail(folder / "switch-install.log");
     else if (code)
-        throw std::runtime_error("Windowsがインストールできませんでした（" + std::to_string(code) + "）: " + LogTail(folder / "switch-install.log"));
+    {
+        // Installed some other way than the Xbox app / Store: say so, the reason is usually there.
+        const bool notStore = LogTail(folder / "switch-check.log").find("Not from the Store") != std::string::npos;
+        const std::string log = LogTail(folder / "switch-install.log", 2400);
+        const std::string hint = InstallErrorHint(log);
+        throw std::runtime_error("Windowsがインストールできませんでした（" + std::to_string(code) + "）: " + (hint.empty() ? "" : hint + "\n") + log +
+                                 (notStore ? "\n今のMinecraftはXboxアプリ・Microsoft Store以外の方法で入っているため、Windowsが置き換えを断った可能性があります。" : ""));
+    }
 }
 
-void StartSwitch(const std::string& id)
+void StartSwitch(const std::string& id, bool launchAfter)
 {
     if (state != State::Idle) return;
+    const auto release = std::find_if(catalog.releases.begin(), catalog.releases.end(), [&](const Release& item) {
+        return item.target.id == id;
+    });
+    if (release == catalog.releases.end() || !ClientVersionSelectable(id, release->available))
+        throw std::runtime_error("この版はOriginX未対応のため、インストール・切替できません。対応済みの26.45以降を選んでください。");
     const auto links = versionLinks.find(id);
-    if (links == versionLinks.end()) throw std::runtime_error("この版のダウンロード先が公開一覧にありません。");
-    if (GamePidAny()) throw std::runtime_error("Minecraftを終了してから版を変更してください。");
-    bool supported = false;
-    for (const auto& release : catalog.releases) if (release.target.id == id && release.available) supported = true;
-    std::wstring current;
-    for (const auto& [installedId, path] : installedGames)
-        if (Lower(path.u8string()).find("xboxgames") != std::string::npos) current = Wide(installedId);
-    const std::wstring message =
-        L"Minecraft を " + Wide(id) + L" に変更します。\n\n"
-        L"・Microsoft の配信サーバーから数 GB をダウンロードし、Windows（Gaming Services）がインストールします。\n"
-        L"・今 Xbox アプリで入っている Minecraft" + (current.empty() ? L"" : L"（" + current + L"）") + L"は置き換えられます。版を並べて持つことはできません。\n"
-        L"・ワールドは消えませんが、新しい版で開いたワールドを古い版で開くと壊れることがあります。大事なワールドはバックアップしてください。\n"
-        L"・Xbox アプリや Microsoft Store の自動更新で最新版に戻ることがあります。\n" +
-        (supported ? std::wstring{} : L"・MyClient はこの版にまだ対応していないので、変更後は MyClient で起動できません。\n") +
-        L"\n続けますか？";
-    if (MessageBoxW(window, message.c_str(), L"Minecraft の版を変更", MB_OKCANCEL | MB_ICONINFORMATION | MB_DEFBUTTON2) != IDOK) return;
+    Save(); // keep the previous selection until Windows confirms the requested version
     const auto folder = privateDirectory / "cache" / "game-switch";
-    fs::create_directories(folder);
-    {
-        std::ofstream script(folder / "switch-game.ps1", std::ios::binary | std::ios::trunc);
-        script << SwitchScript;
-        if (!script) throw std::runtime_error("版の変更の準備ファイルを書き込めません。");
-    }
+    WriteSwitchScript(folder, "switch-game.ps1");
     // The replacement bootstrapper built from launcher/vendor/gamelaunchhelper (absent in local builds).
     fs::path helper;
     if (HRSRC found = FindResourceW(nullptr, L"GAMELAUNCHHELPER", MAKEINTRESOURCEW(10)))
@@ -1279,14 +1623,32 @@ void StartSwitch(const std::string& id)
     switchTotal = 0;
     Busy(State::Switching);
     BeginProgress();
-    Status(L"Minecraft を " + Wide(id) + L" に変更しています。終わるまでこのウィンドウを開いたままにしてください。");
-    const auto urls = links->second;
-    switchThread = std::thread([id, urls, folder, helper] {
-        auto result = new SwitchResult{id, {}, {}};
+    Status(L"Minecraft " + Wide(id) + L" の通常起動を確認・変更しています…");
+    const auto urls = links != versionLinks.end() ? links->second : std::vector<std::string>{};
+    switchThread = std::thread([id, urls, folder, helper, launchAfter] {
+        auto result = new SwitchResult{id, {}, {}, launchAfter};
         try { SwitchGame(id, urls, folder, helper, result->warning); }
         catch (const std::exception& error) { result->error = error.what(); }
         if (!PostMessageW(window, SwitchedMessage, 0, reinterpret_cast<LPARAM>(result))) delete result;
     });
+}
+
+// A Versions card picks the version OriginX plays. With the Settings switch on, Windows' normal-launch version
+// follows (StartSwitch: no download when Windows already has it); off, Windows is not touched (user, 2026-11-09).
+void SelectUserVersion(const std::string& id)
+{
+    if (syncNormal) { StartSwitch(id); return; }   // failures keep the OriginX choice: see SwitchedMessage
+    const auto release = std::find_if(catalog.releases.begin(), catalog.releases.end(), [&](const Release& item) {
+        return item.target.id == id;
+    });
+    if (release == catalog.releases.end() || !ClientVersionSelectable(id, release->available))
+        throw std::runtime_error("この版はOriginX未対応のため、選べません。対応済みの26.45以降を選んでください。");
+    RefreshVersions(id);
+    Save();
+    const bool here = installedGames.count(id) || !Text(Game).empty();
+    Status(L"OriginX の版を " + Wide(id) + L" にしました（Windowsの通常起動の版はそのまま）。" +
+           (here ? std::wstring{} : L"\r\nこの版はまだこの PC にありません。Launch を押すと、確認のあとダウンロードして Windows に入れます。"));
+    GoTo(0);
 }
 
 void PollSwitchProgress()
@@ -1345,33 +1707,71 @@ void FetchAndApply()
     Busy(State::Fetching);
     Status(L"選択した版のDLLを取得・検査しています…\r\n保存済みの同じ版は再ダウンロードしません。");
     const auto release = selected;
-    preparation = std::thread([release] {
+    const Channel wanted = wantedChannel;
+    const std::string token = wanted == Channel::Stable ? std::string{} : LoadAccount(privateDirectory).token;
+    const unsigned epoch = accountEpoch.Now();
+    preparation = std::thread([release, wanted, token, epoch] {
         auto result = new PackageResult;
+        result->epoch = epoch;
         try {
-            bool local = false;
-            for (const auto& candidate : bundledCatalog.releases)
-                if (candidate.available && candidate.target.id == release.target.id && candidate.files == release.files &&
-                    candidate.revision == release.revision && candidate.target.loader == release.target.loader) local = true;
-            if (!local)
-                result->root = AcquirePackage(privateDirectory / "packages", release, Sha256File, DownloadHttps);
-            else
+            // The chosen channel first (docs/superpowers/specs/2026-11-09-release-channels-design.md): any problem is a
+            // reason shown to the user and the stable release is used, so Launch is never stopped by a channel.
+            AccountStatus status;   // alive until the end: the plan points into it
+            if (wanted != Channel::Stable)
             {
-                // Bundled files: taken as they are in the MyClient folder (a DLL rebuilt and copied in by hand
-                // works without editing catalog.json); see LocalRelease.
-                const auto bundled = [release](const std::string& key) {
-                    // Extra game versions would ship under versions/<id>/ (none now: only 26.51.1, at the bundle root).
-                    auto source = SafeChild(bundle / "versions" / fs::u8path(release.target.id), key);
-                    if (!fs::is_regular_file(source)) source = SafeChild(bundle, key);
-                    return source;
-                };
-                std::string folder;
-                const Release onDisk = LocalRelease(release, bundled, Sha256File, folder);
-                result->root = AcquirePackage(privateDirectory / "packages", onDisk, Sha256File,
-                    [onDisk, bundled](const std::string& url, const fs::path& destination, uint64_t) {
-                        for (const auto& file : onDisk.files.items())
-                            if (file.value().at("url") == url) { fs::copy_file(bundled(file.key()), destination); return; }
-                        throw std::runtime_error("同梱更新ファイルが見つかりません。");
-                    }, folder);
+                const AccountStatus* known = nullptr;
+                std::string error;
+                try { status = FetchStatus(token); known = &status; result->status = status; }
+                catch (const std::exception& e) { error = e.what(); }
+                const LaunchPlan plan = PlanLaunch(wanted, known, error, release.target.id, &release);
+                result->note = plan.reason;
+                if (plan.release)
+                {
+                    try
+                    {
+                        result->root = AcquirePackage(privateDirectory / "packages", *plan.release, Sha256File, DownloadHttps,
+                                                      PackageFolder(plan.channel, *plan.release));
+                        result->local = false;
+                        result->channel = plan.channel;
+                    }
+                    catch (const std::exception& e)
+                    {
+                        // e.g. the signed link expired during a long download: nothing half-written is used
+                        result->note = std::string(ChannelName(wanted)) + "を取得できなかったため、安定版で起動します。理由: " + e.what();
+                        result->root.clear();
+                    }
+                }
+            }
+            if (result->root.empty())
+            {
+                bool local = false;
+                for (const auto& candidate : bundledCatalog.releases)
+                    if (candidate.available && candidate.target.id == release.target.id && candidate.files == release.files &&
+                        candidate.revision == release.revision && candidate.target.loader == release.target.loader) local = true;
+                result->local = local;
+                if (!local)
+                    result->root = AcquirePackage(privateDirectory / "packages", release, Sha256File, DownloadHttps);
+                else
+                {
+                    // Bundled files: taken as they are in the MyClient folder (a DLL rebuilt and copied in by hand
+                    // works without editing catalog.json); see LocalRelease.
+                    const auto bundled = [release](const std::string& key) {
+                        // Extra game versions would ship under versions/<id>/ (none now: only 26.51.1, at the bundle root).
+                        // The HUD of a bundle sits beside the launcher (MyClient.exe), not under hud/.
+                        const std::string name = key == HudFile ? std::string("MyClient.exe") : key;
+                        auto source = SafeChild(bundle / "versions" / fs::u8path(release.target.id), name);
+                        if (!fs::is_regular_file(source)) source = SafeChild(bundle, name);
+                        return source;
+                    };
+                    std::string folder;
+                    const Release onDisk = LocalRelease(release, bundled, Sha256File, folder);
+                    result->root = AcquirePackage(privateDirectory / "packages", onDisk, Sha256File,
+                        [onDisk, bundled](const std::string& url, const fs::path& destination, uint64_t) {
+                            for (const auto& file : onDisk.files.items())
+                                if (file.value().at("url") == url) { fs::copy_file(bundled(file.key()), destination); return; }
+                            throw std::runtime_error("同梱更新ファイルが見つかりません。");
+                        }, folder);
+                }
             }
         }
         catch (const std::exception& error) { result->error = error.what(); }
@@ -1386,6 +1786,7 @@ void ShowPage()
     for (int id : settings) ShowWindow(GetDlgItem(window, id), !scrolling && page == 1 && settingsTab == 0 ? SW_SHOW : SW_HIDE);
     ShowWindow(GetDlgItem(window, Apply), !scrolling && page == 0 ? SW_SHOW : SW_HIDE);
     ShowWindow(GetDlgItem(window, HomeSettings), !scrolling && page == 0 ? SW_SHOW : SW_HIDE);
+    SyncVersionCards();
     Refresh();
 }
 
@@ -1433,7 +1834,7 @@ void BuildUi()
     ShowWindow(GetDlgItem(window, Version), SW_HIDE);
     // Home: the launch and settings buttons in the middle of the window.
     editable.push_back(Control(L"BUTTON", L"Launch", 452, 318, 260, 62, Apply, WS_TABSTOP | BS_OWNERDRAW));
-    Control(L"BUTTON", L"Settings", 452, 394, 260, 50, HomeSettings, WS_TABSTOP | BS_OWNERDRAW);
+    Control(L"BUTTON", L"Settings", 452, 456, 260, 50, HomeSettings, WS_TABSTOP | BS_OWNERDRAW);   // (under Launch: the version at 384, the normal-launch line at 422)
     // Settings page.
     editable.push_back(Control(L"EDIT", L"", 328, 116, 516, 42, Game, WS_BORDER | ES_AUTOHSCROLL | ES_READONLY | WS_TABSTOP));
     editable.push_back(Control(L"BUTTON", L"自動検出", 856, 116, 126, 42, AutoDetect, WS_TABSTOP | BS_OWNERDRAW));
@@ -1442,7 +1843,9 @@ void BuildUi()
     editable.push_back(Control(L"BUTTON", L"更新を確認", 896, 318, 220, 42, CheckUpdates, WS_TABSTOP | BS_OWNERDRAW));
     editable.push_back(Control(L"BUTTON", L"使い方・必要な部品", 896, 426, 220, 42, Guide, WS_TABSTOP | BS_OWNERDRAW));
     ShowPage();
-    bundledCatalog = ParseCatalog(ReadJson(bundle / "catalog.json"));
+    // Downloaded on its own (no folder around it), the launcher has no bundled list: the list comes from the
+    // update check right below, and everything it names is downloaded.
+    if (fs::is_regular_file(bundle / "catalog.json")) bundledCatalog = ParseCatalog(ReadJson(bundle / "catalog.json"));
     catalog = bundledCatalog;
     if (fs::exists(privateDirectory / "catalog.json"))
     {
@@ -1464,6 +1867,9 @@ void BuildUi()
             if (!sources.is_object()) throw std::runtime_error("保存した本体一覧が不正です。");
             preferred = config.value("selectedVersion", preferred);
             if (config.contains("imports") && config.at("imports").is_array()) imports = config.at("imports");
+            if (config.contains("xboxSeen") && config.at("xboxSeen").is_string()) xboxSeen = config.at("xboxSeen").get<std::string>();
+            if (config.contains("channel") && config.at("channel").is_string()) wantedChannel = ParseChannel(config.at("channel").get<std::string>());
+            if (config.contains("syncNormal") && config.at("syncNormal").is_boolean()) syncNormal = config.at("syncNormal").get<bool>();
         }
         else sources["26.51.1"] = config.value("game", std::string{});
     }
@@ -1473,10 +1879,25 @@ void BuildUi()
         catch (const std::exception&) { /* Replaced by the download below. */ }
     }
     ScanInstalled();
+    // The Xbox app updates the game by itself (e.g. 26.51.1 -> 26.60.5). When its install changed to another
+    // version MyClient supports, that version is chosen; a version picked by hand stays until the install changes.
+    for (const auto& [id, path] : installedGames)
+    {
+        if (Lower(path.u8string()).find("xboxgames") == std::string::npos || id == xboxSeen) continue;
+        for (const auto& release : catalog.releases)
+            if (release.available && release.target.id == id) preferred = id;
+        xboxSeen = id;
+    }
     RefreshVersions(preferred);
     FetchVersionDb();
+    QueryNormalVersion();
+    CheckLauncherUpdate();
     if (!SetTimer(window, 1, 500, nullptr)) throw std::runtime_error("接続確認タイマーを開始できません。");
     PostMessageW(window, CheckMessage, 0, 0);
+    // The saved Discord login: the name and icon are drawn at once, the roles are asked in the background.
+    storedAccount = LoadAccount(privateDirectory);
+    ReloadAvatar();
+    StartAccount(false);
 }
 
 
@@ -1489,11 +1910,7 @@ RECT LogFileLink() { return MR(960, 48, 156, 30); }
 // Home: links in the corners.
 RECT HomeVersionsLink() { return MR(904, 28, 104, 30); }
 RECT HomeLogsLink() { return MR(1020, 28, 104, 30); }
-RECT HomeVersionChip() { return MR(28, 676, 300, 50); }
-constexpr int VersionRowsShown = 12;
-RECT VersionListRow(int i) { return MR(324, 156 + i * 38, 792, 34); }
-RECT VersionInstallButton(int i) { return MR(1004, 161 + i * 38, 100, 24); }
-bool ShowsInstall(const VersionRow& row) { return row.published && row.downloadable && !row.installed; }
+RECT VersionCardRect(int i) { return MR(328, 136 + i * 154, 788, 140); }
 
 std::vector<VersionRow> CurrentVersionRows()
 {
@@ -1503,9 +1920,65 @@ std::vector<VersionRow> CurrentVersionRows()
     for (const auto& [id, path] : installedGames) installed.push_back(id);
     std::vector<std::string> downloadable;
     for (const auto& [id, urls] : versionLinks) downloadable.push_back(id);
-    auto rows = VersionRows(publishedVersions, entries, installed, downloadable);
-    if (rows.size() > VersionRowsShown) rows.resize(VersionRowsShown);
-    return rows;
+    return ClientVersionRows(VersionRows(publishedVersions, entries, installed, downloadable));
+}
+
+size_t VersionCardChoice(const VersionFamilyRows& family)
+{
+    for (const auto& id : {switchingId, normalVersionId, selected.target.id})
+        if (!id.empty())
+            for (size_t i = 0; i < family.rows.size(); ++i) if (family.rows[i].id == id) return i;
+    for (size_t i = 0; i < family.rows.size(); ++i) if (family.rows[i].supported) return i;
+    return 0;
+}
+
+std::wstring DisplayGameVersion(const std::string& id)
+{
+    return Wide(id.rfind("1.", 0) == 0 ? id : "1." + id);
+}
+
+void SyncVersionCards()
+{
+    versionFamilies = GroupVersionRows(CurrentVersionRows());
+    for (int slot = 0; slot < VersionCardsShown; ++slot)
+    {
+        HWND& control = versionCardControls[slot];
+        const size_t index = static_cast<size_t>(slot);
+        const bool visible = !scrolling && page == 1 && settingsTab == 1 && index < versionFamilies.size();
+        if (!visible) { if (control) ShowWindow(control, SW_HIDE); continue; }
+        if (!control)
+        {
+            control = Control(L"COMBOBOX", L"", 700, 174 + slot * 154, 392, 270,
+                              VersionCardControl + slot, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP,
+                              false, false); // Keep native white chrome hidden until custom painting and selection are ready.
+            if (!control) throw std::runtime_error("バージョン選択欄を作成できません。");
+            COMBOBOXINFO info{};
+            info.cbSize = sizeof(info);
+            if (!GetComboBoxInfo(control, &info) || !info.hwndList)
+                throw std::runtime_error("バージョン一覧の表示を準備できません。");
+            nativeVersionSelectorProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(control, GWLP_WNDPROC,
+                reinterpret_cast<LONG_PTR>(VersionSelectorProc)));
+            if (!nativeVersionSelectorProc) throw std::runtime_error("バージョン選択欄の配色を設定できません。");
+            nativeVersionListProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(info.hwndList, GWLP_WNDPROC,
+                reinterpret_cast<LONG_PTR>(VersionListProc)));
+            if (!nativeVersionListProc) throw std::runtime_error("バージョン一覧の配色を設定できません。");
+            SendMessageW(control, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), Sc(32));
+        }
+        SendMessageW(control, CB_RESETCONTENT, 0, 0);
+        const auto& family = versionFamilies[index];
+        for (const auto& row : family.rows)
+        {
+            const auto label = DisplayGameVersion(row.id) + (!row.supported ? L"　未対応・選択不可" : row.installed ? L"　インストール済み" :
+                row.downloadable ? L"　ダウンロード" : L"　配信リンクなし");
+            if (SendMessageW(control, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str())) < 0)
+                throw std::runtime_error("バージョン一覧を表示できません。");
+        }
+        SendMessageW(control, CB_SETCURSEL, VersionCardChoice(family), 0);
+        EnableWindow(control, state == State::Idle);
+        ShowWindow(control, SW_SHOW);
+        RedrawWindow(control, nullptr, nullptr, RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW);
+    }
+    Refresh();
 }
 
 void Box(HDC dc, RECT r, int radius, COLORREF fill, COLORREF edge, bool border = true)
@@ -1529,6 +2002,133 @@ void Txt(HDC dc, const std::wstring& text, RECT r, HFONT f, COLORREF colour,
     HGDIOBJ old = SelectObject(dc, f);
     DrawTextW(dc, text.c_str(), -1, &r, flags);
     SelectObject(dc, old);
+}
+
+void DrawVersionItem(const DRAWITEMSTRUCT& item)
+{
+    if (!item.hDC || item.CtlID < VersionCardControl || item.CtlID >= VersionCardControl + VersionCardsShown) return;
+    const size_t slot = item.CtlID - VersionCardControl;
+    const VersionRow* row = nullptr;
+    if (slot < versionFamilies.size() && item.itemID < versionFamilies[slot].rows.size())
+        row = &versionFamilies[slot].rows[item.itemID];
+    const bool enabled = row && ClientVersionSelectable(row->id, row->supported) && !(item.itemState & ODS_DISABLED);
+    const bool highlighted = enabled && (item.itemState & ODS_SELECTED);
+    Box(item.hDC, item.rcItem, 0, highlighted ? ColTile : ColPanel, 0, false);
+    if (!row) return;
+    const auto label = DisplayGameVersion(row->id) + (!row->supported ? L"　未対応・選択不可" :
+        row->installed ? L"　インストール済み" : row->downloadable ? L"　ダウンロード" : L"　配信リンクなし");
+    RECT text = item.rcItem;
+    text.left += Sc(10);
+    text.right -= Sc(8);
+    Txt(item.hDC, label, text, font, enabled ? ColText : RGB(77, 84, 100),
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    if (enabled && (item.itemState & ODS_FOCUS)) DrawFocusRect(item.hDC, &item.rcItem);
+}
+
+void ClearVersionSelector(HDC dc, const RECT& r)
+{
+    if (!dc) return;
+    const auto brush = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
+    if (!brush) return;
+    const COLORREF previous = SetDCBrushColor(dc, ColSide);
+    FillRect(dc, &r, brush);
+    SetDCBrushColor(dc, previous);
+}
+
+void DrawVersionSelector(HWND handle, HDC dc)
+{
+    if (!handle || !dc) return;
+    RECT r{};
+    if (!GetClientRect(handle, &r)) return;
+    // RoundRect does not touch its four outside corners. Clear the entire client area first.
+    ClearVersionSelector(dc, r);
+    const bool enabled = IsWindowEnabled(handle) != FALSE;
+    const bool focused = GetFocus() == handle;
+    Box(dc, r, 6, ColPanel, enabled && focused ? ColAccentHi : ColLine);
+    const int arrowWidth = Sc(34);
+    const int centreX = r.right - arrowWidth / 2, centreY = (r.top + r.bottom) / 2;
+    HPEN pen = CreatePen(PS_SOLID, std::max(1, Sc(2)), enabled ? ColMuted : RGB(77, 84, 100));
+    if (pen)
+    {
+        const HGDIOBJ previous = SelectObject(dc, pen);
+        MoveToEx(dc, centreX - Sc(5), centreY - Sc(2), nullptr);
+        LineTo(dc, centreX, centreY + Sc(3));
+        LineTo(dc, centreX + Sc(5), centreY - Sc(2));
+        SelectObject(dc, previous);
+        DeleteObject(pen);
+    }
+    const LRESULT choice = SendMessageW(handle, CB_GETCURSEL, 0, 0);
+    const int id = GetDlgCtrlID(handle) - VersionCardControl;
+    if (id < 0 || static_cast<size_t>(id) >= versionFamilies.size() || choice == CB_ERR ||
+        static_cast<size_t>(choice) >= versionFamilies[static_cast<size_t>(id)].rows.size()) return;
+    DRAWITEMSTRUCT item{};
+    item.CtlID = GetDlgCtrlID(handle);
+    item.itemID = static_cast<UINT>(choice);
+    item.hDC = dc;
+    item.rcItem = r;
+    InflateRect(&item.rcItem, -Sc(2), -Sc(2));
+    item.rcItem.right -= arrowWidth;
+    item.itemState = enabled ? 0 : ODS_DISABLED;
+    DrawVersionItem(item);
+}
+
+void DrawVersionBorder(HWND handle)
+{
+    if (!handle) return;
+    RECT r{};
+    if (!GetWindowRect(handle, &r)) return;
+    r = RECT{0, 0, r.right - r.left, r.bottom - r.top};
+    HDC dc = GetWindowDC(handle);
+    if (!dc) return;
+    HBRUSH brush = CreateSolidBrush(ColLine);
+    if (brush)
+    {
+        // Cover both pixels of the standard raised white popup frame.
+        FrameRect(dc, &r, brush);
+        InflateRect(&r, -1, -1);
+        FrameRect(dc, &r, brush);
+        DeleteObject(brush);
+    }
+    ReleaseDC(handle, dc);
+}
+
+LRESULT CALLBACK VersionSelectorProc(HWND handle, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    if (message == WM_PAINT)
+    {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(handle, &paint);
+        if (dc) DrawVersionSelector(handle, dc);
+        EndPaint(handle, &paint);
+        return 0;
+    }
+    if (message == WM_PRINTCLIENT)
+    {
+        if (wParam) DrawVersionSelector(handle, reinterpret_cast<HDC>(wParam));
+        return 0;
+    }
+    if (message == WM_ERASEBKGND)
+    {
+        RECT r{};
+        if (wParam && GetClientRect(handle, &r)) ClearVersionSelector(reinterpret_cast<HDC>(wParam), r);
+        return 1;
+    }
+    const LRESULT result = nativeVersionSelectorProc ? CallWindowProcW(nativeVersionSelectorProc, handle, message, wParam, lParam) :
+        DefWindowProcW(handle, message, wParam, lParam);
+    if (message == WM_NCPAINT) DrawVersionBorder(handle);
+    if (message == WM_SETFOCUS || message == WM_KILLFOCUS || message == WM_ENABLE ||
+        message == CB_SETCURSEL || message == CB_SHOWDROPDOWN || message == WM_LBUTTONDOWN ||
+        message == WM_LBUTTONUP || message == WM_KEYDOWN || message == WM_KEYUP)
+        InvalidateRect(handle, nullptr, FALSE);
+    return result;
+}
+
+LRESULT CALLBACK VersionListProc(HWND handle, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    const LRESULT result = nativeVersionListProc ? CallWindowProcW(nativeVersionListProc, handle, message, wParam, lParam) :
+        DefWindowProcW(handle, message, wParam, lParam);
+    if (message == WM_NCPAINT) DrawVersionBorder(handle);
+    return result;
 }
 
 std::wstring SecondLine(const std::wstring& text)
@@ -1588,6 +2188,199 @@ std::wstring Greeting()
     return L"Good Evening!";
 }
 
+// ---- Home: the Discord account and the release channel (bottom left), the version under Launch ----
+// (docs/superpowers/specs/2026-11-09-release-channels-design.md)
+struct LoginResult { std::string error, token; std::optional<AccountStatus> status; bool interactive = true; unsigned epoch = 0; };
+std::thread accountThread;
+std::atomic<bool> loginCancel{false};
+bool accountBusy = false, channelMenuOpen = false;
+HBITMAP avatarBitmap = nullptr;
+
+RECT HomeVersionUnderLaunch() { return MR(452, 384, 260, 36); }
+RECT HomeNormalLine() { return MR(452, 422, 460, 26); }
+RECT HomeAvatarRect() { return MR(28, 684, 34, 34); }
+RECT HomeLoginButton() { return MR(28, 684, 190, 34); }
+RECT HomeNameRect() { return MR(70, 684, 150, 34); }
+RECT HomeChannelButton() { return MR(228, 684, 132, 34); }
+RECT HomeChannelMenuRow(int i, int count) { return MR(228, 684 - 6 - (count - i) * 36, 230, 34); }
+
+bool LoggedIn() { return !storedAccount.token.empty() && !accountExpired; }
+
+void ReloadAvatar()
+{
+    if (avatarBitmap) { DeleteObject(avatarBitmap); avatarBitmap = nullptr; }
+    if (!storedAccount.token.empty()) avatarBitmap = LoadAvatarBitmap(AvatarFile(privateDirectory), Sc(34));
+}
+
+// The browser login (interactive) or a refresh of the roles with the saved key, on a thread: both end in LoginMessage.
+void StartAccount(bool interactive)
+{
+    if (accountBusy) return;
+    const std::string token = interactive ? std::string{} : storedAccount.token;
+    if (!interactive && token.empty()) return;
+    if (accountThread.joinable()) accountThread.join();
+    accountBusy = true;
+    loginCancel = false;
+    if (interactive) { Status(L"ブラウザーで Discord にログインしてください。終わるとここへ自動で戻ります。"); Refresh(); }
+    const unsigned epoch = accountEpoch.Now();
+    accountThread = std::thread([interactive, token, epoch] {
+        auto* result = new LoginResult;
+        result->interactive = interactive;
+        result->epoch = epoch;
+        try
+        {
+            result->token = interactive ? LoginInBrowser(loginCancel) : token;
+            AccountStatus status = FetchStatus(result->token);
+            if (status.token.empty()) status.token = result->token;
+            const fs::path icon = AvatarFile(privateDirectory);
+            std::error_code ignored;
+            if (status.avatarUrl.empty()) fs::remove(icon, ignored);
+            else if (status.avatarUrl != LoadAccount(privateDirectory).avatarUrl || !fs::exists(icon, ignored)) FetchAvatar(status.avatarUrl, icon);
+            result->status = status;
+        }
+        catch (const std::exception& error) { result->error = error.what(); }
+        if (!PostMessageW(window, LoginMessage, 0, reinterpret_cast<LPARAM>(result))) delete result;
+    });
+}
+
+void Logout()
+{
+    loginCancel = true;
+    accountEpoch.Invalidate();   // a login / refresh still running must not bring the account back
+    DeleteAccount(privateDirectory);
+    storedAccount = {};
+    accountStatus.reset();
+    accountExpired = false;
+    wantedChannel = Channel::Stable;
+    channelMenuOpen = false;
+    ReloadAvatar();
+    Save();
+    Status(L"ログアウトしました。");
+    Refresh();
+}
+
+struct MenuEntry { std::wstring label; bool logout; Channel channel; bool current; };
+std::vector<MenuEntry> ChannelMenu()
+{
+    std::vector<MenuEntry> entries;
+    const auto allowed = accountStatus ? AllowedChannels(*accountStatus) : std::vector<Channel>{Channel::Stable};
+    for (Channel channel : allowed)
+        entries.push_back({Wide(ChannelName(channel)) + (channel == Channel::Early ? L"（supporter）" : channel == Channel::Test ? L"（moderator）" : L""),
+                           false, channel, channel == wantedChannel});
+    entries.push_back({L"ログアウト", true, Channel::Stable, false});
+    return entries;
+}
+
+void DrawAvatar(HDC dc, RECT r)
+{
+    const int size = r.right - r.left;
+    if (avatarBitmap)
+    {
+        HDC source = CreateCompatibleDC(dc);
+        HGDIOBJ previous = SelectObject(source, avatarBitmap);
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        AlphaBlend(dc, r.left, r.top, size, size, source, 0, 0, size, size, blend);
+        SelectObject(source, previous);
+        DeleteDC(source);
+        return;
+    }
+    // no icon (none set, not downloaded, or it could not be read): a round badge with the first letter of the name
+    Box(dc, r, size / 2, RGB(88, 101, 242), RGB(88, 101, 242), false);
+    std::wstring name = Wide(storedAccount.name);
+    const std::wstring letter = name.empty() ? std::wstring(L"D") : std::wstring(1, static_cast<wchar_t>(towupper(name[0])));
+    Txt(dc, letter, r, boldFont, RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+}
+
+void ChannelColours(Channel channel, COLORREF& fill, COLORREF& edge, COLORREF& text)
+{
+    if (channel == Channel::Test) { fill = RGB(58, 31, 8); edge = RGB(163, 90, 20); text = RGB(255, 200, 138); }
+    else if (channel == Channel::Early) { fill = RGB(14, 52, 40); edge = RGB(30, 120, 90); text = RGB(150, 230, 190); }
+    else { fill = RGB(15, 42, 87); edge = RGB(29, 77, 156); text = RGB(214, 228, 255); }
+}
+
+void DrawAccountArea(HDC dc)
+{
+    if (!LoggedIn())
+    {
+        const RECT button = HomeLoginButton();
+        Box(dc, button, 17, RGB(15, 42, 87), RGB(29, 77, 156));
+        Txt(dc, accountBusy ? L"ブラウザーで確認しています…" : (accountExpired ? L"Discord でログインし直す" : L"Discord でログイン"), button, smallFont,
+            RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        return;
+    }
+    DrawAvatar(dc, HomeAvatarRect());
+    Txt(dc, storedAccount.name.empty() ? std::wstring(L"Discord") : Wide(storedAccount.name), HomeNameRect(), smallFont, ColText,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+    COLORREF fill, edge, text;
+    ChannelColours(wantedChannel, fill, edge, text);
+    const RECT button = HomeChannelButton();
+    Box(dc, button, 17, fill, edge);
+    Txt(dc, Wide(ChannelName(wantedChannel)) + L" \u25BC", button, smallFont, text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if (!channelMenuOpen) return;
+    const auto entries = ChannelMenu();
+    const int count = static_cast<int>(entries.size());
+    for (int i = 0; i < count; i++)
+    {
+        const RECT row = HomeChannelMenuRow(i, count);
+        Box(dc, row, 10, entries[i].current ? RGB(15, 42, 87) : ColPanel, ColBorder);
+        Txt(dc, (entries[i].current ? L"\u25CF " : L"   ") + entries[i].label, RECT{row.left + Sc(12), row.top, row.right, row.bottom}, smallFont,
+            entries[i].logout ? ColMuted : ColText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+}
+
+// Under Launch: the chosen game version (opens Versions); with the release channel named when it is not stable.
+void DrawVersionUnderLaunch(HDC dc, const std::wstring& id)
+{
+    const RECT area = HomeVersionUnderLaunch();
+    const std::wstring where = !selected.available ? L"waiting for DLL" : installedGames.count(selected.target.id) ? L"on this PC" : L"not on this PC";
+    const std::wstring pillText = wantedChannel == Channel::Stable ? id : id + L" \u00B7 " + Wide(ChannelName(wantedChannel));
+    SIZE pillSize{};
+    HGDIOBJ previous = SelectObject(dc, smallFont);
+    GetTextExtentPoint32W(dc, pillText.c_str(), static_cast<int>(pillText.size()), &pillSize);
+    SelectObject(dc, previous);
+    const int pillWidth = std::max<int>(Sc(96), pillSize.cx + Sc(32)), height = Sc(34);
+    RECT pill{area.left, area.top + (area.bottom - area.top - height) / 2, area.left + pillWidth, area.top + (area.bottom - area.top - height) / 2 + height};
+    COLORREF fill = ColSide, edge = ColBorder, text = ColText;
+    if (wantedChannel == Channel::Test) ChannelColours(wantedChannel, fill, edge, text);
+    Box(dc, pill, 17, fill, edge);
+    Txt(dc, pillText, pill, smallFont, text, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    Txt(dc, where + L"  \u203A", RECT{pill.right + Sc(12), area.top, area.right, area.bottom}, smallFont, ColMuted, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+}
+
+// The second line under Launch: what Windows starts normally, and a switch to the chosen version when they differ.
+bool NormalSwitchOffered()
+{
+    return state == State::Idle && normalRead == NormalRead::Known && !normalVersionId.empty() && selected.available &&
+           normalVersionId != selected.target.id && ClientVersionSelectable(selected.target.id, selected.available);
+}
+
+void DrawNormalLine(HDC dc)
+{
+    const RECT area = HomeNormalLine();
+    std::wstring label = L"通常起動: ", value, link;
+    if (state == State::Switching && !switchingId.empty())
+        value = (normalVersionId.empty() ? std::wstring{} : Wide(normalVersionId) + L" → ") + Wide(switchingId) + L" に切り替え中…";
+    else if (normalRead == NormalRead::Unknown || normalRead == NormalRead::Reading) value = L"確認中…";
+    else if (normalRead == NormalRead::Missing) value = normalReadNote.empty() ? std::wstring(L"読み取れません") : normalReadNote;
+    else
+    {
+        value = Wide(normalVersionId);
+        if (NormalSwitchOffered()) link = Wide(selected.target.id) + L" に切り替える  \u203A";
+        else if (normalVersionId == selected.target.id) value += L"  \u2713 同じ版";
+    }
+    SIZE labelSize{}, valueSize{};
+    HGDIOBJ previous = SelectObject(dc, smallFont);
+    GetTextExtentPoint32W(dc, label.c_str(), static_cast<int>(label.size()), &labelSize);
+    GetTextExtentPoint32W(dc, value.c_str(), static_cast<int>(value.size()), &valueSize);
+    SelectObject(dc, previous);
+    const UINT flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
+    Txt(dc, label, area, smallFont, ColMuted, flags);
+    RECT valueArea{area.left + labelSize.cx, area.top, area.right, area.bottom};
+    Txt(dc, value, valueArea, smallFont, ColText, flags);
+    if (!link.empty())
+        Txt(dc, link, RECT{valueArea.left + valueSize.cx + Sc(14), area.top, area.right, area.bottom}, smallFont, ColAccentHi, flags);
+}
+
 void DrawHome(HDC dc, int width, int height)
 {
     for (int y = 0; y < height; y += 2)
@@ -1620,7 +2413,7 @@ void DrawHome(HDC dc, int width, int height)
         if (sub.empty()) sub = L"Please keep this window open.";
     }
     else if (state == State::Waiting || state == State::Attaching) { title = L"Starting Minecraft"; sub = L"Waiting for the game to connect..."; }
-    else if (!selected.available) sub = L"Minecraft " + id + L" is waiting for MyClient support.";
+    else if (!selected.available) sub = L"Minecraft " + id + L" is waiting for OriginX support.";
     else if (!found) sub = L"Minecraft " + id + L" was not found. Start the game once, or set it in Settings.";
     Txt(dc, title, MR(0, 196, 1164, 56), greetFont, RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     Txt(dc, sub, MR(160, 254, 844, 30), font, RGB(196, 208, 228), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
@@ -1631,28 +2424,26 @@ void DrawHome(HDC dc, int width, int height)
     {
         size_t cut = status.find(L"\r\n");   // at most two lines
         if (cut != std::wstring::npos) cut = status.find(L"\r\n", cut + 2);
-        Txt(dc, status.substr(0, cut), MR(232, 460, 700, 44), smallFont, statusError ? ColError : RGB(168, 182, 206),
+        Txt(dc, status.substr(0, cut), MR(232, 520, 700, 44), smallFont, statusError ? ColError : RGB(168, 182, 206),
             DT_CENTER | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
     }
     if (progressPercent >= 0)
     {
-        const RECT track = MR(402, 512, 300, 10);
+        const RECT track = MR(402, 572, 300, 10);
         Box(dc, track, 5, ColSide, ColBorder);
         RECT fill = track;
         fill.right = fill.left + std::max<LONG>(Sc(10), (track.right - track.left) * progressPercent / 100);
         if (progressPercent > 0) Box(dc, fill, 5, ColAccent, ColAccent, false);
-        Txt(dc, std::to_wstring(progressPercent) + L"%", MR(712, 504, 60, 26), smallFont, RGB(255, 255, 255));
+        Txt(dc, std::to_wstring(progressPercent) + L"%", MR(712, 564, 60, 26), smallFont, RGB(255, 255, 255));
     }
 
-    // Bottom left: the chosen version (opens Versions). Bottom right: launcher version and readiness.
-    const RECT chip = HomeVersionChip();
-    Box(dc, RECT{chip.left, chip.top + Sc(8), chip.left + Sc(110), chip.bottom - Sc(8)}, 17, ColSide, ColBorder);
-    Txt(dc, id, RECT{chip.left, chip.top, chip.left + Sc(110), chip.bottom}, smallFont, ColText,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    const std::wstring where = !selected.available ? L"waiting for DLL" : installedGames.count(selected.target.id) ? L"on this PC" : L"not on this PC";
-    Txt(dc, where + L"  ›", RECT{chip.left + Sc(122), chip.top, chip.right, chip.bottom}, smallFont, ColMuted,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    const wchar_t* launcherVersion = L"v0.5.0";
+    // Under Launch: the chosen version (opens Versions). Bottom left: the Discord account and the release channel.
+    // Bottom right: launcher version and readiness.
+    DrawVersionUnderLaunch(dc, id);
+    DrawNormalLine(dc);
+    DrawAccountArea(dc);
+    const std::wstring versionText = LauncherBuild ? L"v1.0.0 · build " + std::to_wstring(LauncherBuild) : std::wstring(L"v1.0.0");
+    const wchar_t* launcherVersion = versionText.c_str();
     SIZE versionSize{};
     HGDIOBJ previous = SelectObject(dc, smallFont);
     GetTextExtentPoint32W(dc, launcherVersion, static_cast<int>(wcslen(launcherVersion)), &versionSize);
@@ -1671,44 +2462,44 @@ void DrawHome(HDC dc, int width, int height)
 // ----------------------------- Settings: a second screen below Home -----------------------------
 void DrawVersions(HDC dc)
 {
-    Txt(dc, L"Minecraft versions", MR(328, 48, 500, 30), boldFont, ColText);
-    Txt(dc, L"公開版の一覧（LeviLauncherと同じ公開データ・" + versionDbNote + L"）と、MyClientの対応・このPCにある版。"
-            L"遊べるのはDLLがあり、このPCにある版です。対応版の行を押すと選んでホームに戻ります。",
-        MR(328, 80, 790, 40), smallFont, ColMuted, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS);
-    const int columns[4] = {344, 500, 660, 880};
-    const wchar_t* heads[4] = {L"Version", L"Released", L"MyClient", L"This PC"};
-    for (int c = 0; c < 4; c++) Txt(dc, heads[c], MR(columns[c], 130, 200, 22), smallFont, ColMuted);
-    const auto rows = CurrentVersionRows();
-    if (rows.empty()) Txt(dc, L"一覧を取得しています…", VersionListRow(0), font, ColMuted);
-    for (size_t n = 0; n < rows.size(); n++)
+    Txt(dc, L"Minecraft のバージョン", MR(328, 48, 600, 30), boldFont, ColText);
+    Txt(dc, L"1.26 系列の26.45以降を表示。対応済みの版を選ぶと、通常起動の Minecraft も自動で切り替わります。",
+        MR(328, 86, 788, 36), smallFont, ColMuted, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+    if (versionFamilies.empty()) Txt(dc, L"バージョン一覧を取得しています…", MR(348, 174, 700, 40), font, ColMuted);
+    for (int slot = 0; slot < VersionCardsShown; ++slot)
     {
-        const auto& row = rows[n];
-        const RECT r = VersionListRow(static_cast<int>(n));
-        const bool chosen = row.inCatalog && row.id == selected.target.id;
-        Box(dc, r, 10, chosen ? ColTile : ColSide, chosen ? ColAccentHi : ColLine);
-        const auto cell = [&](int c, int width) { return RECT{Sc(columns[c]), r.top, Sc(columns[c] + width), r.bottom}; };
-        const UINT flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS;
-        Txt(dc, Wide(row.id), cell(0, 150), titleFont, row.supported ? ColText : ColMuted, flags);
-        Txt(dc, row.published ? L"Released" : L"—", cell(1, 150), smallFont, row.published ? ColText : ColMuted, flags);
-        Txt(dc, row.supported ? L"DLL ready" : row.inCatalog ? L"Waiting for DLL" : L"Not supported yet", cell(2, 210), smallFont,
-            row.supported ? ColGreen : ColMuted, flags);
-        if (row.id == switchingId)
-            Txt(dc, L"Installing\u2026 " + std::to_wstring(std::max(progressPercent, 0)) + L"%", cell(3, 220), smallFont, ColAccentHi, flags);
-        else
+        const size_t index = static_cast<size_t>(slot);
+        if (index >= versionFamilies.size()) break;
+        const auto& family = versionFamilies[index];
+        if (family.rows.empty()) continue;
+        const auto& row = family.rows[VersionCardChoice(family)];
+        const int y = 136 + slot * 154;
+        Box(dc, VersionCardRect(slot), 14, ColSide, row.id == selected.target.id ? ColAccentHi : ColLine);
+        Txt(dc, Wide(family.label), MR(360, y + 18, 306, 76), versionLabelFont ? versionLabelFont : greetFont, ColText,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        Txt(dc, L"Minecraft Bedrock", MR(364, y + 100, 300, 22), smallFont, ColMuted);
+        Txt(dc, L"バージョンを選ぶ", MR(700, y + 12, 370, 20), smallFont, ColText);
+        if (scrolling)
         {
-            Txt(dc, row.installed ? L"Installed" : L"—", cell(3, 110), smallFont, row.installed ? ColGreen : ColMuted, flags);
-            if (ShowsInstall(row))
-            {
-                const RECT button = VersionInstallButton(static_cast<int>(n));
-                const bool idle = state == State::Idle;
-                Box(dc, button, 8, idle ? ColAccent : ColDisabled, idle ? ColAccent : ColDisabled, false);
-                Txt(dc, L"Install", button, smallFont, idle ? RGB(255, 255, 255) : ColDisabledText, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-            }
+            Box(dc, MR(700, y + 38, 392, 34), 6, ColPanel, ColLine);
+            Txt(dc, DisplayGameVersion(row.id) + L"  ▾", MR(712, y + 44, 370, 26), font, ColText);
         }
+        std::wstring status = row.supported ? L"OriginX 対応" : L"OriginX 未対応・選択不可";
+        if (row.supported)
+            status += row.installed ? L" / インストール済み" : row.downloadable ? L" / 選ぶとダウンロード" : L" / 配信リンクなし";
+        Txt(dc, status, MR(700, y + 80, 400, 22), smallFont, row.supported ? ColGreen : ColMuted,
+            DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+        std::wstring current = row.id == normalVersionId ? L"通常起動に設定済み" : L"";
+        if (row.id == switchingId)
+            current = switchPhase.load() == 0 ? L"通常起動の版を確認中…" : switchPhase.load() == 1 ?
+                L"ダウンロード中 " + std::to_wstring(std::max(progressPercent, 0)) + L"%" : L"Windows にインストール中…";
+        Txt(dc, current, MR(700, y + 108, 400, 22), smallFont, ColAccentHi);
     }
-    Txt(dc, L"Install を押すと、Microsoft の配信からその版を入れて今の Minecraft と置き換えます（Gaming Services とストア版の Minecraft が必要）。"
-            L"LeviLauncherなどで入れた版も自動で探します。MyClientが対応していない版はDLLが出るまで起動できません。",
-        MR(328, 628, 790, 60), smallFont, ColMuted, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+    Txt(dc, L"暗い項目はOriginX未対応のため、インストール・切替できません。",
+        MR(328, 302, 788, 30), smallFont, ColMuted);
+    Txt(dc, L"公開一覧: " + versionDbNote, MR(328, 340, 788, 24), smallFont, ColMuted);
+    Txt(dc, L"別の版に切り替えるときは Minecraft を終了してください。通常起動が別の版なら本体を取得します（PC内に別コピーがあっても対象）。同じ版なら再取得しません。",
+        MR(328, 390, 788, 90), smallFont, ColMuted, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
 }
 
 void Divider(HDC dc, int y)
@@ -1718,6 +2509,20 @@ void Divider(HDC dc, int y)
     HBRUSH brush = CreateSolidBrush(ColLine);
     FillRect(dc, &line, brush);
     DeleteObject(brush);
+}
+
+RECT SyncSwitchRect() { return MR(1040, 530, 76, 36); }
+
+void DrawSyncSwitch(HDC dc)
+{
+    const RECT track = SyncSwitchRect();
+    const int height = track.bottom - track.top, inset = Sc(4);
+    Box(dc, track, height / 2, syncNormal ? ColAccent : ColSide, syncNormal ? ColAccent : ColBorder);
+    const int knob = height - 2 * inset;
+    const int left = syncNormal ? track.right - inset - knob : track.left + inset;
+    Box(dc, RECT{left, track.top + inset, left + knob, track.top + inset + knob}, knob / 2, RGB(255, 255, 255), RGB(255, 255, 255), false);
+    Txt(dc, syncNormal ? L"ON" : L"OFF", RECT{track.left - Sc(60), track.top, track.left - Sc(10), track.bottom}, smallFont,
+        syncNormal ? ColAccentHi : ColMuted, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
 void DrawGeneral(HDC dc)
@@ -1736,9 +2541,15 @@ void DrawGeneral(HDC dc)
     Txt(dc, L"Help", MR(328, 414, 500, 28), boldFont, ColText);
     Txt(dc, L"使い方と、ゲームに必要なWindowsの部品。", MR(328, 444, 540, 44), smallFont, ColMuted, wrap);
     Divider(dc, 502);
-    Txt(dc, L"DLLは版ごとに保存し、公開された更新を起動時に確認します。本体の版は Version タブの Install で変えられます。ワールドの版ごとの分離は未対応です。"
+    Txt(dc, L"Normal launch", MR(328, 522, 500, 28), boldFont, ColText);
+    Txt(dc, syncNormal ? L"ON：Launch と版の選択で、Windows の通常起動（スタートメニューなど）の版も選んだ版に変えます。すでにその版ならダウンロードしません。"
+                       : L"OFF：Windows の通常起動の版は変えません。この PC に無い版だけ、確認のあとダウンロードして入れます（このとき通常起動の版も変わります）。",
+        MR(328, 552, 640, 44), smallFont, ColMuted, wrap);
+    DrawSyncSwitch(dc);
+    Divider(dc, 610);
+    Txt(dc, L"DLLは版ごとに保存し、公開された更新を起動時に確認します。通常起動の版は Home の Launch の下からも変えられます。ワールドの版ごとの分離は未対応です。"
             L"対応待ちの版は起動できません。配布先が未公開・オフラインの場合は保存済み一覧を使います。",
-        MR(328, 522, 788, 64), smallFont, ColMuted, wrap);
+        MR(328, 630, 788, 64), smallFont, ColMuted, wrap);
 }
 
 void DrawLogs(HDC dc)
@@ -1867,6 +2678,20 @@ LRESULT CALLBACK WindowProc(HWND handle, UINT message, WPARAM wParam, LPARAM lPa
         {
         case WM_CREATE: window = handle; BuildUi(); return 0;
         case CheckMessage: if (state == State::Idle) CheckForUpdates(); return 0;
+        case LauncherUpdateMessage:
+        {
+            std::unique_ptr<LauncherUpdateResult> result(reinterpret_cast<LauncherUpdateResult*>(lParam));
+            if (selfUpdateThread.joinable()) selfUpdateThread.join();
+            if (!result->error.empty()) Status(L"ランチャーの更新は確認できませんでした（このまま使えます）: " + Wide(result->error));
+            else if (!result->file.empty())
+            {
+                readyLauncher = result->file;
+                readyLauncherBuild = result->build;
+                ApplyLauncherUpdate();   // now if idle, else when the current step ends (Busy)
+            }
+            return 0;
+        }
+        case ApplyLauncherMessage: ApplyLauncherUpdate(); return 0;
         case UpdatedMessage:
         {
             std::unique_ptr<UpdateResult> result(reinterpret_cast<UpdateResult*>(lParam));
@@ -1876,6 +2701,23 @@ LRESULT CALLBACK WindowProc(HWND handle, UINT message, WPARAM wParam, LPARAM lPa
             RefreshVersions(selected.target.id);
             Status(result->error.empty() ? L"更新一覧を確認しました。版を選んで起動してください。" :
                 L"保存済み一覧を使用します。" + Wide(result->error));
+            if (launchAfterCheck)
+            {
+                launchAfterCheck = false;
+                if (!selected.available) throw std::runtime_error(selected.reason);
+                launchNote.clear();
+                // (user, 2026-11-09) Switch on: Windows' normal-launch version follows the chosen one (no download when
+                // Windows already has it). Off: OriginX's copy / the found install starts, Windows is not touched; a version
+                // not on this PC at all can only come from Windows, so that is asked first.
+                const std::string id = selected.target.id;
+                if (syncNormal) StartSwitch(id, true);
+                else if (installedGames.count(id) || !Text(Game).empty()) FetchAndApply();
+                else if (MessageBoxW(window, (L"Minecraft " + Wide(id) + L" はまだこの PC にありません。\r\n\r\nMicrosoft からダウンロード（数GB）して Windows に入れてから起動します。"
+                                              L"Windows の通常起動の版も " + Wide(id) + L" に変わります。\r\n\r\n続けますか？").c_str(),
+                                     L"OriginX", MB_YESNO | MB_ICONQUESTION) == IDYES)
+                    StartSwitch(id, true);
+                else Status(L"起動を取り消しました（Minecraft " + Wide(id) + L" はこの PC にありません）。");
+            }
             return 0;
         }
         case VersionDbMessage:
@@ -1889,24 +2731,98 @@ LRESULT CALLBACK WindowProc(HWND handle, UINT message, WPARAM wParam, LPARAM lPa
                 versionDbNote = L"最新";
             }
             else if (publishedVersions.empty()) versionDbNote = L"取得できません: " + Wide(result->error);
-            Refresh();
+            SyncVersionCards();
             return 0;
         }
         case SwitchedMessage:
         {
             std::unique_ptr<SwitchResult> result(reinterpret_cast<SwitchResult*>(lParam));
+            if (!result) throw std::runtime_error("Minecraftの版変更の結果を受け取れませんでした。");
             if (switchThread.joinable()) switchThread.join();
             Busy(State::Idle);
             EndProgress();
             switchingId.clear();
             ScanInstalled();
-            if (!result->error.empty()) throw std::runtime_error(result->error);
+            QueryNormalVersion();   // what Windows starts normally now, whatever the result
+            if (!result->error.empty() && result->launchAfter)
+            {
+                // Launch does not need Windows' registered version: OriginX starts its own copy of the chosen version.
+                // The registered (Start menu) version stays as it was; say why, then go on.
+                if (!installedGames.count(result->id) && Text(Game).empty())
+                    throw std::runtime_error("Minecraft " + result->id + " を Windows に入れられなかったため、起動できません（この PC にこの版がありません）。\n理由: " + result->error);
+                launchNote = L"Windowsの通常起動の版は変更できませんでした（Start menuなどのMinecraftは今のまま）。OriginXは選んだ版 " +
+                             Wide(result->id) + L" で起動します。\r\n理由: " + Wide(result->error);
+                PushLog(launchNote, true, false);
+                FetchAndApply();
+                return 0;
+            }
             bool listed = false;
             for (const auto& release : catalog.releases) if (release.target.id == result->id) listed = true;
+            if (!result->error.empty())
+            {
+                // A Versions card or the switch under Launch: OriginX takes the chosen version anyway (user, 2026-11-09);
+                // only Windows' registered (Start menu) version stays as it was. Say why.
+                if (listed) { RefreshVersions(result->id); Save(); }
+                else SyncVersionCards();
+                Status(L"OriginX の版は " + Wide(result->id) + L" にしました。Windowsの通常起動の版は変更できませんでした（Start menuなどのMinecraftは今のまま）。\r\n理由: " +
+                       Wide(result->error));
+                if (listed) GoTo(0);
+                return 0;
+            }
+            normalVersionId = result->id;
+            normalRead = NormalRead::Known;
             if (listed) { RefreshVersions(result->id); Save(); }
-            Status(L"Minecraft を " + Wide(result->id) + L" に変更しました。" +
+            else SyncVersionCards();
+            Status(L"通常起動の Minecraft を " + Wide(result->id) + L" に設定し、Windowsの登録を確認しました。" +
                    (result->warning.empty() ? L"" : L"\r\n" + Wide(result->warning)) +
                    (installedGames.count(result->id) ? L"" : L"\r\n（この PC の一覧にまだ出ない場合は、Settings の自動検出を押してください。）"));
+            if (result->launchAfter) FetchAndApply();
+            else if (listed) GoTo(0);
+            return 0;
+        }
+        case NormalVersionMessage:
+        {
+            std::unique_ptr<NormalQueryResult> result(reinterpret_cast<NormalQueryResult*>(lParam));
+            if (normalQueryThread.joinable()) normalQueryThread.join();
+            if (result && !result->id.empty()) { normalVersionId = result->id; normalRead = NormalRead::Known; normalReadNote.clear(); }
+            else
+            {
+                normalVersionId.clear();
+                normalRead = NormalRead::Missing;
+                normalReadNote = result ? Wide(result->error) : std::wstring(L"読み取れません");
+                if (result) PushLog(L"Windowsの通常起動の版: " + normalReadNote, false, false);
+            }
+            SyncVersionCards();
+            Refresh();
+            if (normalQueryAgain) QueryNormalVersion();
+            return 0;
+        }
+        case LoginMessage:
+        {
+            std::unique_ptr<LoginResult> result(reinterpret_cast<LoginResult*>(lParam));
+            if (accountThread.joinable()) accountThread.join();
+            accountBusy = false;
+            if (!accountEpoch.Current(result->epoch))
+            {
+                // the user logged out while this ran: drop it, and the icon file it may have written meanwhile
+                if (storedAccount.token.empty()) DeleteAccount(privateDirectory);
+                Refresh();
+                return 0;
+            }
+            if (result->status)
+            {
+                NoteAccountStatus(*result->status);
+                ReloadAvatar();
+                if (result->interactive) Status(L"Discord にログインしました: " + Wide(result->status->name));
+            }
+            else if (result->interactive) { Refresh(); throw std::runtime_error(result->error); }
+            else
+            {
+                // the saved key could not be checked: the account stays as drawn, except when the key has expired
+                accountStatus.reset();
+                if (result->error.find("期限が切れました") != std::string::npos) accountExpired = true;
+            }
+            Refresh();
             return 0;
         }
         case PackageMessage:
@@ -1914,8 +2830,17 @@ LRESULT CALLBACK WindowProc(HWND handle, UINT message, WPARAM wParam, LPARAM lPa
             std::unique_ptr<PackageResult> result(reinterpret_cast<PackageResult*>(lParam));
             if (preparation.joinable()) preparation.join();
             Busy(State::Idle);
+            if (result->status && accountEpoch.Current(result->epoch)) NoteAccountStatus(*result->status);   // not after a logout
+            if (!result->note.empty())
+            {
+                // the chosen channel could not be used: the reason is shown with the launch result and kept in the log
+                const std::wstring note = Wide(result->note);
+                launchNote += (launchNote.empty() ? std::wstring{} : std::wstring(L"\r\n")) + note;
+                PushLog(note, true, false);
+            }
             if (!result->error.empty()) throw std::runtime_error(result->error);
             packageRoot = result->root;
+            packageLocal = result->local;
             ApplyClient();
             return 0;
         }
@@ -1933,17 +2858,64 @@ LRESULT CALLBACK WindowProc(HWND handle, UINT message, WPARAM wParam, LPARAM lPa
             return 0;
         }
         case WM_COMMAND:
+            if (LOWORD(wParam) >= VersionCardControl && LOWORD(wParam) < VersionCardControl + VersionCardsShown)
+            {
+                // Commit only when the dropdown closes with a selection; arrow browsing/Escape never installs.
+                if (HIWORD(wParam) == CBN_SELENDOK && state == State::Idle)
+                {
+                    const int slot = LOWORD(wParam) - VersionCardControl;
+                    const size_t familyIndex = static_cast<size_t>(slot);
+                    const HWND control = versionCardControls[slot];
+                    const LRESULT choice = control ? SendMessageW(control, CB_GETCURSEL, 0, 0) : CB_ERR;
+                    if (familyIndex < versionFamilies.size() && choice != CB_ERR &&
+                        static_cast<size_t>(choice) < versionFamilies[familyIndex].rows.size())
+                    {
+                        const auto row = versionFamilies[familyIndex].rows[static_cast<size_t>(choice)];
+                        if (!ClientVersionSelectable(row.id, row.supported))
+                        {
+                            Status(L"この版はOriginX未対応のため、インストール・切替できません。");
+                            SendMessageW(control, CB_SETCURSEL, VersionCardChoice(versionFamilies[familyIndex]), 0);
+                            Refresh();
+                        }
+                        else
+                        {
+                            try { SelectUserVersion(row.id); }
+                            catch (...) { SyncVersionCards(); throw; }
+                            Refresh();
+                        }
+                    }
+                }
+                else if (HIWORD(wParam) == CBN_SELENDCANCEL)
+                {
+                    const int slot = LOWORD(wParam) - VersionCardControl;
+                    const size_t index = static_cast<size_t>(slot);
+                    if (versionCardControls[slot] && index < versionFamilies.size())
+                        SendMessageW(versionCardControls[slot], CB_SETCURSEL, VersionCardChoice(versionFamilies[index]), 0);
+                }
+                return 0;
+            }
             if (LOWORD(wParam) == Version && HIWORD(wParam) == CBN_SELCHANGE && state == State::Idle)
-            { Save(); SelectVersion(); Save(); return 0; }
+            {
+                const auto index = SendDlgItemMessageW(window, Version, CB_GETCURSEL, 0, 0);
+                if (index != CB_ERR && static_cast<size_t>(index) < catalog.releases.size())
+                    SelectUserVersion(catalog.releases[static_cast<size_t>(index)].target.id);
+                return 0;
+            }
             if (HIWORD(wParam) != BN_CLICKED) return 0;
             switch (LOWORD(wParam))
             {
             case PickGame: if (state == State::Idle) Pick(Game); break;
             case AutoDetect: if (state == State::Idle && FindInstalledGame(false)) Save(); break;
             case ImportGame: if (state == State::Idle) ImportFolder(); break;
-            case Apply: if (state == State::Idle) FetchAndApply(); break;
+            case Apply:
+                if (state == State::Idle) { launchAfterCheck = true; CheckForUpdates(); }
+                else if (state == State::Checking) { launchAfterCheck = true; Status(L"更新を確認してから起動します…"); }
+                break;
             case CheckUpdates: if (state == State::Idle) CheckForUpdates(); break;
-            case Guide: ShellExecuteW(handle, L"open", (bundle / "README-ja.md").c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
+            case Guide:
+                ShellExecuteW(handle, L"open", fs::is_regular_file(bundle / "README-ja.md") ? (bundle / "README-ja.md").c_str()
+                              : L"https://originx.originx-client.workers.dev/", nullptr, nullptr, SW_SHOWNORMAL);
+                break;
             case Logs: OpenLogs(); break;
             case HomeSettings: settingsTab = 0; GoTo(1); break;
             }
@@ -1956,6 +2928,19 @@ LRESULT CALLBACK WindowProc(HWND handle, UINT message, WPARAM wParam, LPARAM lPa
         {
             const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
             if (item && item->CtlType == ODT_BUTTON) { DrawButton(*item); return TRUE; }
+            if (item && item->CtlType == ODT_COMBOBOX && item->CtlID >= VersionCardControl &&
+                item->CtlID < VersionCardControl + VersionCardsShown) { DrawVersionItem(*item); return TRUE; }
+            break;
+        }
+        case WM_MEASUREITEM:
+        {
+            auto* item = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+            if (item && item->CtlType == ODT_COMBOBOX && item->CtlID >= VersionCardControl &&
+                item->CtlID < VersionCardControl + VersionCardsShown)
+            {
+                item->itemHeight = static_cast<UINT>(Sc(32));
+                return TRUE;
+            }
             break;
         }
         case WM_ERASEBKGND: return 1;   // everything is drawn from the back buffer
@@ -1965,28 +2950,39 @@ LRESULT CALLBACK WindowProc(HWND handle, UINT message, WPARAM wParam, LPARAM lPa
             if (scrolling) return 0;
             if (page == 0)
             {
+                if (channelMenuOpen)
+                {
+                    // a click inside the menu picks an entry, a click anywhere else only closes it
+                    const auto entries = ChannelMenu();
+                    const int count = static_cast<int>(entries.size());
+                    channelMenuOpen = false;
+                    for (int i = 0; i < count; i++)
+                        if (InRect(HomeChannelMenuRow(i, count), x, y))
+                        {
+                            if (entries[i].logout) Logout();
+                            else { wantedChannel = entries[i].channel; Save(); }
+                            break;
+                        }
+                    Refresh();
+                    return 0;
+                }
                 if (InRect(HomeLogsLink(), x, y)) { settingsTab = 2; GoTo(1); }
-                else if (InRect(HomeVersionsLink(), x, y) || InRect(HomeVersionChip(), x, y)) { settingsTab = 1; GoTo(1); }
+                else if (InRect(HomeVersionsLink(), x, y) || InRect(HomeVersionUnderLaunch(), x, y)) { settingsTab = 1; GoTo(1); }
+                else if (InRect(HomeNormalLine(), x, y) && NormalSwitchOffered()) StartSwitch(selected.target.id, false);
+                else if (!LoggedIn() && InRect(HomeLoginButton(), x, y)) StartAccount(true);
+                else if (LoggedIn() && InRect(HomeChannelButton(), x, y)) { channelMenuOpen = true; Refresh(); }
                 return 0;
             }
             if (InRect(ReturnRect(), x, y)) { GoTo(0); return 0; }
             for (int i = 0; i < 3; i++)
                 if (InRect(TabRect(i), x, y)) { settingsTab = i; ShowPage(); return 0; }
             if (settingsTab == 2 && InRect(LogFileLink(), x, y)) OpenLogs();
-            else if (settingsTab == 1 && state == State::Idle)
+            if (settingsTab == 0 && state == State::Idle && InRect(SyncSwitchRect(), x, y))
             {
-                // A version MyClient lists is chosen, then Home slides back.
-                const auto rows = CurrentVersionRows();
-                for (size_t n = 0; n < rows.size(); n++)
-                    if (ShowsInstall(rows[n]) && InRect(VersionInstallButton(static_cast<int>(n)), x, y)) { StartSwitch(rows[n].id); return 0; }
-                for (size_t n = 0; n < rows.size(); n++)
-                    if (rows[n].inCatalog && InRect(VersionListRow(static_cast<int>(n)), x, y))
-                    {
-                        SendDlgItemMessageW(window, Version, CB_SETCURSEL, rows[n].catalogIndex, 0);
-                        Save(); SelectVersion(); Save();
-                        GoTo(0);
-                        break;
-                    }
+                syncNormal = !syncNormal;
+                Save();
+                Status(syncNormal ? L"通常起動の版も切り替えます（Launch・版の選択で Windows の版も合わせます）。"
+                                  : L"通常起動の版は切り替えません（OriginX だけ選んだ版で起動します）。");
             }
             return 0;
         }
@@ -2037,10 +3033,15 @@ LRESULT CALLBACK WindowProc(HWND handle, UINT message, WPARAM wParam, LPARAM lPa
             DestroyWindow(handle);
             return 0;
         case WM_DESTROY:
+            loginCancel = true;
+            if (accountThread.joinable()) accountThread.detach();
+            if (avatarBitmap) DeleteObject(avatarBitmap);
             KillTimer(handle, 1);
             KillTimer(handle, SlideTimer);
             if (versionDbThread.joinable()) versionDbThread.detach();
             if (switchThread.joinable()) switchThread.detach();
+            if (normalQueryThread.joinable()) normalQueryThread.detach();
+            if (selfUpdateThread.joinable()) selfUpdateThread.detach();
             if (hudProcess) CloseHandle(hudProcess);
             if (gameProcess) CloseHandle(gameProcess);
             PostQuitMessage(0);
@@ -2065,10 +3066,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
         std::vector<wchar_t> path(32768);
         const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
         if (!length || length >= path.size()) throw std::runtime_error("配布フォルダーを取得できません。");
-        bundle = fs::path(std::wstring(path.data(), length)).parent_path();
+        launcherExe = fs::path(std::wstring(path.data(), length));
+        bundle = launcherExe.parent_path();
+        RemoveOldLauncher(launcherExe);   // left by the last self-update
         privateDirectory = KnownFolder(FOLDERID_LocalAppData) / "MyClient";
         fs::create_directories(privateDirectory);
-        HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\MyClient.Launcher");
+        TrimLauncherLog();
+        HANDLE single = singleInstance = CreateMutexW(nullptr, TRUE, L"Local\\MyClient.Launcher");
         const DWORD mutexError = GetLastError();
         if (!single) throw std::runtime_error("ランチャーの起動状態を確認できません。");
         if (mutexError == ERROR_ALREADY_EXISTS)
@@ -2076,6 +3080,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
             HWND previous = FindWindowW(L"MyClientLauncherWindow", nullptr);
             if (previous) { ShowWindow(previous, SW_RESTORE); SetForegroundWindow(previous); }
             CloseHandle(single);
+            singleInstance = nullptr;
             CoUninitialize();
             return 0;
         }
@@ -2096,6 +3101,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Yu Gothic UI");
         greetFont = CreateFontW(-Px(34), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Yu Gothic UI");
+        versionLabelFont = CreateFontW(-Px(48), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                      OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Yu Gothic UI");
         symFont = CreateFontW(-Px(16), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                               OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI Symbol");
         logoIcon = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(2), IMAGE_ICON, Sc(44), Sc(44), LR_DEFAULTCOLOR));
@@ -2128,10 +3135,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show)
         DeleteObject(boldFont);
         DeleteObject(heroFont);
         DeleteObject(greetFont);
+        if (versionLabelFont) DeleteObject(versionLabelFont);
         DeleteObject(symFont);
         DeleteObject(titleFont);
         if (logoIcon) DestroyIcon(logoIcon);
-        CloseHandle(single);
+        if (singleInstance) CloseHandle(singleInstance);
     }
     catch (const std::exception& error)
     {

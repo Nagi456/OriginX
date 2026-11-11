@@ -1,6 +1,13 @@
+#include "SelfCheck.h"
 #include "FeatureAdapter.h"
+#include "JavaChatAdapter.h"
+#include "OwnHook.h"
+#include "GameState.h"
+#include "GameAccess.h"
+#include "Log.h"
 #include "FeatureChannel.h"
 #include "ReplayFormat.h"
+#include "ChatChannel.h"
 #include "Profile.h"
 #include "Compositor.h"
 #include "mc/resources/IResourcePackRepository.h"
@@ -9,7 +16,18 @@
 #include "mc/resources/ResourcePackManager.h"
 #include "mc/resources/ResourcePackListener.h"
 #include "mc/resources/ResourcePackStack.h"
+#include "mc/resources/PackInstance.h"
+#include "mc/resources/ResourcePack.h"
+#include "mc/resources/ResourcePackRepository.h"
+#include "mc/resources/RepositorySources.h"
+#include "mc/resources/CompositePackSource.h"
+#include "mc/resources/DirectoryPackSource.h"
+#include "mc/resources/PackSourceFactory.h"
+#include "mc/resources/ResourceLoadManager.h"
+#include "mc/deps/core/file/Path.h"
+#include "mc/deps/core/threading/IAsyncResult.h"
 #include "mc/client/game/IMinecraftGame.h"
+#include "mc/client/game/MinecraftGame.h"
 #include "mc/client/gui/screens/models/IContentManager.h"
 #include "mc/client/renderer/game/LevelRenderer.h"
 #include "mc/client/gui/screens/interfaces/ISceneStack.h"
@@ -19,6 +37,9 @@
 #include "mc/network/NetworkPeer.h"
 #include "PartyAdapter.h"
 #include "ll/api/memory/Hook.h"
+#include "ll/api/Versions.h"
+#include "mc/client/gui/screens/ScreenController.h"
+#include "mc/deps/core/string/StringHash.h"
 #include "ll/api/mod/NativeMod.h"
 #include "ll/api/service/Bedrock.h"
 #include "mc/client/game/ClientInstance.h"
@@ -33,6 +54,7 @@
 #include "mc/client/renderer/game/GameRenderer.h"
 #include "mc/client/options/IOptionRegistry.h"
 #include "mc/client/renderer/actor/ActorRenderDispatcher.h"
+#include "mc/client/renderer/blockactor/BlockActorRenderDispatcher.h"
 #include "mc/client/renderer/game/LevelRendererPlayer.h"
 #include "mc/client/renderer/game/LevelRendererCamera.h"
 #include "mc/client/renderer/chunks/RenderChunkInstanced.h"
@@ -75,6 +97,7 @@ class MinecraftUIRenderContext;
 class IClientInstance;
 class UIControl;
 class UIScene;
+class TextureAtlas;
 
 namespace {
 std::atomic<bool> active{false};
@@ -89,12 +112,25 @@ bool outlineHooked = false, tessColorHooked = false;
 using TextureReloadFn = void (*)(void* game, bool waitForUiReload);
 TextureReloadFn textureReload = nullptr;
 std::atomic<bool> textureReloadPending{false};
+// The in-world apply is how a pack switch is applied in a world (2026-11-10, user: always, no switch). Its hooks sit on
+// the world's render path, so they are installed when a switch is first applied in a world (EnsureLiveTextureHooks),
+// not at start; liveTextureKnown = this game build is identified and the functions exist (reported to the HUD as
+// FlagLiveTextures). Where it is not known, a switch made in a world is saved and applied at the title screen.
+bool liveTextureReady = false, liveTextureKnown = false, liveDrawingComposited = false;
+std::atomic<bool> liveTextureWanted{false};
+std::atomic<bool> liveTextureBusy{false};
+std::atomic<LevelRenderer*> liveRendererHeld{nullptr};
+// The render callbacks must never wait behind sampling/replay work holding featureMutex. Copy the
+// zoom command once per frame; the timestamp preserves the same HUD lease on every subsequent read.
+std::atomic<uint64_t> zoomCommandAt{0};
+std::atomic<uint32_t> zoomCommandFields{0};
 // What has to follow a reload while you are in a world (the game re-read the list, but blocks and animations
 // kept their old look until the world was joined again). Counters come from hooks on the game's own reload steps.
 std::atomic<uint32_t> statPacksChanged{0};
 std::atomic<uint32_t> statPacksChangedInner{0};   // MinecraftGame::_onActiveResourcePacksChanged only     // MinecraftGame::onActiveResourcePacksChanged: the game reloads the packs
 std::atomic<bool> atlasReloaded{false};        // MinecraftGame::_onTerrainAtlasReloaded: the block textures are new
-bool packsChangedHooked = false, atlasHooked = false;
+std::atomic<uint32_t> terrainAtlasUpdates{0}, legacyAtlasSignals{0};
+bool packsChangedHooked = false, atlasHooked = false, commonTerrainHooked = false;
 std::atomic<uint32_t> hitboxFilterValue{0};       // bits 17..20 of command.reserved: 1 players, 2 items, 4 entities, 8 mobs
 std::atomic<bool> hitboxRequestedValue{false};     // Hitbox: bit 16 of command.reserved (the low 16 bits are the zoom factor)
 std::atomic<uint32_t> frameGenWide{0};             // Shared.frameGenMultiplier (x2..x10), refreshed once per frame
@@ -186,8 +222,19 @@ std::atomic<bool> cullPlayers{false};
 std::atomic<uint32_t> cullKinds{0};
 std::atomic<float> cullPlayerRange2{0.f};
 std::atomic<bool> hideNameTagsWanted{false};
+std::atomic<bool> uncapFpsWanted{false};   // legacy Optimization request; native V-Sync OFF is honored independently
 std::atomic<uint32_t> statCulled{0};
 bool cullHooked = false;
+// Optimization rows that need render hooks (Shared.optimize bits 10..20, DecodeOptimizeExtras), refreshed once per
+// frame like the entity distance: sub-chunk rows kept above/below the camera (0 = all), block entities farther than
+// this from the player (0 = off), the sky itself, actors behind the camera.
+std::atomic<uint32_t> verticalRowsWanted{0};
+std::atomic<float> blockEntityRange2{0.f};
+std::atomic<bool> noSkyWanted{false}, cullBehindWanted{false}, noCloudsWanted{false};
+std::atomic<uint32_t> statChunksSkipped{0}, statBlockEntitiesSkipped{0}, statSkySkipped{0}, statBehindSkipped{0};
+bool queueChunkHooked = false, blockActorHooked = false, skyHooked = false;
+float cameraForward[3] = {};                       // render thread: view direction of the last captured frame
+bool cameraForwardKnown = false;
 std::atomic<bool> nickWanted{false};               // Nick on (bit 21 of command.reserved)
 std::atomic<char> localTagColor{0};                // colour of the local player's REAL name tag, seen by the Nick hook
 std::string nickName;                              // written only by the per-frame hook, read by the name hook (same thread)
@@ -215,7 +262,8 @@ uint32_t AvailabilityBits()
         MyClientFeatures::WithFlag(0u, MyClientFeatures::FlagFullbright, brightHooked),
         MyClientFeatures::FlagNametag, nametagHooked)
         | (outlineHooked ? MyClientFeatures::FlagOutline : 0u)
-        | (textureReload ? MyClientFeatures::FlagTextures : 0u);
+        | (textureReload ? MyClientFeatures::FlagTextures : 0u)
+        | (liveTextureKnown ? MyClientFeatures::FlagLiveTextures : 0u);
 }
 
 // Every Reset() wipes telemetry, so re-stamp what must survive it.
@@ -244,12 +292,19 @@ void PublishFps()
             serverHost.clear(); serverPort = 0; serverTransport = 1;
         }
     }
-    std::lock_guard guard(featureMutex);
-    if (!active.load()) return;
     const auto now = GetTickCount64();
     frames.Frame(now);
+    std::unique_lock guard(featureMutex, std::try_to_lock);
+    if (!guard.owns_lock() || !active.load()) return;
     if (!channel.Data() || !channel.Lock()) return;
     if (!MyClientFeatures::Valid(*channel.Data(), GetCurrentProcessId())) ResetChannel();
+    {
+        const auto& command = channel.Data()->command;
+        const auto key = command.key > 0 && command.key < 255 ? command.key : 0u;
+        zoomCommandFields.store((command.reserved & 0xFFFFu) | (key << 16) |
+                                (command.zoom == 1 ? 0x01000000u : 0u), std::memory_order_relaxed);
+        zoomCommandAt.store(command.at, std::memory_order_release);
+    }
     auto& data = channel.Data()->telemetry;
     data.fpsAt = 0; data.fps = 0;
     frames.Read(now, data.fps, data.fpsAt);
@@ -289,8 +344,12 @@ void PublishFps()
     const bool appliedNow = wantNametag && appliedAt != 0 && appliedAt <= now && now - appliedAt < 1000;
     data.fullbrightActive = MyClientFeatures::WithFlag(data.fullbrightActive, MyClientFeatures::FlagNametag, appliedNow);
     // Texture packs: one request per change of the HUD's counter (never on the first sight of it).
-    if (MyClientFeatures::TextureReloadRequested(channel.Data()->command, now, textureSeen, texturePrimed))
+    liveTextureWanted.store(MyClientFeatures::WantsLiveTextures(channel.Data()->command, now) || liveTextureKnown, std::memory_order_relaxed);
+    if (MyClientFeatures::TextureReloadRequested(channel.Data()->command, now, textureSeen, texturePrimed)) {
         textureReloadPending.store(true);
+        // When Done was pressed, to line up with the FPS in the log (2026-11-03: the game ran at 10 FPS for minutes).
+        MyClientLog::Get().info("Texture packs: the HUD asked for a reload (Done).");
+    }
     {
         const bool fresh = MyClientFeatures::Fresh(channel.Data()->command.at, now, MyClientFeatures::CommandLeaseMs * 4);
         const uint32_t field = channel.Data()->command.autoRq;
@@ -305,7 +364,7 @@ void PublishFps()
             const uint64_t age = now >= channel.Data()->command.at ? now - channel.Data()->command.at : 0;
             if (menuFlag && hudMenuWanted.load() && age > MyClientFeatures::CommandLeaseMs * 4 && !staleLogged) {
                 staleLogged = true;
-                ll::mod::NativeMod::current()->getLogger().warn("HUD menu: no command from the HUD for {} ms (still treated as open).", age);
+                MyClientLog::Get().warn("HUD menu: no command from the HUD for {} ms (still treated as open).", age);
             }
             if (age <= MyClientFeatures::CommandLeaseMs) staleLogged = false;
             hudMenuWanted.store(menuFresh && menuFlag);
@@ -334,8 +393,9 @@ void PublishFps()
         const uint32_t playerRange = MyClientFeatures::PlayerDistanceBlocks(optimize);
         float range2 = 0.f, playerRange2 = 0.f;
         try {
-            const auto client = ll::service::getClientInstance();
-            auto* local = (range || playerRange) && client ? client->getLocalPlayer() : nullptr;
+            const auto client = MyClientGame::Client();
+            const auto extras = MyClientFeatures::DecodeOptimizeExtras(optimize);
+            auto* local = (range || playerRange || extras.blockEntityBlocks || extras.cullBehind) && client ? client->getLocalPlayer() : nullptr;
             if (local) {
                 const auto pos = local->getPosition();
                 cullX.store(pos.x); cullY.store(pos.y); cullZ.store(pos.z);
@@ -348,7 +408,18 @@ void PublishFps()
         cullKinds.store(optimize & (MyClientFeatures::CullMobsBit | MyClientFeatures::CullItemsBit | MyClientFeatures::CullMiscBit));
         cullPlayerRange2.store(playerRange2);
         hideNameTagsWanted.store((optimize & MyClientFeatures::HideNameTagsBit) != 0);
+        uncapFpsWanted.store((optimize & MyClientFeatures::UncapFpsBit) != 0);
         cullRange2.store(range2);
+        {
+            const auto extras = MyClientFeatures::DecodeOptimizeExtras(optimize);
+            verticalRowsWanted.store(extras.verticalRows, std::memory_order_relaxed);
+            const float blocks = static_cast<float>(extras.blockEntityBlocks);
+            // Needs the player's position above; without it the distance stays off this frame.
+            blockEntityRange2.store(cullLocal.load(std::memory_order_relaxed) ? blocks * blocks : 0.f, std::memory_order_relaxed);
+            noSkyWanted.store(extras.noSky, std::memory_order_relaxed);
+            noCloudsWanted.store(extras.noClouds, std::memory_order_relaxed);
+            cullBehindWanted.store(extras.cullBehind, std::memory_order_relaxed);
+        }
     }
     // Block Outline colour: same once-per-frame lease read, plus two status bits for the HUD.
     const bool wantOutline = MyClientFeatures::WantsOutline(channel.Data()->command, now);
@@ -399,55 +470,41 @@ void NotifyPacksChanged(ResourcePackManager& manager)
 // stack, as the game's own settings screen ends up doing; the listeners
 // are told afterwards (NotifyPacksChanged).
 // ResourcePackManager::setStack / _composeFullStack are not in the SDK's import library: found by name.
-using SetStackFn = bool (*)(ResourcePackManager*, std::unique_ptr<ResourcePackStack>*, ResourcePackStackType);
-SetStackFn SetStackFunction()
+// ResourcePackManager::mFullStack exists only before 26.60 (-1 there: not known).
+template <class Manager>
+int FullStackSize(Manager const& manager)
 {
-    static const auto setStack = MyClientGame::ResolveFunction<SetStackFn>(
-        "?setStack@ResourcePackManager@@QEAA_NV?$unique_ptr@VResourcePackStack@@U?$default_delete@VResourcePackStack@@@std@@@std@@W4ResourcePackStackType@@@Z");
-    return setStack;
+    if constexpr (requires { manager.mFullStack; })
+        return manager.mFullStack.get() ? (int)manager.mFullStack.get()->mStack.get().size() : -1;
+    else
+        return -1;
 }
-bool SetStackFound() { return SetStackFunction() != nullptr; }
 
-void RestackGlobalPacks(IMinecraftGame& game, ll::io::Logger& log)
+void NoteSubpackIndices(const char* label, ResourcePackStack const* stack, MyClientLog::Logger& log)
 {
-    ResourcePackManager& manager = game.getResourcePackManager();
-    // MinecraftGame::_deserializeGlobalResourcePacks (IMinecraftGame is MinecraftGame's first base): the stack
-    // comes back through the hidden return pointer, after `this`.
-    using DeserializeFn = std::unique_ptr<ResourcePackStack>* (*)(IMinecraftGame*, std::unique_ptr<ResourcePackStack>*);
-    static const auto deserialize = reinterpret_cast<DeserializeFn>(MyClientGame::ResolveFirst({
-        "?_deserializeGlobalResourcePacks@MinecraftGame@@AEAA?AV?$unique_ptr@VResourcePackStack@@U?$default_delete@VResourcePackStack@@@std@@@std@@XZ",
-        "?_deserializeGlobalResourcePacks@MinecraftGame@@IEAA?AV?$unique_ptr@VResourcePackStack@@U?$default_delete@VResourcePackStack@@@std@@@std@@XZ",
-        "?_deserializeGlobalResourcePacks@MinecraftGame@@QEAA?AV?$unique_ptr@VResourcePackStack@@U?$default_delete@VResourcePackStack@@@std@@@std@@XZ"}));
-    bool set = false;
-    if (deserialize) {
-        std::unique_ptr<ResourcePackStack> stack;
-        deserialize(&game, &stack);
-        // ResourcePackManager::setStack / _composeFullStack are not in the SDK's import library: found by name.
-        // The stack goes by value, which the x64 ABI passes as a pointer to a copy the callee destroys, so it is
-        // handed over in storage this side never destroys.
-        const auto setStack = SetStackFunction();
-        if (stack && setStack) {
-            alignas(std::unique_ptr<ResourcePackStack>) unsigned char arg[sizeof(std::unique_ptr<ResourcePackStack>)];
-            auto* owned = new (arg) std::unique_ptr<ResourcePackStack>(std::move(stack));
-            set = setStack(&manager, owned, ResourcePackStackType::Global);
-        }
+    if (!stack) { log.info("Texture packs: {} stack is absent", label); return; }
+    std::string indices;
+    size_t count = 0;
+    for (const auto& pack : stack->mStack.get()) {
+        if (count++ >= 128) { indices += ",..."; break; }
+        if (!indices.empty()) indices += ',';
+        indices += std::to_string(static_cast<int>(pack.mSubpackIndex));
     }
-    using ComposeFn = void (*)(ResourcePackManager*);
-    static const auto compose = reinterpret_cast<ComposeFn>(MyClientGame::ResolveFirst({
-        "?_composeFullStack@ResourcePackManager@@AEAAXXZ", "?_composeFullStack@ResourcePackManager@@IEAAXXZ",
-        "?_composeFullStack@ResourcePackManager@@QEAAXXZ"}));
-    if (compose) compose(&manager);
-    log.info("Texture packs in a world: deserialize={} setStack={} globalStackSet={} composed={}", deserialize != nullptr,
-             SetStackFound(), set, compose != nullptr);
+    log.info("Texture packs: {} stack subpack indices (priority order)=[{}]", label, indices);
 }
 
-// A reload made while in a world, followed over the next frames.
-struct TextureFollowUp {
-    uint64_t at = 0;              // 0 = none
-    uint32_t changesBefore = 0;   // statPacksChanged before the reload
-    bool notified = false;        // NotifyPacksChanged was used
-};
-TextureFollowUp textureFollowUp;
+template <class Manager>
+void NoteFullSubpacks(Manager const& manager, MyClientLog::Logger& log)
+{
+    if constexpr (requires { manager.mFullStack; })
+        NoteSubpackIndices("full", manager.mFullStack.get(), log);
+}
+
+std::atomic<bool> skinRefreshWanted{false};
+// 2026-11-03 (#109): the arms and dolls went see-through right at the reload, but the skin was handed back only when
+// the follow-up ended (block textures in, or the 20 s timeout). It is now also handed back shortly after each reload.
+std::atomic<uint64_t> skinRefreshAt{0};
+void RefreshSkinSoon() { skinRefreshAt.store(GetTickCount64() + 1500); }
 
 // Chunks keep the block textures they were built with: build them again with the new ones.
 bool RebuildChunks(ClientInstance& client)
@@ -455,57 +512,7 @@ bool RebuildChunks(ClientInstance& client)
     if (!client.getLocalPlayer()) return false;
     LevelRenderer* renderer = client.getLevelRenderer();
     if (!renderer) return false;
-    renderer->rebuildAllRenderChunkGeometry();
-    return true;
-}
-
-inline uintptr_t PacksChangedInnerSymbol();
-
-void RunTextureFollowUp(ClientInstance& client, IMinecraftGame& game)
-{
-    auto& f = textureFollowUp;
-    if (!f.at) return;
-    auto& log = ll::mod::NativeMod::current()->getLogger();
-    const uint64_t now = GetTickCount64();
-    if (!client.getLocalPlayer()) { f = {}; return; }   // left the world
-    if (now - f.at > 20000) {
-        log.warn("Texture packs: the block textures were not reloaded in this world within 20 s (a rejoin applies them).");
-        f = {};
-        return;
-    }
-    // The game re-read the list but did not reload the packs (in a world it waited for the next join). With the
-    // atlas hooked, "no new block textures yet" is the sign; a pack-change call alone did not mean the new
-    // packs were in use (it could reload the old full stack).
-    if (!f.notified && now - f.at >= 1500 && (atlasHooked || (packsChangedHooked && statPacksChanged.load() == f.changesBefore))) {
-        f.notified = true;
-        f.at = now;
-        atlasReloaded.store(false);
-        try { RestackGlobalPacks(game, log); } catch (...) { log.warn("Texture packs: re-stacking the global packs failed."); }
-        const uint32_t outerBefore = statPacksChanged.load(), innerBefore = statPacksChangedInner.load();
-        NotifyPacksChanged(game.getResourcePackManager());
-        const bool told = statPacksChanged.load() != outerBefore, reloaded = statPacksChangedInner.load() != innerBefore;
-        // 2026-10-28 log: told, but the block textures never came (no "chunks rebuilt" in 20 s). When the listener call
-        // did not reach the step that reloads, that step is called directly.
-        bool direct = false;
-        if (!reloaded) {
-            using InnerFn = void (*)(IMinecraftGame*, ResourcePackManager*, bool);
-            static const auto inner = reinterpret_cast<InnerFn>(PacksChangedInnerSymbol());
-            if (inner) {
-                try { inner(&game, &game.getResourcePackManager(), true); direct = true; } catch (...) { direct = false; }
-            }
-        }
-        log.info("Texture packs: the game did not reload them in this world; asked it to (listener {}, reload step {}{}).",
-                 told ? "ran" : "did not run", reloaded ? "ran" : "did not run", direct ? ", called it directly" : "");
-        return;
-    }
-    // Once the block textures are reloaded (or after a while when that step could not be hooked).
-    const bool atlasDone = atlasReloaded.exchange(false);
-    if (atlasDone || (!atlasHooked && now - f.at >= 4000)) {
-        if (RebuildChunks(client)) log.info("Texture packs: chunks rebuilt with the new block textures.");
-        // Animations and models are not reloaded here: MinecraftGame::reloadAnimationAndGeometryData in a world
-        // left your own player without a model (invisible) until a rejoin.
-        f = {};
-    }
+    return MyClientGame::RebuildAllChunks(*renderer);
 }
 
 // The HUD menu is open right now: read straight from the channel, because the game reports the lost focus
@@ -551,7 +558,7 @@ LRESULT CALLBACK GameWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 constexpr const char* MouseFeedSymbol = "?feed@MouseDevice@@QEAAXDCFFFF_N@Z";
 bool mouseFeedHooked = false;
 
-LL_TYPE_INSTANCE_HOOK(MouseFeedHook, ll::memory::HookPriority::Normal, MouseDevice,
+MYCLIENT_TYPE_INSTANCE_HOOK(MouseFeedHook, ll::memory::HookPriority::Normal, MouseDevice,
                       ll::memory::SymbolView{MouseFeedSymbol}, void,
                       char actionButtonId, schar buttonData, short x, short y, short dx, short dy, bool forceMotionlessPointer)
 {
@@ -589,7 +596,7 @@ void EnsureGameWindowHook()
     if (!best.first) return;
     const auto previous = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(best.first, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&GameWndProc)));
     if (!previous) {
-        ll::mod::NativeMod::current()->getLogger().warn("HUD menu: could not hook the game window's input (error {}).", GetLastError());
+        MyClientLog::Get().warn("HUD menu: could not hook the game window's input (error {}).", GetLastError());
         gameWndHooked = best.first;   // do not retry every second
         return;
     }
@@ -599,13 +606,13 @@ void EnsureGameWindowHook()
     GetClassNameW(best.first, cls, 64);
     char name[64]{};
     WideCharToMultiByte(CP_UTF8, 0, cls, -1, name, sizeof name, nullptr, nullptr);
-    ll::mod::NativeMod::current()->getLogger().info("HUD menu: game window input hooked ({}).", name);
+    MyClientLog::Get().info("HUD menu: game window input hooked ({}).", name);
 }
 
 // Opening the HUD menu takes the focus from the game, and the game answers a lost focus with its pause screen.
 // While the HUD menu is open the lost focus is not passed on, so the menu opens straight over play.
 // onAppFocusLost is an AppPlatformListener function of MinecraftGame; `this` is only passed through.
-LL_TYPE_INSTANCE_HOOK(FocusLostHook, ll::memory::HookPriority::Normal, IMinecraftGame,
+MYCLIENT_TYPE_INSTANCE_HOOK(FocusLostHook, ll::memory::HookPriority::Normal, IMinecraftGame,
                       ll::memory::SymbolView{"?onAppFocusLost@MinecraftGame@@UEAAXXZ"}, void)
 {
     if (HudMenuOpenNow()) {
@@ -633,7 +640,7 @@ void ReleaseHeldFocusLost()
     char clsUtf8[128]{}, titleUtf8[128]{};
     WideCharToMultiByte(CP_UTF8, 0, cls, -1, clsUtf8, sizeof clsUtf8, nullptr, nullptr);
     WideCharToMultiByte(CP_UTF8, 0, title, -1, titleUtf8, sizeof titleUtf8, nullptr, nullptr);
-    ll::mod::NativeMod::current()->getLogger().info(
+    MyClientLog::Get().info(
         "HUD menu closed with another app in front: told the game it lost the focus (front window: class '{}', title '{}', pid {}).",
         clsUtf8, titleUtf8, foregroundPid);
 }
@@ -649,17 +656,17 @@ void TrackGameScreens()
     static bool menuWas = false, pauseWas = false, pausedByHud = false;
     static uint64_t pauseSince = 0;
     try {
-        const auto client = ll::service::getClientInstance();
+        const auto client = MyClientGame::Client();
         if (!client) { gameScreenBits.store(0); return; }
         const bool inWorld = client->getLocalPlayer() != nullptr;
         const std::string name = client->getTopScreenName();
         // For the HUD's in-world display: also no loading / saving / disconnect / title screen on top
         // (the player and level can outlive the world for a moment while it is left or joined).
-        const bool playing = inWorld && ll::service::getMultiPlayerLevel() &&
+        const bool playing = inWorld && MyClientGame::WorldLevel() &&
                              name.find("progress") == std::string::npos && name.find("loading") == std::string::npos &&
                              name.find("start_screen") == std::string::npos && name.find("disconnect") == std::string::npos;
         // Playing = the HUD screen on top ("hud_screen"); anything else over it is a game menu.
-        const bool menu = inWorld && client->isShowingMenu() && name.find("hud_screen") == std::string::npos;
+        const bool menu = inWorld && name.find("hud_screen") == std::string::npos;
         const bool pause = menu && name.find("pause") != std::string::npos;
         // The title screen itself (for the HUD's Replays button), not the Play / Settings screens opened from it.
         const bool title = !inWorld && name.find("start_screen") != std::string::npos;
@@ -668,7 +675,7 @@ void TrackGameScreens()
                              (playing ? MyClientFeatures::GameInWorld : 0u) | MyClientFeatures::GameTitleKnown |
                              (title ? MyClientFeatures::GameOnTitle : 0u));
         if (name != lastName) {
-            ll::mod::NativeMod::current()->getLogger().info("Game screen: {} (menu={})", name, menu);
+            MyClientLog::Get().info("Game screen: {} (menu={})", name, menu);
             lastName = name;
         }
         const uint64_t now = GetTickCount64();
@@ -680,7 +687,7 @@ void TrackGameScreens()
         if (!hudMenu && menuWas && pausedByHud && pause) {
             client->getCurrentSceneStack()->schedulePopScreenWithExpectedNames({name});
             pausedByHud = false;
-            ll::mod::NativeMod::current()->getLogger().info("Closed the pause screen the HUD menu caused ({}).", name);
+            MyClientLog::Get().info("Closed the pause screen the HUD menu caused ({}).", name);
         }
         // Menu closed: the HUD hands the focus back to the game a moment later, so whether the focus went to
         // another app is decided once the game is in front again or kFocusSettleMs have passed (deciding on the
@@ -704,7 +711,7 @@ void TrackGameScreens()
         static uint64_t lastClose = 0;
         if (!hudMenu && menuWas) lastClose = now;
         if (pause && !pauseWas && !hudMenu && lastClose && now - lastClose < 2000)
-            ll::mod::NativeMod::current()->getLogger().info("Pause screen {} ms after the HUD menu closed ({}).", now - lastClose, name);
+            MyClientLog::Get().info("Pause screen {} ms after the HUD menu closed ({}).", now - lastClose, name);
         menuWas = hudMenu;
         pauseWas = pause;
     } catch (...) { gameScreenBits.store(0); }
@@ -793,7 +800,7 @@ void NoteLitePack(ClientInstance& client)
     try { development = repository.getDevelopmentResourcePacksPath().value; } catch (...) {}
     size_t invalid = 0;
     try { invalid = repository.getInvalidPacks().size(); } catch (...) {}
-    auto& log = ll::mod::NativeMod::current()->getLogger();
+    auto& log = MyClientLog::Get();
     log.info("Texture packs: OriginX Lite {} in the game's packs; the game reads resource packs from '{}' and '{}' ({} invalid packs).",
              found.empty() ? "is NOT" : "is", packs, development, invalid);
     if (found.empty() && !packs.empty()) {
@@ -805,10 +812,361 @@ void NoteLitePack(ClientInstance& client)
     }
 }
 
+// Equivalent to the SDK's addCustomResourcePackPath: use the game's factory-owned source, then attach it to
+// the repository. No LeviLamina helper/import is needed. The interface returned by ClientInstance is the
+// ResourcePackRepository (its first base). Only our isolated generated-pack directory is rediscovered.
+DirectoryPackSource* AttachGeneratedPackSource(RepositorySources& sources, PackSourceFactory& factory)
+{
+    wchar_t local[MAX_PATH]{};
+    const DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+    if (!length || length >= MAX_PATH) return nullptr;
+    const auto root = LitePack::GeneratedPackRoot(std::filesystem::path(local));
+    std::error_code ec;
+    if (root.empty() || !std::filesystem::is_regular_file(root / L"OriginX_Lite" / L"manifest.json", ec)) return nullptr;
+    if (!sources.mPackSource) return nullptr;
+    const Core::Path path(root);
+    DirectoryPackSource* source = factory.getDirectoryPackSource(path, PackType::Resources);
+    if (!source) source = &factory.createDirectoryPackSource(path, PackType::Resources, PackOrigin::Dev, false);
+    if (!source) return nullptr;
+    auto& entries = sources.mPackSource->mPackSources.get();
+    const bool added = std::find(entries.begin(), entries.end(), source) == entries.end();
+    if (added) entries.push_back(source);   // lifetime belongs to the factory, like the SDK helper
+    source->mDiscovered = false;           // this generated directory can change after every HUD request
+    MyClientLog::Get().info("Texture packs: generated pack source prepared '{}' (added={})", WideUtf8(root.wstring()), added);
+    return source;
+}
+
+// User-pack discovery can reconstruct RepositorySources after a caller adds a custom source. Attach at the
+// end of that native initialization as well, before the freshly built source list is consumed by load tasks.
+constexpr const char* SourcesInitSymbol = "?initializePackSource@RepositorySources@@QEAAXAEAVPackSourceFactory@@@Z";
+bool sourcesInitAttempted = false;
+MYCLIENT_TYPE_INSTANCE_HOOK(SourcesInitHook, ll::memory::HookPriority::Normal, RepositorySources,
+                           MyClientGame::Target(SourcesInitSymbol), void, PackSourceFactory& factory)
+{
+    origin(factory);
+    if (!this) return;
+    try { AttachGeneratedPackSource(*this, factory); }
+    catch (...) { MyClientLog::Get().warn("Texture packs: generated source attachment after initialization failed"); }
+}
+
+DirectoryPackSource* PrepareGeneratedPackSource(IResourcePackRepository& repository)
+{
+    auto* concrete = static_cast<ResourcePackRepository*>(&repository);
+    if (!concrete) return nullptr;
+    const auto& sources = concrete->mSources.get();
+    if (!sources) return nullptr;
+    return AttachGeneratedPackSource(*sources, repository.getPackSourceFactory());
+}
+
+bool GeneratedSourceAttached(IResourcePackRepository& repository, DirectoryPackSource* source)
+{
+    if (!source) return false;
+    auto* concrete = static_cast<ResourcePackRepository*>(&repository);
+    if (!concrete) return false;
+    const auto& sources = concrete->mSources.get();
+    if (!sources || !sources->mPackSource) return false;
+    const auto& entries = sources->mPackSource->mPackSources.get();
+    return std::find(entries.begin(), entries.end(), source) != entries.end();
+}
+
+struct PackRefreshWait {
+    enum class Phase { Idle, Users, Generated } phase = Phase::Idle;
+    IResourcePackRepository* repository = nullptr;
+    std::shared_ptr<Bedrock::Threading::IAsyncResult<void>> result;
+    DirectoryPackSource* generated = nullptr;   // factory-owned; compare only until completion
+    uint64_t started = 0;
+};
+
+// A world switch is a transaction. The old full stack is never edited in place. World rendering and
+// visibility submission stop first; the game's invalidation listener cancels its own work, then its
+// composer and resource loader rebuild the stack/atlases. UI and resource-load updates keep running.
+struct LiveTextureReload {
+    IMinecraftGame* game = nullptr;
+    ResourcePackListener* listener = nullptr;   // native secondary base, validated against both callbacks
+    Level* level = nullptr;                     // identity only, never dereferenced after a frame boundary
+    LevelRenderer* renderer = nullptr;          // identity checked against the current client each frame
+    uint64_t started = 0;
+    uint32_t terrainBefore = 0;
+    bool applied = false, modelsReset = false, warned = false;
+    uint64_t appliedAt = 0, modelsAt = 0;       // when the game's reload call returned / the old meshes were dropped
+} liveTexture;
+thread_local IMinecraftGame* liveInvalidationGame = nullptr;
+thread_local IMinecraftGame* liveComposeGame = nullptr;
+// How long the world may stay hidden (r44 kept it hidden for ever when a completion signal never came):
+// the resources get LiveApplyWaitMs after the game's reload call, the models LiveModelWaitMs more; then the
+// world is shown again whatever arrived, and the log says which signal was missing.
+constexpr uint64_t LiveApplyWaitMs = 12000, LiveModelWaitMs = 5000, LiveBeforeApplyMs = 40000;
+
+constexpr const char* LiveInvalidSymbol = "?onFullPackStackInvalid@MinecraftGame@@UEAA_NXZ";
+constexpr const char* LiveInGameSymbol = "?isInGame@MinecraftGame@@UEBA_NXZ";
+constexpr const char* LiveRenderSymbol = "?renderLevel@LevelRenderer@@QEAAXAEAVScreenContext@@AEBUFrameRenderObject@@@Z";
+constexpr const char* LivePrepSymbol = "?preRenderUpdate@LevelRenderer@@QEAAXAEAVScreenContext@@AEAULevelRenderPreRenderUpdateParameters@@@Z";
+constexpr const char* LiveVisibilitySymbol = "?_handleVisibilityUpdates@RenderChunkCoordinator@@QEAAXXZ";
+constexpr const char* LiveSceneRenderSymbol = "?_renderLevel@InGamePlayScreen@@UEAAXAEAVScreenContext@@AEBUFrameRenderObject@@@Z";
+constexpr const char* LiveScenePrepSymbol = "?_renderLevelPrep@InGamePlayScreen@@UEAAXAEAVScreenContext@@AEAVLevelRenderer@@AEAVActor@@@Z";
+constexpr const char* LoadsCompleteSymbol = "?isComplete@ResourceLoadManager@@QEBA_NXZ";
+using LoadsCompleteFn = bool (*)(ResourceLoadManager const*);
+using WaitActorsFn = int (*)(IMinecraftGame*);
+LoadsCompleteFn liveLoadsComplete = nullptr;
+WaitActorsFn liveWaitActors = nullptr;
+
+MYCLIENT_TYPE_INSTANCE_HOOK(LiveInGameHook, ll::memory::HookPriority::Normal, IMinecraftGame,
+                          MyClientGame::Target(LiveInGameSymbol), bool)
+{
+    // During the whole of the game's reload call that the live apply makes (and inside its invalidation
+    // callback), on this thread and this game object only. r44 answered only inside the callback, and the block
+    // textures never came: the reload path asks "in a world?" in more than one place (the older Flarial pack
+    // changer answered for the whole call too). No process-wide flag is changed; other threads, normal play and
+    // the load callbacks that follow see the real state.
+    if (this && (this == liveInvalidationGame || this == liveComposeGame)) return false;
+    return origin();
+}
+// The other "in a world?" question of the same path: ClientInstance::isPreGame (no local player yet). Answered
+// "yes" only on this thread during that same reload call. Optional: without it the apply is still tried.
+constexpr const char* LivePreGameSymbol = "?isPreGame@ClientInstance@@UEBA_NXZ";
+bool livePreGameHooked = false;
+MYCLIENT_INSTANCE_HOOK(LivePreGameHook, ll::memory::HookPriority::Normal,
+                      MyClientGame::Target(LivePreGameSymbol), bool)
+{
+    if (liveComposeGame) return true;
+    return origin();
+}
+MYCLIENT_TYPE_INSTANCE_HOOK(LiveInvalidHook, ll::memory::HookPriority::Normal, ResourcePackListener,
+                          MyClientGame::Target(LiveInvalidSymbol), bool)
+{
+    if (!this) return false;
+    if (!liveTextureBusy.load() || !liveTexture.game || liveComposeGame != liveTexture.game ||
+        this != liveTexture.listener) return origin();
+    struct Scope {
+        IMinecraftGame* saved = liveInvalidationGame;
+        explicit Scope(IMinecraftGame* game) { liveInvalidationGame = game; }
+        ~Scope() { liveInvalidationGame = saved; }
+    } scope(liveTexture.game);
+    return origin();   // retain device-readiness checks and the game's work cancellation, including rejection
+}
+MYCLIENT_TYPE_INSTANCE_HOOK(LiveWorldRenderHook, ll::memory::HookPriority::Normal, LevelRenderer,
+                          MyClientGame::Target(LiveRenderSymbol), void, ScreenContext& screen, FrameRenderObject const& frame)
+{
+    if (liveTextureBusy.load() && this == liveRendererHeld.load()) return;
+    origin(screen, frame);
+}
+MYCLIENT_TYPE_INSTANCE_HOOK(LiveWorldPrepHook, ll::memory::HookPriority::Normal, LevelRenderer,
+                          MyClientGame::Target(LivePrepSymbol), void, ScreenContext& screen, LevelRenderPreRenderUpdateParameters& parameters)
+{
+    if (liveTextureBusy.load() && this == liveRendererHeld.load()) return;
+    origin(screen, parameters);
+}
+MYCLIENT_TYPE_INSTANCE_HOOK(LiveVisibilityHook, ll::memory::HookPriority::Normal, RenderChunkCoordinator,
+                          MyClientGame::Target(LiveVisibilitySymbol), void)
+{
+    if (liveTextureBusy.load()) return;
+    origin();
+}
+MYCLIENT_INSTANCE_HOOK(LiveSceneRenderHook, ll::memory::HookPriority::Normal,
+                      MyClientGame::Target(LiveSceneRenderSymbol), void, ScreenContext& screen, FrameRenderObject const& frame)
+{
+    if (liveTextureBusy.load()) return;
+    origin(screen, frame);
+}
+MYCLIENT_INSTANCE_HOOK(LiveScenePrepHook, ll::memory::HookPriority::Normal,
+                      MyClientGame::Target(LiveScenePrepSymbol), void, ScreenContext& screen, LevelRenderer& renderer, Actor& camera)
+{
+    if (liveTextureBusy.load()) return;
+    origin(screen, renderer, camera);
+}
+bool LiveLoadsIdle(IMinecraftGame& game)
+{
+    if (!liveLoadsComplete) return false;
+    const auto loads = game.getResourceLoadManager();
+    const auto* pointer = loads.get().get();
+    return pointer && liveLoadsComplete(pointer);
+}
+void EndLiveTextureReload(const char* reason)
+{
+    MyClientLog::Get().info("Texture packs: live transaction {} (elapsed={} ms)", reason,
+                           liveTexture.started ? GetTickCount64() - liveTexture.started : 0);
+    liveTextureBusy.store(false);
+    liveRendererHeld.store(nullptr);
+    liveTexture = {};
+}
+bool BeginLiveTextureReload(ClientInstance& client, bool& waitForLoads)
+{
+    waitForLoads = false;
+    if (!liveTextureReady || liveTextureBusy.load()) return false;
+    auto& game = client.getMinecraftGame_DEPRECATED();
+    // The 26.51 SDK casts this base to +B8, but the shipped game's constructor installs it at +C0.
+    // Use only verified native layouts, and require the actual vtable's two callbacks to match the
+    // fingerprint-checked RVA table before accepting the address. Never call through the SDK cast.
+    // Per build in tools/sigs.json "offsets" (0 = unknown on this build: the live apply is not used).
+    const size_t listenerOffset = MyClientSigs::OffsetOr("MinecraftGame.ResourcePackListener", 0u);
+    auto readable = [](const void* pointer, size_t bytes) {
+        if (!pointer || !bytes) return false;
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(pointer, &info, sizeof(info)) || info.State != MEM_COMMIT ||
+            (info.Protect & (PAGE_GUARD | PAGE_NOACCESS))) return false;
+        const auto start = reinterpret_cast<uintptr_t>(pointer);
+        const auto base = reinterpret_cast<uintptr_t>(info.BaseAddress);
+        return start >= base && start - base < info.RegionSize && bytes <= info.RegionSize - (start - base);
+    };
+    auto* listener = listenerOffset ? reinterpret_cast<ResourcePackListener*>(reinterpret_cast<char*>(&game) + listenerOffset) : nullptr;
+    uintptr_t table = 0;
+    if (readable(listener, sizeof(table))) std::memcpy(&table, listener, sizeof(table));
+    uintptr_t callbacks[3]{};
+    if (table && MyClientHook::InGameImage(reinterpret_cast<void*>(table)) &&
+        MyClientHook::InGameImage(reinterpret_cast<void*>(table + sizeof(callbacks) - 1)) &&
+        readable(reinterpret_cast<void*>(table), sizeof(callbacks)))
+        std::memcpy(callbacks, reinterpret_cast<void*>(table), sizeof(callbacks));
+    const auto changed = MyClientGame::RvaFallback("?onActiveResourcePacksChanged@MinecraftGame@@UEAAXAEAVResourcePackManager@@@Z");
+    const auto invalid = MyClientGame::RvaFallback(LiveInvalidSymbol);
+    if (!listener || !changed || !invalid || callbacks[1] != changed || callbacks[2] != invalid) {
+        MyClientLog::Get().warn("Texture packs: native listener validation failed (offset={}); live apply declined", listenerOffset);
+        return false;
+    }
+    auto* renderer = client.getLevelRenderer();
+    const auto world = MyClientGame::WorldLevel();
+    auto* level = world ? &*world : nullptr;
+    if (!renderer || !level || !client.getLocalPlayer() || game.getClientInstanceCount() != 1) return false;
+    if (!LiveLoadsIdle(game)) { waitForLoads = true; return false; }
+    if (!MyClientCompositor::DrainGameGpu()) return false;
+    liveTexture = {&game, listener, level, renderer, GetTickCount64(), terrainAtlasUpdates.load()};
+    liveRendererHeld.store(renderer);
+    liveTextureBusy.store(true);
+    MyClientLog::Get().info("Texture packs: live transaction began; GPU drained, world drawing/visibility held");
+    return true;
+}
+bool PollLiveTextureReload(ClientInstance& client)
+{
+    if (!liveTextureBusy.load()) return false;
+    auto& state = liveTexture;
+    const auto world = MyClientGame::WorldLevel();
+    if (!client.getLocalPlayer() || !world || &*world != state.level ||
+        client.getLevelRenderer() != state.renderer || &client.getMinecraftGame_DEPRECATED() != state.game) {
+        EndLiveTextureReload("ended after world/client changed");
+        return false;
+    }
+    const uint64_t now = GetTickCount64();
+    if (!state.applied) {
+        // the pack discovery before the apply never finished: show the world again, the title screen applies it
+        if (now - state.started > LiveBeforeApplyMs) { EndLiveTextureReload("gave up before the apply (pack discovery did not finish); left for the title screen"); return false; }
+        return false;
+    }
+    if (!state.appliedAt) state.appliedAt = now;
+    const bool pending = static_cast<bool>(state.game->getResourcePackManager().mPendingRestack);
+    const bool loadsIdle = LiveLoadsIdle(*state.game);
+    const bool terrain = terrainAtlasUpdates.load() != state.terrainBefore;
+    if (!state.modelsReset) {
+        if (pending || !loadsIdle || !terrain) {
+            if (now - state.appliedAt <= LiveApplyWaitMs) return true;
+            // Never hide the world for ever. Without the new block textures nothing is rebuilt (the old meshes
+            // still match the old atlas); the saved list is applied at the title screen as before.
+            MyClientLog::Get().warn("Texture packs: live apply timed out after {} ms (pendingRestack={} loadsIdle={} terrainAtlasUpdated={} packsChanged={} inner={})",
+                                   now - state.appliedAt, pending, loadsIdle, terrain, statPacksChanged.load(), statPacksChangedInner.load());
+            if (!terrain) {
+                EndLiveTextureReload("timed out without new block textures; world shown again, left for the title screen");
+                return false;
+            }
+        }
+        auto& camera = state.renderer->mLevelRendererPlayer;
+        if (!camera) { EndLiveTextureReload("ended: no camera to rebuild"); return false; }
+        camera->onDeviceLost();   // drop meshes that still refer to the old atlas/materials
+        state.modelsReset = true;
+        state.modelsAt = now;
+    }
+    const bool actors = liveWaitActors && liveWaitActors(state.game) == 1;
+    const bool rebuilt = actors && LiveLoadsIdle(*state.game) && RebuildChunks(client);
+    if (!rebuilt && now - state.modelsAt <= LiveModelWaitMs) return true;
+    if (!rebuilt) {
+        MyClientLog::Get().warn("Texture packs: live model rebuild timed out (actorsReady={} loadsIdle={}); showing the world again", actors, LiveLoadsIdle(*state.game));
+        try { (void)RebuildChunks(client); } catch (...) {}
+    }
+    skinRefreshWanted.store(true);
+    try { RefreshPackScreens(*state.game); } catch (...) {}
+    EndLiveTextureReload(rebuilt ? "completed native resource/model reload; chunk rebuild requested (visual result unverified)"
+                                 : "ended after the model wait; world shown again (visual result unverified)");
+    return true;
+}
+
+// Installs the live apply's hooks the first time the user's switch asks for it (never for anyone else: they sit
+// on the world's render path, 10452eb). Game thread, after a frame; OwnHook pauses the other threads while it
+// patches. One attempt per game run.
+bool EnsureLiveTextureHooks()
+{
+    static bool attempted = false;
+    if (attempted) return liveTextureReady;
+    attempted = true;
+    auto& log = MyClientLog::Get();
+    if (!liveTextureKnown) { log.warn("Texture packs: live apply asked for, but this game build is not identified for it"); return false; }
+    const bool invalid = LiveInvalidHook::hook() == 0;
+    const bool inGame = LiveInGameHook::hook() == 0;
+    const bool draw = MyClientGame::Target(LiveRenderSymbol) && LiveWorldRenderHook::hook() == 0;
+    const bool prep = MyClientGame::Target(LivePrepSymbol) && LiveWorldPrepHook::hook() == 0;
+    const bool visibility = MyClientGame::Target(LiveVisibilitySymbol) && LiveVisibilityHook::hook() == 0;
+    // optional: the scene-level callers of the two above, and the second "in a world?" question
+    const bool sceneDraw = MyClientGame::RvaFallback(LiveSceneRenderSymbol) && LiveSceneRenderHook::hook() == 0;
+    const bool scenePrep = MyClientGame::RvaFallback(LiveScenePrepSymbol) && LiveScenePrepHook::hook() == 0;
+    livePreGameHooked = MyClientGame::Target(LivePreGameSymbol) && LivePreGameHook::hook() == 0;
+    liveLoadsComplete = MyClientGame::ResolveFunction<LoadsCompleteFn>(LoadsCompleteSymbol);
+    liveWaitActors = reinterpret_cast<WaitActorsFn>(MyClientGame::ResolveFirst({
+        "?_onResumeWaitReloadActors@MinecraftGame@@AEAA?AW4WorkResult@SerialWorkList@@XZ",
+        "?_onResumeWaitReloadActors@MinecraftGame@@IEAA?AW4WorkResult@SerialWorkList@@XZ",
+        "?_onResumeWaitReloadActors@MinecraftGame@@QEAA?AW4WorkResult@SerialWorkList@@XZ"}));
+    liveTextureReady = liveDrawingComposited && invalid && inGame && draw && prep && visibility &&
+                       liveLoadsComplete && liveWaitActors && packsChangedHooked && atlasHooked;
+    log.info("Texture packs: live apply ready={} composited={} invalid={} inGame={} preGame={} draw={} prep={} visibility={} sceneDraw={} scenePrep={} loads={} actors={} packsChanged={} atlas={}",
+             liveTextureReady, liveDrawingComposited, invalid, inGame, livePreGameHooked, draw, prep, visibility, sceneDraw, scenePrep,
+             liveLoadsComplete != nullptr, liveWaitActors != nullptr, packsChangedHooked, atlasHooked);
+    return liveTextureReady;
+}
+
 // Runs after a frame has been rendered, on the game's render/main thread. IMinecraftGame is the first
 // base of MinecraftGame, so the interface reference is also the MinecraftGame address.
 void RunPendingTextureReload()
 {
+    static bool reloadAfterWorld = false;
+    static uint64_t waitingForIdle = 0;
+    static PackRefreshWait refresh;
+    if (liveTextureBusy.load()) {
+        const auto client = MyClientGame::Client();
+        if (!client) { EndLiveTextureReload("ended after client disappeared"); refresh = {}; return; }
+        if (PollLiveTextureReload(*client)) return;
+        if (!liveTextureBusy.load()) { refresh = {}; reloadAfterWorld = true; return; }
+    }
+    const auto deferUnlessTitle = [&](ClientInstance& client) {
+        const bool inWorld = client.getLocalPlayer() || MyClientGame::WorldLevel();
+        const auto screen = client.getTopScreenName();
+        const bool title = screen.find("start_screen") != std::string::npos;
+        const bool loading = screen.find("progress") != std::string::npos || screen.find("loading") != std::string::npos ||
+                             screen.find("disconnect") != std::string::npos;
+        if (!inWorld && title) return false;
+        if (inWorld && liveTextureBusy.load()) return false;
+        if (inWorld && !loading && liveTextureWanted.load(std::memory_order_relaxed) && EnsureLiveTextureHooks() &&
+            refresh.phase == PackRefreshWait::Phase::Idle) {
+            bool waitForLoads = false;
+            if (BeginLiveTextureReload(client, waitForLoads)) { waitingForIdle = 0; return false; }
+            if (waitForLoads && !waitingForIdle) {
+                waitingForIdle = GetTickCount64();
+                MyClientLog::Get().info("Texture packs: waiting for existing game resource loads/GPU before live apply");
+            }
+            if (waitForLoads && GetTickCount64() - waitingForIdle < 30000) {
+                textureReloadPending.store(true);   // coalesce repeated Done requests, keep reading the latest saved list
+                return true;
+            }
+        }
+        waitingForIdle = 0;
+        reloadAfterWorld = true;
+        refresh = {};
+        MyClientLog::Get().warn("Texture packs: changes saved for title-screen apply (inWorld={} liveWanted={} liveReady={})", inWorld,
+                               liveTextureWanted.load(std::memory_order_relaxed), liveTextureReady);
+        return true;
+    };
+    if (reloadAfterWorld && textureReload) {
+        const auto client = MyClientGame::Client();
+        if (client && !client->getLocalPlayer() && !MyClientGame::WorldLevel() &&
+            client->getTopScreenName().find("start_screen") != std::string::npos) {
+            reloadAfterWorld = false;
+            textureReloadPending.store(true);
+        }
+    }
     // Once per game start, on the title screen a few seconds after the mods are enabled: re-read the
     // global pack list, as opening the game's resource pack screen and going back does. Global packs
     // were otherwise often missing after a start until that screen had been visited.
@@ -819,66 +1177,120 @@ void RunPendingTextureReload()
         if (!firstSeen) firstSeen = now;
         if (now - firstSeen >= 4000) {
             try {
-                const auto client = ll::service::getClientInstance();
+                const auto client = MyClientGame::Client();
                 if (client && !client->getLocalPlayer()) {   // title screen (never in a world)
                     startupDone = true;
                     textureReloadPending.store(true);
-                    ll::mod::NativeMod::current()->getLogger().info("Reloading the global resource packs once after start.");
+                    MyClientLog::Get().info("Reloading the global resource packs once after start.");
                 }
             } catch (...) { startupDone = true; }
         }
     }
-    if (textureFollowUp.at) {
+    // The refresh queue is asynchronous. First await user-pack rediscovery, which can rebuild the sources;
+    // only then attach our source and await its refresh. A fixed delay is not evidence either task completed.
+    if (refresh.phase == PackRefreshWait::Phase::Idle && textureReloadPending.exchange(false) && textureReload) {
         try {
-            const auto client = ll::service::getClientInstance();
-            if (client) RunTextureFollowUp(*client, client->getMinecraftGame_DEPRECATED());
-            else textureFollowUp = {};
-        } catch (...) { textureFollowUp = {}; }
-    }
-    // First let the pack repository pick up packs written or changed since the game started (the
-    // client pack is rewritten by the HUD). Without this the global list names packs the repository
-    // does not know yet, the game drops the whole list and no global pack is applied at all.
-    // The repository takes a moment to see a new pack folder: reloading right after refreshPacks still logged
-    // "Configured pack (OriginX Lite) was not found and was ignored" (2026-10-28), so the reload waits 600 ms.
-    static uint64_t reloadAt = 0;
-    if (textureReloadPending.exchange(false) && textureReload) {
-        try {
-            const auto client = ll::service::getClientInstance();
+            const auto client = MyClientGame::Client();
             if (client) {
-                // refreshPacks alone never picked up OriginX Lite ("Configured pack ... was not found" on every reload,
-                // 2026-10-28): the user pack folders are re-read only on requestReloadUserPacks.
+                if (deferUnlessTitle(*client)) return;
                 auto& repository = client->getResourcePackRepository();
-                try { repository.requestReloadUserPacks(); } catch (...) {}
-                repository.refreshPacks();
-                reloadAt = GetTickCount64() + 600;
+                repository.requestReloadUserPacks();
+                refresh.repository = &repository;
+                refresh.started = GetTickCount64();
+                refresh.result = repository.refreshPacksAsync().mResult;
+                refresh.phase = PackRefreshWait::Phase::Users;
+                MyClientLog::Get().info("Texture packs: waiting for user-pack rediscovery completion");
             }
-        } catch (...) {}
+        } catch (...) {
+            refresh = {};
+            if (liveTextureBusy.load() && !liveTexture.applied) EndLiveTextureReload("aborted before resource apply");
+            MyClientLog::Get().warn("Texture packs: starting repository refresh failed");
+        }
         return;
     }
-    if (!reloadAt || GetTickCount64() < reloadAt || !textureReload) return;
-    reloadAt = 0;
+    if (refresh.phase == PackRefreshWait::Phase::Idle || !textureReload) return;
     try {
-        const auto client = ll::service::getClientInstance();
-        if (!client) return;
-        client->getResourcePackRepository().refreshPacks();
-        IMinecraftGame& game = client->getMinecraftGame_DEPRECATED();
-        const uint32_t changesBefore = statPacksChanged.load();
-        textureReload(&game, false);
-        const auto count = statTextureReloads.fetch_add(1) + 1;
-        ll::mod::NativeMod::current()->getLogger().info("Texture packs were reloaded (request #{}).", count);
-        try { NoteLitePack(*client); } catch (...) {}
-        try { RefreshPackScreens(game); } catch (...) {}
-        if (client->getLocalPlayer()) {
-            atlasReloaded.store(false);
-            textureFollowUp = {GetTickCount64(), changesBefore, false};
+        const auto client = MyClientGame::Client();
+        if (!client) { refresh = {}; return; }
+        // A world may have opened while awaiting the task. Do not apply resources to it part way through loading.
+        if (deferUnlessTitle(*client)) return;
+        auto& repository = client->getResourcePackRepository();
+        if (refresh.repository != &repository || !refresh.result) {
+            refresh = {};
+            if (liveTextureBusy.load()) EndLiveTextureReload("aborted before apply: repository changed");
+            MyClientLog::Get().warn("Texture packs: repository changed or refresh handle unavailable; reload not applied");
+            return;
         }
-    } catch (...) {}
+        using Status = Bedrock::Threading::AsyncStatus;
+        const auto status = refresh.result->getStatus();
+        if (status == Status::Started && GetTickCount64() - refresh.started <= 30000) return;
+        if (status != Status::Completed) {
+            MyClientLog::Get().warn("Texture packs: repository refresh did not complete (status={}); reload not applied", static_cast<int>(status));
+            refresh = {};   // release our handle; do not cancel work also owned by the game's refresh queue
+            if (liveTextureBusy.load()) EndLiveTextureReload("aborted before apply: discovery did not complete");
+            return;
+        }
+        if (refresh.phase == PackRefreshWait::Phase::Users) {
+            MyClientLog::Get().info("Texture packs: user-pack rediscovery completed");
+            refresh.generated = PrepareGeneratedPackSource(repository);
+            refresh.phase = PackRefreshWait::Phase::Generated;
+            if (refresh.generated) {
+                refresh.started = GetTickCount64();
+                refresh.result = repository.refreshPacksAsync().mResult;
+                MyClientLog::Get().info("Texture packs: waiting for generated-pack refresh completion");
+                return;
+            }
+        }
+        if (refresh.generated && !GeneratedSourceAttached(repository, refresh.generated)) {
+            MyClientLog::Get().warn("Texture packs: generated source was replaced during refresh; reload not applied");
+            refresh = {};
+            if (liveTextureBusy.load()) EndLiveTextureReload("aborted before apply: generated source replaced");
+            return;
+        }
+        MyClientLog::Get().info("Texture packs: repository refresh completed (generated source retained={})", refresh.generated != nullptr);
+        refresh = {};
+        IMinecraftGame& game = client->getMinecraftGame_DEPRECATED();
+        auto& log = MyClientLog::Get();
+        const bool live = liveTextureBusy.load();
+        const uint32_t changes = statPacksChangedInner.load();
+        const uint32_t notifications = statPacksChanged.load();
+        if (live) liveTexture.applied = true;
+        {
+            struct ComposeScope {
+                IMinecraftGame* saved = liveComposeGame;
+                explicit ComposeScope(IMinecraftGame* game) { liveComposeGame = game; }
+                ~ComposeScope() { liveComposeGame = saved; }
+            } scope(live ? &game : nullptr);
+            textureReload(&game, false);
+        }
+        const auto count = statTextureReloads.fetch_add(1) + 1;
+        if (live) {
+            auto& manager = game.getResourcePackManager();
+            NoteSubpackIndices("native live global", manager.mGlobalStack.get(), log);
+            NoteFullSubpacks(manager, log);
+            const bool noCallbacks = statPacksChangedInner.load() == changes && statPacksChanged.load() == notifications;
+            if (static_cast<bool>(manager.mPendingRestack) && noCallbacks) {
+                reloadAfterWorld = true;
+                EndLiveTextureReload("native composer declined; deferred to title");
+            } else if (noCallbacks) {
+                EndLiveTextureReload("native composer reported no resource change");
+            } else log.info("Texture packs: native composition accepted; waiting for resource/model completion (request #{})", count);
+        } else log.info("Texture packs were reloaded on the title screen (request #{}).", count);
+        if (!live) {
+            try { NoteLitePack(*client); } catch (...) {}
+            try { RefreshPackScreens(game); } catch (...) {}
+        }
+    } catch (...) {
+        refresh = {};
+        if (liveTextureBusy.load() && !liveTexture.applied) EndLiveTextureReload("aborted before resource apply");
+        MyClientLog::Get().warn("Texture packs: repository/resource application raised an exception");
+    }
 }
 
 // The game's own reload steps, only counted (see RunTextureFollowUp). onActiveResourcePacksChanged is a
 // ResourcePackListener function, so `this` is that base of MinecraftGame.
-LL_TYPE_INSTANCE_HOOK(PacksChangedHook, ll::memory::HookPriority::Normal, ResourcePackListener,
-                      ll::memory::SymbolView{"?onActiveResourcePacksChanged@MinecraftGame@@UEAAXAEAVResourcePackManager@@@Z"},
+MYCLIENT_TYPE_INSTANCE_HOOK(PacksChangedHook, ll::memory::HookPriority::Normal, ResourcePackListener,
+                      MyClientGame::Target("?onActiveResourcePacksChanged@MinecraftGame@@UEAAXAEAVResourcePackManager@@@Z"),
                       void, ResourcePackManager& manager)
 {
     statPacksChanged.fetch_add(1);
@@ -893,7 +1305,7 @@ inline uintptr_t PacksChangedInnerSymbol()
                                        "?_onActiveResourcePacksChanged@MinecraftGame@@QEAAXAEAVResourcePackManager@@_N@Z"});
 }
 
-LL_TYPE_INSTANCE_HOOK(PacksChangedInnerHook, ll::memory::HookPriority::Normal, IMinecraftGame, PacksChangedInnerSymbol(),
+MYCLIENT_TYPE_INSTANCE_HOOK(PacksChangedInnerHook, ll::memory::HookPriority::Normal, IMinecraftGame, PacksChangedInnerSymbol(),
                       void, ResourcePackManager& manager, bool fullVanillaPackOnStack)
 {
     statPacksChanged.fetch_add(1);
@@ -908,10 +1320,33 @@ inline uintptr_t AtlasReloadedSymbol()
                                        "?_onTerrainAtlasReloaded@MinecraftGame@@QEAAXXZ"});
 }
 
-LL_TYPE_INSTANCE_HOOK(AtlasReloadedHook, ll::memory::HookPriority::Normal, IMinecraftGame, AtlasReloadedSymbol(), void)
+MYCLIENT_TYPE_INSTANCE_HOOK(AtlasReloadedHook, ll::memory::HookPriority::Normal, IMinecraftGame, AtlasReloadedSymbol(), void)
 {
     origin();
+    legacyAtlasSignals.fetch_add(1);
     atlasReloaded.store(true);
+}
+
+// 26.51: the TerrainAtlas load task's completion lambda (0x89FEE0) inlines the body of
+// _onTerrainAtlasReloaded instead of calling it. Both paths end in this common function
+// (0x7F0130), with terrain=true. Watching only the named wrapper misses normal pack reloads
+// and prevents RunTextureFollowUp from invalidating chunks even after the atlas is ready.
+inline uintptr_t AtlasUpdatedSymbol()
+{
+    return MyClientGame::ResolveFirst({
+        "?_updateTextureAtlasPBRData@MinecraftGame@@AEAAXAEBVTextureAtlas@@_N@Z",
+        "?_updateTextureAtlasPBRData@MinecraftGame@@IEAAXAEBVTextureAtlas@@_N@Z",
+        "?_updateTextureAtlasPBRData@MinecraftGame@@QEAAXAEBVTextureAtlas@@_N@Z"});
+}
+MYCLIENT_TYPE_INSTANCE_HOOK(AtlasUpdatedHook, ll::memory::HookPriority::Normal, IMinecraftGame, AtlasUpdatedSymbol(),
+                          void, TextureAtlas const* atlas, bool terrain)
+{
+    if (!this || !atlas) return;
+    origin(atlas, terrain); // a const-reference parameter has the same x64 ABI as this checked pointer
+    if (terrain) {
+        terrainAtlasUpdates.fetch_add(1);
+        atlasReloaded.store(true);
+    }
 }
 
 // Name tags: in this game the tags drawn above actors are built by LevelRendererPlayer::extractNameTags
@@ -920,8 +1355,8 @@ std::mutex nameTagSampleMutex;
 std::string nameTagSample;   // a description of one tag of the last list, for the log
 std::string NameTagSample() { std::lock_guard g(nameTagSampleMutex); return nameTagSample; }
 
-LL_TYPE_INSTANCE_HOOK(NameTagsHook, ll::memory::HookPriority::Normal, LevelRendererPlayer,
-                      ll::memory::SymbolView{"?extractNameTags@LevelRendererPlayer@@UEBA?AUNameTagRenderObjectCollection@@AEAVScreenContext@@@Z"},
+MYCLIENT_TYPE_INSTANCE_HOOK(NameTagsHook, ll::memory::HookPriority::Normal, LevelRendererPlayer,
+                      MyClientGame::Target("?extractNameTags@LevelRendererPlayer@@UEBA?AUNameTagRenderObjectCollection@@AEAVScreenContext@@@Z"),
                       NameTagRenderObjectCollection*, NameTagRenderObjectCollection* out, ScreenContext& screenContext)
 {
     // Returned by value: under the MSVC ABI that is a hidden pointer to the caller's buffer (after `this`),
@@ -936,7 +1371,7 @@ LL_TYPE_INSTANCE_HOOK(NameTagsHook, ll::memory::HookPriority::Normal, LevelRende
         // Your own name: the local player's name (Actor::getNameTag is inlined here, so the Nick hook that
         // used to record it is hardly ever reached); the name it recorded is only a fallback.
         std::string real;
-        if (const auto client = ll::service::getClientInstance())
+        if (const auto client = MyClientGame::Client())
             if (auto* local = client->getLocalPlayer()) real = local->mName.get();
         if (real.empty()) { std::lock_guard g(realNameMutex); real = localRealName; }
         const bool nick = nickWanted.load(std::memory_order_relaxed) && active.load(std::memory_order_relaxed) && !nickName.empty();
@@ -1021,14 +1456,43 @@ bool CodeRange(const void* address, size_t limit, uint8_t*& begin, uint8_t*& end
     return end > begin;
 }
 
+// 2026-11-03 log: the fixed pattern found nothing in this game version ("0 matches in game code"). The same check
+// with other registers / another call form: a forward jz rel32, then within 40 bytes a virtual call
+// (mov rax,[rax+disp32] then call) whose bool result is tested (test al,al) and jumped on. Only inside
+// extractNameTags. Up to 8 candidates are kept for the log.
+int FindOwnTagJumpLoose(uint8_t* begin, uint8_t* end, uint8_t*& found, std::vector<uint8_t*>& candidates)
+{
+    int matches = 0;
+    for (uint8_t* p = begin; p + 46 <= end; p++) {
+        if (p[0] != 0x0F || p[1] != 0x84) continue;
+        int32_t rel = 0;
+        std::memcpy(&rel, p + 2, sizeof rel);
+        if (rel <= 0 || rel > 0x4000) continue;
+        uint8_t* q = p + 6;
+        bool vtableLoad = false, call = false, tested = false;
+        for (int i = 0; i < 40 && !tested; i++) {
+            const uint8_t* c = q + i;
+            if (c[0] == 0x48 && c[1] == 0x8B && c[2] == 0x80) vtableLoad = true;                       // mov rax,[rax+disp32]
+            if (vtableLoad && ((c[0] == 0xFF && (c[1] == 0x15 || c[1] == 0xD0 || c[1] == 0x50 || c[1] == 0x90)) ||
+                               c[0] == 0xE8))
+                call = true;
+            if (call && c[0] == 0x84 && c[1] == 0xC0 && (c[2] == 0x0F || c[2] == 0x74 || c[2] == 0x75)) tested = true;
+        }
+        if (!tested) continue;
+        if (candidates.size() < 8) candidates.push_back(p);
+        found = p;
+        matches++;
+    }
+    return matches;
+}
+
 void LocateOwnTagJump()
 {
     if (ownTagSearched) return;
     ownTagSearched = true;
-    auto& log = ll::mod::NativeMod::current()->getLogger();
+    auto& log = MyClientLog::Get();
     try {
-        void* fn = ll::memory::SymbolView{"?extractNameTags@LevelRendererPlayer@@UEBA?AUNameTagRenderObjectCollection@@AEAVScreenContext@@@Z"}
-                       .resolve(true);
+        void* fn = reinterpret_cast<void*>(MyClientGame::Target("?extractNameTags@LevelRendererPlayer@@UEBA?AUNameTagRenderObjectCollection@@AEAVScreenContext@@@Z"));
         uint8_t *begin = nullptr, *end = nullptr, *found = nullptr;
         int matches = 0;
         const char* where = "extractNameTags";
@@ -1049,6 +1513,23 @@ void LocateOwnTagJump()
                 const int m = FindOwnTagJump(sBegin, sEnd, hit);
                 if (m > 0) { matches += m; found = hit; }
             }
+        }
+        std::vector<uint8_t*> loose;
+        if (matches == 0 && fn && CodeRange(fn, 0x6000, begin, end)) {
+            uint8_t* hit = nullptr;
+            const int m = FindOwnTagJumpLoose(begin, end, hit, loose);
+            const auto base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+            for (uint8_t* c : loose) {
+                std::string bytes;
+                char b[4];
+                for (int i = 0; i < 40; i++) { std::snprintf(b, sizeof b, "%02X ", c[i]); bytes += b; }
+                log.info("Nametag: candidate at extractNameTags+0x{:X} (+0x{:X}): {}", static_cast<uint64_t>(c - begin),
+                         static_cast<uint64_t>(c - base), bytes);
+            }
+            // Only logged, not patched: a wrong jump turned into NOPs could make the game read past a check it needs
+            // (a crash). The right candidate is picked from the log and its bytes become the new pattern.
+            log.info("Nametag: {} loose candidates in extractNameTags (not patched; for the next version's pattern).", m);
+            (void)hit;
         }
         if (matches == 1 && found) {
             ownTagJump = found;
@@ -1080,7 +1561,7 @@ void UpdateOwnTag()
     bool want = active.load(std::memory_order_relaxed) && nametagWanted.load(std::memory_order_relaxed);
     if (want) {
         try {
-            const auto client = ll::service::getClientInstance();
+            const auto client = MyClientGame::Client();
             // 0 = first person: your own tag would sit in front of the camera.
             want = client && client->getLocalPlayer() && client->getOptions().getPlayerViewPerspective() != 0;
         } catch (...) { want = false; }
@@ -1091,6 +1572,30 @@ void UpdateOwnTag()
     if (WriteCode(ownTagJump, want ? nops : ownTagOriginal, OwnTagJumpSize)) ownTagPatched = want;
 }
 
+// Clouds are an engine option, not a resource-pack reload. Remember the user's setting for this options
+// object and restore it when the request/lease ends. Never dereference an options object from an old client.
+void UpdateCloudOption()
+{
+    static IOptionRegistry* held = nullptr;
+    static bool original = true;
+    const auto client = MyClientGame::Client();
+    if (!client) { held = nullptr; return; }
+    auto& options = client->getOptions();
+    if (held && held != &options) held = nullptr;
+    const bool wanted = active.load(std::memory_order_relaxed) && noCloudsWanted.load(std::memory_order_relaxed);
+    if (wanted) {
+        if (!held) { original = options.getRenderClouds(); held = &options; }
+        if (options.getRenderClouds()) {
+            options.setRenderClouds(false);
+            MyClientLog::Get().info("Optimization: clouds hidden through the game's render-clouds option");
+        }
+    } else if (held) {
+        if (options.getRenderClouds() != original) options.setRenderClouds(original);
+        held = nullptr;
+        MyClientLog::Get().info("Optimization: the original render-clouds option was restored");
+    }
+}
+
 // Left Hand: your player and the camera view for this frame (see leftHandOwnPlayer).
 void UpdateLeftHandView()
 {
@@ -1098,7 +1603,7 @@ void UpdateLeftHandView()
     bool firstPersonView = false;
     if (leftHandWanted.load(std::memory_order_relaxed) && active.load(std::memory_order_relaxed)) {
         try {
-            const auto client = ll::service::getClientInstance();
+            const auto client = MyClientGame::Client();
             if (client) {
                 own = client->getLocalPlayer();
                 firstPersonView = own && client->getOptions().getPlayerViewPerspective() == 0;
@@ -1122,7 +1627,7 @@ void UpdateHitboxShifts(float alpha)
     static const auto getLerp = MyClientGame::ResolveMember<LerpFn>(MyClientGame::Symbols::InterpolatedPosition);
     if (!getLerp) return;
     try {
-        auto level = ll::service::getMultiPlayerLevel();
+        auto level = MyClientGame::WorldLevel();
         if (!level) return;
         std::vector<float> shifts(hitboxActors.size() * 3, 0.0f);
         for (Actor* actor : level->getRuntimeActorList()) {
@@ -1143,12 +1648,22 @@ void UpdateHitboxShifts(float alpha)
     } catch (...) {}
 }
 
-LL_TYPE_INSTANCE_HOOK(FrameHook, ll::memory::HookPriority::Normal, GameRenderer,
+std::string RenderSkipSummary();   // below, with the Optimization render hooks
+void TickReplayJoin(void* gameArgs);   // below, with the replay recorder
+MYCLIENT_TYPE_INSTANCE_HOOK(FrameHook, ll::memory::HookPriority::Normal, GameRenderer,
                       ll::memory::SymbolView{"?renderCurrentFrame@GameRenderer@@QEAAXM@Z"}, void, float alpha)
 {
+    // The game's client for MyClientGame::Client() (GameState.h), instead of LeviLamina's getClientInstance().
+    // mPrimaryClient is a NotNullNonOwnerPtr<IClientInstance> (gsl::not_null around a NonOwnerPointer).
+    {
+        const auto* primary = reinterpret_cast<Bedrock::NonOwnerPointer<IClientInstance> const*>(static_cast<void const*>(std::addressof(this->mPrimaryClient)));
+        if (primary && primary->mPointer) MyClientGame::NoteClient(static_cast<ClientInstance*>(primary->mPointer));
+    }
     // Before the frame: the Compositor may present it while the game is still inside renderCurrentFrame.
     UpdateOwnTag();   // also runs when inactive, so the original bytes come back
     UpdateLeftHandView();
+    try { UpdateCloudOption(); }
+    catch (...) { /* A failed option update must not interrupt the game's frame. */ }
     if (active.load()) UpdateHitboxShifts(alpha);
     { MyClientProfile::GameScope prof(MyClientProfile::GameFrame); origin(alpha); }
     if (!active.load()) return;
@@ -1157,13 +1672,16 @@ LL_TYPE_INSTANCE_HOOK(FrameHook, ll::memory::HookPriority::Normal, GameRenderer,
         PublishFps();
         TrackGameScreens();
         RunPendingTextureReload();
+        TickReplayJoin(nullptr);
     }
     renderedFrames.fetch_add(1, std::memory_order_relaxed);
     // Perf: once a minute (general cost, not tied to a check in progress).
     const std::string perf = MyClientProfile::Summary(GetTickCount64(), 60000);
     if (!perf.empty()) {
-        auto& log = ll::mod::NativeMod::current()->getLogger();
+        auto& log = MyClientLog::Get();
         log.info("{}", perf);
+        const std::string skips = RenderSkipSummary();
+        if (!skips.empty()) log.info("{}", skips);
         // Left Hand is still being checked in the game (VERIFY.md 5): its counters, only while it is on.
         const uint32_t calls = statLeftHandCalls.exchange(0), passes = statFirstPersonPasses.exchange(0),
                        first = statLeftHandFirst.exchange(0), restored = statLeftHandRestored.exchange(0);
@@ -1204,33 +1722,33 @@ inline uintptr_t ItemRenderSymbol()
         {"?render@InventoryItemRenderer@@UEAAXAEAVMinecraftUIRenderContext@@AEAVIClientInstance@@AEAVUIControl@@H@Z"});
 }
 
-LL_INSTANCE_HOOK(UiUpdateHook, ll::memory::HookPriority::Normal, UiUpdateSymbol(), void, MinecraftUIFrameUpdateContext& context)
+MYCLIENT_INSTANCE_HOOK(UiUpdateHook, ll::memory::HookPriority::Normal, UiUpdateSymbol(), void, MinecraftUIFrameUpdateContext& context)
 {
     MyClientProfile::GameScope prof(MyClientProfile::UiUpdate);
     origin(context);
 }
 
-LL_INSTANCE_HOOK(UiRenderHook, ll::memory::HookPriority::Normal, UiRenderSymbol(), void,
+MYCLIENT_INSTANCE_HOOK(UiRenderHook, ll::memory::HookPriority::Normal, UiRenderSymbol(), void,
                  ScreenContext& screenContext, FrameRenderObject const& renderObj)
 {
     MyClientProfile::GameScope prof(MyClientProfile::UiRender);
     origin(screenContext, renderObj);
 }
 
-LL_INSTANCE_HOOK(HudTickHook, ll::memory::HookPriority::Normal, HudTickSymbol(), ui::DirtyFlag)
+MYCLIENT_INSTANCE_HOOK(HudTickHook, ll::memory::HookPriority::Normal, HudTickSymbol(), ui::DirtyFlag)
 {
     MyClientProfile::GameScope prof(MyClientProfile::HudTick);
     return origin();
 }
 
-LL_INSTANCE_HOOK(ItemUpdateHook, ll::memory::HookPriority::Normal, ItemUpdateSymbol(), bool,
+MYCLIENT_INSTANCE_HOOK(ItemUpdateHook, ll::memory::HookPriority::Normal, ItemUpdateSymbol(), bool,
                  IClientInstance& client, UIControl& owner, UIScene const& scene)
 {
     MyClientProfile::GameScope prof(MyClientProfile::ItemUpdate);
     return origin(client, owner, scene);
 }
 
-LL_INSTANCE_HOOK(ItemRenderHook, ll::memory::HookPriority::Normal, ItemRenderSymbol(), void,
+MYCLIENT_INSTANCE_HOOK(ItemRenderHook, ll::memory::HookPriority::Normal, ItemRenderSymbol(), void,
                  MinecraftUIRenderContext& renderContext, IClientInstance& client, UIControl& owner, int pass)
 {
     MyClientProfile::GameScope prof(MyClientProfile::ItemRender);
@@ -1238,7 +1756,7 @@ LL_INSTANCE_HOOK(ItemRenderHook, ll::memory::HookPriority::Normal, ItemRenderSym
 }
 bool hudCostHooked = false;
 
-LL_TYPE_INSTANCE_HOOK(FovHook, ll::memory::HookPriority::Normal, LevelRendererPlayer,
+MYCLIENT_TYPE_INSTANCE_HOOK(FovHook, ll::memory::HookPriority::Normal, LevelRendererPlayer,
                       ll::memory::SymbolView{"?getFov@LevelRendererPlayer@@QEBAMM_N@Z"}, float, float alpha, bool variable)
 {
     const float original = origin(alpha, variable);
@@ -1246,25 +1764,31 @@ LL_TYPE_INSTANCE_HOOK(FovHook, ll::memory::HookPriority::Normal, LevelRendererPl
     MyClientProfile::Scope prof(MyClientProfile::Fov);
     bool playable = false;
     try {
-        const auto client = ll::service::getClientInstance();
+        const auto client = MyClientGame::Client();
         // Never affect a secondary/split-screen camera or an inventory/chat menu.
         playable = client && &mClientInstance == &*client && client->getLocalPlayer() &&
             client->isInWorldAndNotShowingAnyMenuScreens();
     } catch (...) { playable = false; }
-    DWORD foregroundPid = 0;
-    GetWindowThreadProcessId(GetForegroundWindow(), &foregroundPid);
-    std::lock_guard guard(featureMutex);
-    if (!active.load() || !channel.Data() || !channel.Lock()) return original;
-    if (!MyClientFeatures::Valid(*channel.Data(), GetCurrentProcessId())) ResetChannel();
-    const auto command = channel.Data()->command;
+    MyClientFeatures::Command command{};
+    command.at = zoomCommandAt.load(std::memory_order_acquire);
+    const auto packed = zoomCommandFields.load(std::memory_order_relaxed);
+    command.key = (packed >> 16) & 0xFFu;
+    command.zoom = (packed >> 24) & 1u;
+    command.reserved = packed & 0xFFFFu;
     const auto now = GetTickCount64();
-    const bool keyDown = command.key > 0 && command.key < 255 && (GetAsyncKeyState(static_cast<int>(command.key)) & 0x8000);
+    DWORD foregroundPid = 0;
+    bool keyDown = false;
+    if (command.zoom && playable && MyClientFeatures::Fresh(command.at, now, MyClientFeatures::CommandLeaseMs)) {
+        GetWindowThreadProcessId(GetForegroundWindow(), &foregroundPid);
+        keyDown = command.key > 0 && command.key < 255 && (GetAsyncKeyState(static_cast<int>(command.key)) & 0x8000);
+    }
     const bool zoom = MyClientFeatures::WantsZoom(command, now, foregroundPid == GetCurrentProcessId(), playable, keyDown);
     const float result = MyClientFeatures::ZoomFov(original, zoom, MyClientFeatures::ZoomFactor(command.reserved & 0xFFFFu));
+    MyClientFeatures::Telemetry camera{};
     if (variable && playable)
     {
         try {
-            const auto client2 = ll::service::getClientInstance();
+            const auto client2 = MyClientGame::Client();
             using PosFn = Vec3 (Actor::*)() const;
             using LerpFn = Vec3 (Actor::*)(float) const;
             static const auto getEye = MyClientGame::ResolveMember<PosFn>(MyClientGame::Symbols::EyePos);
@@ -1276,7 +1800,7 @@ LL_TYPE_INSTANCE_HOOK(FovHook, ll::memory::HookPriority::Normal, LevelRendererPl
                 const auto eye = (player->*getEye)();
                 const auto pos = player->getPosition();
                 const auto smooth = (player->*getLerp)(alpha);
-                auto& t = channel.Data()->telemetry;
+                auto& t = camera;
                 t.camX = smooth.x + (eye.x - pos.x);
                 t.camY = smooth.y + (eye.y - pos.y);
                 t.camZ = smooth.z + (eye.z - pos.z);
@@ -1289,9 +1813,19 @@ LL_TYPE_INSTANCE_HOOK(FovHook, ll::memory::HookPriority::Normal, LevelRendererPl
             }
         } catch (...) {}
     }
-    channel.Data()->telemetry.zoomAt = now;
-    channel.Data()->telemetry.zoomActive = result != original ? 1u : 0u;
-    channel.Unlock();
+    // Optional telemetry must not stall rendering when the tick sampler/HUD owns the channel.
+    std::unique_lock guard(featureMutex, std::try_to_lock);
+    if (guard.owns_lock() && active.load() && channel.Data() && channel.Lock()) {
+        auto& telemetry = channel.Data()->telemetry;
+        if (camera.camAt) {
+            telemetry.camAt = camera.camAt;
+            telemetry.camX = camera.camX; telemetry.camY = camera.camY; telemetry.camZ = camera.camZ;
+            telemetry.camPitch = camera.camPitch; telemetry.camYaw = camera.camYaw; telemetry.camFov = camera.camFov;
+        }
+        telemetry.zoomAt = now;
+        telemetry.zoomActive = result != original ? 1u : 0u;
+        channel.Unlock();
+    }
     return result;
 }
 
@@ -1324,7 +1858,7 @@ struct OutlineScope {
         wasInside = insideOutline;
         insideOutline = true;
         try {
-            const auto client = ll::service::getClientInstance();
+            const auto client = MyClientGame::Client();
             if (client) {
                 shader = &client->getShaderColor();
                 savedColor = shader->color.get();
@@ -1365,19 +1899,19 @@ constexpr const char* OutlineSymbolPublic    = MYCLIENT_OUTLINE_SYMBOL("Q");
 constexpr const char* OutlineSymbolPrivate   = MYCLIENT_OUTLINE_SYMBOL("A");
 constexpr const char* OutlineSymbolProtected = MYCLIENT_OUTLINE_SYMBOL("I");
 
-LL_TYPE_INSTANCE_HOOK(OutlineHookPublic, ll::memory::HookPriority::Normal, LevelRendererPlayer,
+MYCLIENT_TYPE_INSTANCE_HOOK(OutlineHookPublic, ll::memory::HookPriority::Normal, LevelRendererPlayer,
                       ll::memory::SymbolView{OutlineSymbolPublic}, void,
                       BaseActorRenderContext& renderContext, Block const& block, BlockSource& region, BlockPos const& pos)
 {
     RunOutline([&] { origin(renderContext, block, region, pos); });
 }
-LL_TYPE_INSTANCE_HOOK(OutlineHookPrivate, ll::memory::HookPriority::Normal, LevelRendererPlayer,
+MYCLIENT_TYPE_INSTANCE_HOOK(OutlineHookPrivate, ll::memory::HookPriority::Normal, LevelRendererPlayer,
                       ll::memory::SymbolView{OutlineSymbolPrivate}, void,
                       BaseActorRenderContext& renderContext, Block const& block, BlockSource& region, BlockPos const& pos)
 {
     RunOutline([&] { origin(renderContext, block, region, pos); });
 }
-LL_TYPE_INSTANCE_HOOK(OutlineHookProtected, ll::memory::HookPriority::Normal, LevelRendererPlayer,
+MYCLIENT_TYPE_INSTANCE_HOOK(OutlineHookProtected, ll::memory::HookPriority::Normal, LevelRendererPlayer,
                       ll::memory::SymbolView{OutlineSymbolProtected}, void,
                       BaseActorRenderContext& renderContext, Block const& block, BlockSource& region, BlockPos const& pos)
 {
@@ -1395,16 +1929,12 @@ bool hitSelectHooked = false, highlightHooked = false;
 
 void CaptureWorldCamera(BaseActorRenderContext& context);   // below, with the camera hooks
 
-LL_TYPE_INSTANCE_HOOK(HitSelectHook, ll::memory::HookPriority::Normal, LevelRendererPlayer,
+MYCLIENT_TYPE_INSTANCE_HOOK(HitSelectHook, ll::memory::HookPriority::Normal, LevelRendererPlayer,
                       ll::memory::SymbolView{HitSelectSymbol}, void,
                       BaseActorRenderContext& renderContext, BlockSource& region, BlockPos const& pos, bool fancyGraphics)
 {
     CaptureWorldCamera(renderContext);
-    // While the coloured outline is drawn in game, the game's own black one is left out.
-    if (outlineWanted.load(std::memory_order_relaxed) && MyClientCompositor::DrawingOutline()) {
-        statOutline.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
+    // Keep Minecraft's own geometry, occlusion and line width. Only change its colour.
     RunOutline([&] { origin(renderContext, region, pos, fancyGraphics); });
 }
 
@@ -1444,13 +1974,21 @@ void CaptureWorldCamera(BaseActorRenderContext& context)
         CameraPositionOf(impl, pos);   // stays 0 on older games: the Compositor then uses the eye position
         MyClientCompositor::SetMatrices(&view[0][0], &proj[0][0], pos[0], pos[1], pos[2]);
         lastCameraPos[0] = pos[0]; lastCameraPos[1] = pos[1]; lastCameraPos[2] = pos[2];
+        {
+            // The view matrix's third row is the camera's backward axis in world space (right-handed view).
+            const float f[3] = {-view[0][2], -view[1][2], -view[2][2]};
+            const float length = std::sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);
+            cameraForwardKnown = length > 0.5f && (pos[0] != 0.f || pos[1] != 0.f || pos[2] != 0.f);
+            if (cameraForwardKnown)
+                for (int i = 0; i < 3; i++) cameraForward[i] = f[i] / length;
+        }
         cameraCapturedFrame = frame;
         statCameraCaptures.fetch_add(1, std::memory_order_relaxed);
     } catch (...) {}
 }
 
 // Diagnostic only now (calls per second in the log): the frame's camera comes from CaptureWorldCamera.
-LL_TYPE_INSTANCE_HOOK(CameraHook, ll::memory::HookPriority::Normal, LevelRendererPlayer,
+MYCLIENT_TYPE_INSTANCE_HOOK(CameraHook, ll::memory::HookPriority::Normal, LevelRendererPlayer,
                       ll::memory::SymbolView{"?setupCamera@LevelRendererPlayer@@QEAAXAEAVCamera@mce@@M@Z"}, void,
                       mce::Camera& camera, float a)
 {
@@ -1464,7 +2002,7 @@ LL_TYPE_INSTANCE_HOOK(CameraHook, ll::memory::HookPriority::Normal, LevelRendere
     } catch (...) {}
 }
 bool cameraHooked = false;
-LL_TYPE_INSTANCE_HOOK(HighlightHook, ll::memory::HookPriority::Normal, LevelRendererPlayer,
+MYCLIENT_TYPE_INSTANCE_HOOK(HighlightHook, ll::memory::HookPriority::Normal, LevelRendererPlayer,
                       ll::memory::SymbolView{HighlightSymbol}, void,
                       BaseActorRenderContext& renderContext, BlockSource& region, Block const& block, BlockPos const& pos,
                       bool renderSecondPart, bool fancyGraphics)
@@ -1475,13 +2013,13 @@ LL_TYPE_INSTANCE_HOOK(HighlightHook, ll::memory::HookPriority::Normal, LevelRend
 constexpr const char* TessColorFloatSymbol = "?color@Tessellator@@QEAAXMMMM@Z";
 constexpr const char* TessColorObjectSymbol = "?color@Tessellator@@QEAAXAEBVColor@mce@@@Z";
 
-LL_TYPE_INSTANCE_HOOK(TessColorFloatHook, ll::memory::HookPriority::Normal, Tessellator,
+MYCLIENT_TYPE_INSTANCE_HOOK(TessColorFloatHook, ll::memory::HookPriority::Normal, Tessellator,
                       ll::memory::SymbolView{TessColorFloatSymbol}, void, float r, float g, float b, float a)
 {
     { MyClientProfile::Scope prof(MyClientProfile::TessColor); OverrideOutlineColor(r, g, b); }
     origin(r, g, b, a);
 }
-LL_TYPE_INSTANCE_HOOK(TessColorObjectHook, ll::memory::HookPriority::Normal, Tessellator,
+MYCLIENT_TYPE_INSTANCE_HOOK(TessColorObjectHook, ll::memory::HookPriority::Normal, Tessellator,
                       ll::memory::SymbolView{TessColorObjectSymbol}, void, mce::Color const& color)
 {
     float r = color.r, g = color.g, b = color.b;
@@ -1503,7 +2041,7 @@ LL_TYPE_INSTANCE_HOOK(TessColorObjectHook, ll::memory::HookPriority::Normal, Tes
 // skips the local player elsewhere, the HUD stays at "WAITING" because the hook is never reached.
 constexpr const char* NameTagSymbol = "?canShowNameTag@Actor@@UEBA_NXZ";
 
-LL_TYPE_INSTANCE_HOOK(NameTagHook, ll::memory::HookPriority::Normal, Actor,
+MYCLIENT_TYPE_INSTANCE_HOOK(NameTagHook, ll::memory::HookPriority::Normal, Actor,
                       ll::memory::SymbolView{NameTagSymbol}, bool)
 {
     const bool original = origin();
@@ -1511,7 +2049,7 @@ LL_TYPE_INSTANCE_HOOK(NameTagHook, ll::memory::HookPriority::Normal, Actor,
     statNameTag.fetch_add(1, std::memory_order_relaxed);
     if (!active.load(std::memory_order_relaxed)) return original;
     try {
-        const auto client = ll::service::getClientInstance();
+        const auto client = MyClientGame::Client();
         const Actor* local = client ? static_cast<const Actor*>(client->getLocalPlayer()) : nullptr;
         if (local && local == static_cast<const Actor*>(this)) {
             // Diagnostics: does the game ever ask about the local player at all?
@@ -1541,9 +2079,19 @@ bool CullActor(Actor& actor)
 {
     float range2 = cullRange2.load(std::memory_order_relaxed);
     const float playerRange2 = cullPlayerRange2.load(std::memory_order_relaxed);
-    if (range2 <= 0.f && playerRange2 <= 0.f) return false;
+    const bool behind = cullBehindWanted.load(std::memory_order_relaxed) && cameraForwardKnown;
+    if (range2 <= 0.f && playerRange2 <= 0.f && !behind) return false;
     if (static_cast<const void*>(&actor) == cullLocal.load(std::memory_order_relaxed)) return false;
-    if (actor.isPlayer()) {
+    if (behind) {
+        const auto at = actor.getPosition();
+        const float where[3] = {at.x, at.y, at.z};
+        if (MyClientFeatures::BehindCamera(lastCameraPos, cameraForward, where)) {
+            statBehindSkipped.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+    }
+    if (range2 <= 0.f && playerRange2 <= 0.f) return false;
+    if (MyClientGame::IsPlayer(actor)) {
         if (playerRange2 > 0.f) range2 = playerRange2;
         else if (!cullPlayers.load(std::memory_order_relaxed)) return false;
     } else {
@@ -1566,8 +2114,8 @@ constexpr const char* ActorRenderSymbol = "?render@ActorRenderDispatcher@@QEAAXA
 constexpr const char* ActorRenderAtSymbol =
     "?render@ActorRenderDispatcher@@QEAAXAEAVBaseActorRenderContext@@AEAVActor@@AEBVVec3@@2AEBVVec2@@_N@Z";
 
-LL_TYPE_INSTANCE_HOOK(ActorRenderHook, ll::memory::HookPriority::Normal, ActorRenderDispatcher,
-                      ll::memory::SymbolView{ActorRenderSymbol}, void,
+MYCLIENT_TYPE_INSTANCE_HOOK(ActorRenderHook, ll::memory::HookPriority::Normal, ActorRenderDispatcher,
+                      MyClientGame::Target(ActorRenderSymbol), void,
                       BaseActorRenderContext& renderContext, Actor& entity, bool ignoreLighting)
 {
     bool skip = false;
@@ -1575,7 +2123,7 @@ LL_TYPE_INSTANCE_HOOK(ActorRenderHook, ll::memory::HookPriority::Normal, ActorRe
     if (!skip) origin(renderContext, entity, ignoreLighting);
 }
 
-LL_TYPE_INSTANCE_HOOK(ActorRenderAtHook, ll::memory::HookPriority::Normal, ActorRenderDispatcher,
+MYCLIENT_TYPE_INSTANCE_HOOK(ActorRenderAtHook, ll::memory::HookPriority::Normal, ActorRenderDispatcher,
                       ll::memory::SymbolView{ActorRenderAtSymbol}, void,
                       BaseActorRenderContext& renderContext, Actor& entity, Vec3 const& cameraTargetPos,
                       Vec3 const& pos, Vec2 const& rot, bool ignoreLighting)
@@ -1583,6 +2131,102 @@ LL_TYPE_INSTANCE_HOOK(ActorRenderAtHook, ll::memory::HookPriority::Normal, Actor
     bool skip = false;
     { MyClientProfile::Scope prof(MyClientProfile::ActorRender); CaptureWorldCamera(renderContext); try { skip = CullActor(entity); } catch (...) {} }
     if (!skip) origin(renderContext, entity, cameraTargetPos, pos, rot, ignoreLighting);
+}
+
+// ---- Optimization rows that need render hooks (2026-11-04) ----
+// Vertical render distance: each sub-chunk (16x16x16) the game decided to draw goes through
+// LevelRendererCamera::queueChunk, after its own cave culling and the view frustum. Rows more than N sub-chunks
+// above or below the camera are not queued (the measurement hook of 4b66d03 showed the name and arguments).
+constexpr const char* QueueChunkSymbol =
+    "?queueChunk@LevelRendererCamera@@QEAAXAEAUChunkRenderObjectCollection@@AEBVRenderChunkInstanced@@MMAEBV"
+    "TerrainMaterialVariationManager@@V?$optional_ref@$$CBVTerrainMaterialVariationManager@@@@@Z";
+MYCLIENT_TYPE_INSTANCE_HOOK(QueueChunkHook, ll::memory::HookPriority::Normal, LevelRendererCamera,
+                      MyClientGame::Target(QueueChunkSymbol), void,
+                      ChunkRenderObjectCollection& collection, RenderChunkInstanced const& renderChunkInstanced,
+                      float farDistance2, float currentTime, TerrainMaterialVariationManager const& terrainVariationMgr,
+                      optional_ref<TerrainMaterialVariationManager const> fadeVariationMgr)
+{
+    const uint32_t rows = verticalRowsWanted.load(std::memory_order_relaxed);
+    if (rows) {
+        bool skip = false;
+        try {
+            const RenderChunkShared* shared = renderChunkInstanced.mRenderChunkShared.get();   // the shared_ptr's pointer
+            if (shared) {
+                const Vec3& camera = mCameraPos.get();
+                const BlockPos& pos = shared->mPosition.get();
+                skip = MyClientFeatures::OutsideVerticalRows(static_cast<int>(std::floor(pos.y / 16.0f)),
+                                                             static_cast<int>(std::floor(camera.y / 16.0f)), rows);
+            }
+        } catch (...) { skip = false; }
+        if (skip) {
+            statChunksSkipped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    origin(collection, renderChunkInstanced, farDistance2, currentTime, terrainVariationMgr, fadeVariationMgr);
+}
+
+// Block entity distance: BlockActorRenderDispatcher::render (the overload with the block's world position) draws one
+// chest / sign / banner / bed / skull... Farther than the chosen distance from the player: not drawn this frame.
+// Hand-made MSVC name (no game build has confirmed it yet): when it does not resolve, the log says so.
+// The last argument, std::optional<dragon::RenderMetadata> by value, is passed (x64 ABI) as a pointer to the
+// caller's copy, which the called function destroys: the hook takes that pointer and hands it on untouched (the
+// game does not export RenderMetadata's copy / destructor, so it cannot be a real by-value parameter here).
+constexpr const char* BlockActorRenderAtSymbol =
+    "?render@BlockActorRenderDispatcher@@QEAAXAEAVBaseActorRenderContext@@AEAVBlockSource@@"
+    "AEAVIVanillaRenderBlockActorComponent@@AEBVBlock@@AEBVVec3@@AEBVBlockPos@@_NAEBVMaterialPtr@mce@@"
+    "PEBUClientTexture@9@HV?$optional@URenderMetadata@dragon@@@std@@@Z";
+MYCLIENT_TYPE_INSTANCE_HOOK(BlockActorRenderHook, ll::memory::HookPriority::Normal, BlockActorRenderDispatcher,
+                      ll::memory::SymbolView{BlockActorRenderAtSymbol}, void,
+                      BaseActorRenderContext& entityRenderContext, BlockSource& renderSource,
+                      IVanillaRenderBlockActorComponent& renderComponent, Block const& block, Vec3 const& renderPos,
+                      BlockPos const& worldPos, bool renderAlphaLayer, mce::MaterialPtr const& forcedMat,
+                      mce::ClientTexture const* forceTex, int breakingAmount, void* renderMetadata)
+{
+    const float range2 = blockEntityRange2.load(std::memory_order_relaxed);
+    if (range2 > 0.f) {
+        const float dx = worldPos.x + 0.5f - cullX.load(std::memory_order_relaxed);
+        const float dy = worldPos.y + 0.5f - cullY.load(std::memory_order_relaxed);
+        const float dz = worldPos.z + 0.5f - cullZ.load(std::memory_order_relaxed);
+        if (dx * dx + dy * dy + dz * dz > range2) {
+            statBlockEntitiesSkipped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    origin(entityRenderContext, renderSource, renderComponent, block, renderPos, worldPos, renderAlphaLayer, forcedMat,
+           forceTex, breakingAmount, renderMetadata);
+}
+
+// No sky (full): LevelRendererCamera::renderSky draws the sky's colour and gradient (the sun and moon are hidden by
+// the OriginX Lite pack already). Skipped while the row is on: the clear colour stays behind the world.
+constexpr const char* RenderSkySymbol =
+    "?renderSky@LevelRendererCamera@@QEBAXAEAVScreenContext@@AEBUViewRenderObject@@AEBUBaseSceneDirectionalLightRenderData@@@Z";
+MYCLIENT_TYPE_INSTANCE_HOOK(RenderSkyHook, ll::memory::HookPriority::Normal, LevelRendererCamera,
+                      ll::memory::SymbolView{RenderSkySymbol}, void,
+                      ScreenContext& screenContext, ViewRenderObject const& renderObj,
+                      BaseSceneDirectionalLightRenderData const& sceneDirectionalLightRenderData)
+{
+    if (noSkyWanted.load(std::memory_order_relaxed)) {
+        statSkySkipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    origin(screenContext, renderObj, sceneDirectionalLightRenderData);
+}
+
+// One log line a minute while any of these rows is on: how much each one left out.
+std::string RenderSkipSummary()
+{
+    const uint32_t chunks = statChunksSkipped.exchange(0), blocks = statBlockEntitiesSkipped.exchange(0);
+    const uint32_t sky = statSkySkipped.exchange(0), behind = statBehindSkipped.exchange(0);
+    if (!verticalRowsWanted.load() && blockEntityRange2.load() <= 0.f && !noSkyWanted.load() && !cullBehindWanted.load())
+        return {};
+    char line[256];
+    std::snprintf(line, sizeof line,
+                  "Optimization render skips (60 s): sub-chunks=%u (rows %u, hook=%d) block entities=%u (hook=%d) sky=%u (hook=%d) "
+                  "behind camera=%u (camera=%d)",
+                  chunks, verticalRowsWanted.load(), queueChunkHooked, blocks, blockActorHooked, sky, skyHooked, behind,
+                  cameraForwardKnown);
+    return line;
 }
 
 // ---- Replay files (all called with replayMutex held) ----
@@ -1640,7 +2284,7 @@ void EndReplaySession(bool keep)
     replayWriter.Close();
     replayOpen.store(false);
     if (replayMarked && keep && MoveFileExW(replayPartW.c_str(), replayPathW.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
-        ll::mod::NativeMod::current()->getLogger().info("Replay saved: {}", replayPathUtf8);
+        MyClientLog::Get().info("Replay saved: {}", replayPathUtf8);
     else if (!(replayMarked && keep))
         DeleteFileW(replayPartW.c_str());
     replayMarked = false;
@@ -1680,7 +2324,7 @@ void RecoverReplayParts()
 // pack's "myclient:enchanted_hit" sparks when the held item is enchanted. Only this client sees them.
 void SpawnHitEffect(Player& player, Actor& target)
 {
-    const AABB& box = target.getAABB();
+    const AABB& box = *MyClientGame::AabbOf(target);
     const float cx = (box.min.x + box.max.x) * 0.5f, cy = (box.min.y + box.max.y) * 0.5f, cz = (box.min.z + box.max.z) * 0.5f;
     const float hx = (box.max.x - box.min.x) * 0.5f, hy = (box.max.y - box.min.y) * 0.5f, hz = (box.max.z - box.min.z) * 0.5f;
     static std::mt19937 random{std::random_device{}()};
@@ -1693,14 +2337,15 @@ void SpawnHitEffect(Player& player, Actor& target)
         level.addParticle(ParticleType::Crit, pos, dir, 0, nullptr, false);
     }
     if (!hitEffectMagic.load()) return;
-    if (!player.getSelectedItem().isEnchanted()) return;
+    const ItemStack* held = MyClientGame::SelectedItemOf(player);
+    if (!held || !MyClientGame::IsEnchanted(*held)) return;
     using DimensionFn = Dimension& (Actor::*)() const;
     static const auto getDimension = MyClientGame::ResolveMember<DimensionFn>("?getDimension@Actor@@QEBAAEAVDimension@@XZ");
     if (!getDimension) return;
     level.spawnParticleEffect(LitePack::kEnchantedHitId, Vec3{cx, cy, cz}, &(target.*getDimension)());
 }
 
-LL_TYPE_INSTANCE_HOOK(HitEffectHook, ll::memory::HookPriority::Normal, GameMode,
+MYCLIENT_TYPE_INSTANCE_HOOK(HitEffectHook, ll::memory::HookPriority::Normal, GameMode,
                       ll::memory::SymbolView{"?attack@GameMode@@UEAA_NAEAVActor@@AEBVVec3@@@Z"}, bool,
                       Actor& entity, Vec3 const& hitPosition)
 {
@@ -1709,7 +2354,7 @@ LL_TYPE_INSTANCE_HOOK(HitEffectHook, ll::memory::HookPriority::Normal, GameMode,
     if ((hitEffectCrit.load(std::memory_order_relaxed) || hitEffectMagic.load(std::memory_order_relaxed)) && active.load(std::memory_order_relaxed)) {
         try {
             Player& player = mPlayer;
-            const auto client = ll::service::getClientInstance();
+            const auto client = MyClientGame::Client();
             if (client && static_cast<Actor*>(client->getLocalPlayer()) == static_cast<Actor*>(&player))
                 SpawnHitEffect(player, entity);
         } catch (...) {}
@@ -1814,7 +2459,7 @@ inline uintptr_t RenderMeshTarget()
     return MyClientGame::ResolveFirst({MYCLIENT_RENDERMESH("QEBA"), MYCLIENT_RENDERMESH("AEBA"), MYCLIENT_RENDERMESH("IEBA")});
 }
 #undef MYCLIENT_RENDERMESH
-LL_TYPE_INSTANCE_HOOK(LeftHandMeshHook, ll::memory::HookPriority::Normal, mce::Mesh, RenderMeshTarget(), void,
+MYCLIENT_TYPE_INSTANCE_HOOK(LeftHandMeshHook, ll::memory::HookPriority::Normal, mce::Mesh, RenderMeshTarget(), void,
                       mce::MeshContext& meshContext, void const* materialPtr, void* textures, uint startOffset, uint count,
                       void const* offscreenCaptureDescription, void const* overrideIndexBuffer, void* renderMetadata)
 {
@@ -1833,7 +2478,7 @@ constexpr const char* RenderFirstPersonSymbol =
 constexpr const char* RenderObjectSymbol =
     "?renderObject@ItemInHandRenderer@@QEAAXAEAVBaseActorRenderContext@@AEBVItemRenderCall@@AEBURenderMetadata@dragon@@W4ItemContextFlags@@@Z";
 
-LL_TYPE_INSTANCE_HOOK(LeftHandItemHook, ll::memory::HookPriority::Normal, ItemInHandRenderer,
+MYCLIENT_TYPE_INSTANCE_HOOK(LeftHandItemHook, ll::memory::HookPriority::Normal, ItemInHandRenderer,
                       ll::memory::SymbolView{RenderItemSymbol}, void,
                       BaseActorRenderContext& renderContext, Actor& entity, ItemStack const& item, bool posAndRotSetByJSON,
                       ItemContextFlags itemFlags, bool useMatrixAsIs, bool renderingMainHand)
@@ -1843,15 +2488,15 @@ LL_TYPE_INSTANCE_HOOK(LeftHandItemHook, ll::memory::HookPriority::Normal, ItemIn
     });
 }
 
-LL_TYPE_INSTANCE_HOOK(LeftHandItemNewHook, ll::memory::HookPriority::Normal, ItemInHandRenderer,
-                      ll::memory::SymbolView{RenderItemNewSymbol}, void,
+MYCLIENT_TYPE_INSTANCE_HOOK(LeftHandItemNewHook, ll::memory::HookPriority::Normal, ItemInHandRenderer,
+                      MyClientGame::Target(RenderItemNewSymbol), void,
                       BaseActorRenderContext& renderContext, Actor& entity, ItemStack const& item, ItemContextFlags itemFlags,
                       Brightness lightEmission)
 {
     RunLeftHand(renderContext, &entity, itemFlags, [&] { origin(renderContext, entity, item, itemFlags, lightEmission); });
 }
 
-LL_TYPE_INSTANCE_HOOK(LeftHandFirstPersonHook, ll::memory::HookPriority::Normal, ItemInHandRenderer,
+MYCLIENT_TYPE_INSTANCE_HOOK(LeftHandFirstPersonHook, ll::memory::HookPriority::Normal, ItemInHandRenderer,
                       ll::memory::SymbolView{RenderFirstPersonSymbol}, void,
                       BaseActorRenderContext& renderContext, Matrix const& prevProj, ItemContextFlags itemFlags)
 {
@@ -1873,7 +2518,7 @@ inline uintptr_t ItemInHandPassSymbol()
                                        "?_renderItemInHand@InGamePlayScreen@@EEAAXAEAVScreenContext@@AEAVPlayer@@@Z"});
 }
 struct ItemInHandPass {};
-LL_TYPE_INSTANCE_HOOK(ItemInHandPassHook, ll::memory::HookPriority::Normal, ItemInHandPass, ItemInHandPassSymbol(), void,
+MYCLIENT_TYPE_INSTANCE_HOOK(ItemInHandPassHook, ll::memory::HookPriority::Normal, ItemInHandPass, ItemInHandPassSymbol(), void,
                       ScreenContext& screenContext, Player& player)
 {
     if (!leftHandWanted.load(std::memory_order_relaxed) || !active.load(std::memory_order_relaxed) || projectionMirrored) {
@@ -1911,7 +2556,7 @@ LL_TYPE_INSTANCE_HOOK(ItemInHandPassHook, ll::memory::HookPriority::Normal, Item
     }
 }
 
-LL_TYPE_INSTANCE_HOOK(LeftHandObjectHook, ll::memory::HookPriority::Normal, ItemInHandRenderer,
+MYCLIENT_TYPE_INSTANCE_HOOK(LeftHandObjectHook, ll::memory::HookPriority::Normal, ItemInHandRenderer,
                       ll::memory::SymbolView{RenderObjectSymbol}, void,
                       BaseActorRenderContext& renderContext, ItemRenderCall const& renderObject,
                       dragon::RenderMetadata const& renderMetadata, ItemContextFlags itemFlags)
@@ -1951,7 +2596,7 @@ void RecordPacket(const std::string& data, bool sent)
 // Replay: BatchedNetworkPeer::_receivePacket hands the game ONE finished (decrypted, decompressed, unbatched)
 // packet per call, and sendPacket takes one the client sends. Both are copied into the session file;
 // what the game sends and receives is never changed.
-LL_TYPE_INSTANCE_HOOK(ReplayReceiveHook, ll::memory::HookPriority::Normal, BatchedNetworkPeer,
+MYCLIENT_TYPE_INSTANCE_HOOK(ReplayReceiveHook, ll::memory::HookPriority::Normal, BatchedNetworkPeer,
                       ll::memory::SymbolView{MyClientGame::Symbols::ReceivePacket}, NetworkPeer::DataStatus,
                       std::string& outData,
                       std::shared_ptr<std::chrono::steady_clock::time_point> const& timepointPtr)
@@ -1961,13 +2606,120 @@ LL_TYPE_INSTANCE_HOOK(ReplayReceiveHook, ll::memory::HookPriority::Normal, Batch
     return status;
 }
 
-LL_TYPE_INSTANCE_HOOK(ReplaySendHook, ll::memory::HookPriority::Normal, BatchedNetworkPeer,
+MYCLIENT_TYPE_INSTANCE_HOOK(ReplaySendHook, ll::memory::HookPriority::Normal, BatchedNetworkPeer,
                       ll::memory::SymbolView{MyClientGame::Symbols::SendPacket}, void,
                       std::string const& data, NetworkPeer::Reliability reliability, Compressibility compressible)
 {
     { MyClientProfile::Scope prof(MyClientProfile::Replay); RecordPacket(data, true); }
     origin(data, reliability, compressible);
 }
+
+// ---- Replay playback: joining the HUD's local replay server ----
+// The HUD used to open minecraft://connect/?serverUrl=127.0.0.1&serverPort=N, which did not take the game to the
+// replay (2026-11-04 user report). Now it asks this DLL (ChatChannel.h, MyClient.ReplayJoin.v1.<pid>) and the game
+// joins from inside: GameArguments::_deeplinkToServer is what that link runs, called here without its confirmation.
+// From a world the game leaves it first (ClientInstance::requestLeaveGame) and joins once it is on the menus.
+// Everything runs in GameArguments::tick (the game's main thread); the frame hook only times out a request.
+class ReplayGameArguments {};   // GameArguments: `this` is only passed through
+MyClientChat::Channel replayJoinChannel;
+std::mutex replayJoinMutex;
+struct PendingReplayJoin {
+    uint32_t serial = 0;
+    std::string host;
+    uint16_t port = 0;
+    uint64_t since = 0, leftAt = 0;
+    bool leaving = false;
+};
+PendingReplayJoin replayJoin;
+bool gameArgsTickHooked = false;
+std::atomic<uint64_t> gameArgsTickAt{0};   // when GameArguments::tick last ran
+
+using DeeplinkFn = void (*)(void*, std::string const&, int, bool);
+DeeplinkFn DeeplinkFunction()
+{
+    static const auto fn = reinterpret_cast<DeeplinkFn>(MyClientGame::ResolveFirst({
+        "?_deeplinkToServer@GameArguments@@AEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@H_N@Z",
+        "?_deeplinkToServer@GameArguments@@IEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@H_N@Z",
+        "?_deeplinkToServer@GameArguments@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@H_N@Z"}));
+    return fn;
+}
+
+void FinishReplayJoin(MyClientChat::Result result, const char* why)
+{
+    replayJoinChannel.Finish(GetCurrentProcessId(), replayJoin.serial, result);
+    MyClientLog::Get().info("Replay: joining {}:{} - {}", replayJoin.host, replayJoin.port, why);
+    replayJoin = {};
+}
+
+// `gameArgs` = GameArguments (from its tick), or nullptr from the frame hook (timeouts only).
+void TickReplayJoin(void* gameArgs)
+{
+    std::lock_guard guard(replayJoinMutex);
+    const DWORD pid = GetCurrentProcessId();
+    const uint64_t now = GetTickCount64();
+    if (!replayJoinChannel.IsOpen()) {
+        static uint64_t lastTry = 0;
+        if (now - lastTry < 2000) return;
+        lastTry = now;
+        if (!replayJoinChannel.Open(pid, true, MyClientChat::ReplayJoinName)) return;
+    }
+    if (!replayJoin.serial) {
+        std::string line;
+        uint32_t serial = 0;
+        if (!replayJoinChannel.TakePending(pid, line, serial)) return;
+        replayJoin.serial = serial;
+        replayJoin.since = now;
+        if (!MyClientChat::ParseHostPort(line, replayJoin.host, replayJoin.port)) {
+            replayJoin.host = line;
+            FinishReplayJoin(MyClientChat::Result::Failed, "not an address");
+            return;
+        }
+        MyClientLog::Get().info("Replay: the HUD asked to join its replay server at {}:{} (GameArguments tick hook={}, _deeplinkToServer={})",
+                                                        replayJoin.host, replayJoin.port, gameArgsTickHooked, DeeplinkFunction() != nullptr);
+    }
+    if (!DeeplinkFunction() || !gameArgsTickHooked) { FinishReplayJoin(MyClientChat::Result::Failed, "this game build cannot be asked (the HUD opens the link instead)"); return; }
+    if (now - replayJoin.since > 25000) { FinishReplayJoin(MyClientChat::Result::Failed, replayJoin.leaving ? "the world was not left within 25 s" : "GameArguments::tick did not run"); return; }
+    if (!gameArgs) {
+        // The tick is expected every frame; if it does not run, the HUD should not wait the whole 25 s.
+        if (now - replayJoin.since > 3000 && now - gameArgsTickAt.load() > 3000)
+            FinishReplayJoin(MyClientChat::Result::Failed, "GameArguments::tick does not run (the HUD opens the link instead)");
+        return;
+    }
+    try {
+        const auto client = MyClientGame::Client();
+        if (!client) return;
+        if (client->getLocalPlayer()) {
+            if (!replayJoin.leaving) {
+                replayJoin.leaving = true;
+                MyClientLog::Get().info("Replay: leaving the world first");
+                client->requestLeaveGame(true, false);
+            }
+            replayJoin.leftAt = 0;
+            return;
+        }
+        // Left (or never in one): a moment on the menus so the old connection is fully gone.
+        if (replayJoin.leaving) {
+            if (!replayJoin.leftAt) replayJoin.leftAt = now;
+            if (now - replayJoin.leftAt < 1500) return;
+        }
+        DeeplinkFunction()(gameArgs, replayJoin.host, replayJoin.port, false);
+        FinishReplayJoin(MyClientChat::Result::Sent, replayJoin.leaving ? "asked the game to connect (after leaving the world)" : "asked the game to connect");
+    } catch (...) {
+        FinishReplayJoin(MyClientChat::Result::Failed, "the game threw");
+    }
+}
+
+#define MYCLIENT_GAMEARGS_TICK_HOOK(NAME, SYMBOL)                                                               \
+    MYCLIENT_TYPE_INSTANCE_HOOK(NAME, ll::memory::HookPriority::Normal, ReplayGameArguments,                          \
+                          ll::memory::SymbolView{SYMBOL}, void)                                                  \
+    {                                                                                                            \
+        origin();                                                                                                \
+        gameArgsTickAt.store(GetTickCount64(), std::memory_order_relaxed);                                       \
+        if (active.load(std::memory_order_relaxed)) TickReplayJoin(this);                                        \
+    }
+MYCLIENT_GAMEARGS_TICK_HOOK(GameArgsTickPublicHook, "?tick@GameArguments@@UEAAXXZ")
+MYCLIENT_GAMEARGS_TICK_HOOK(GameArgsTickProtectedHook, "?tick@GameArguments@@MEAAXXZ")
+MYCLIENT_GAMEARGS_TICK_HOOK(GameArgsTickPrivateHook, "?tick@GameArguments@@EEAAXXZ")
 
 // Starts / stops the recording from the per-frame hook (the channel is locked by the caller).
 void UpdateReplay(bool wanted, MyClientFeatures::Shared& shared, uint64_t now)
@@ -1998,14 +2750,14 @@ void UpdateReplay(bool wanted, MyClientFeatures::Shared& shared, uint64_t now)
     }
 }
 
-LL_TYPE_INSTANCE_HOOK(NickHook, ll::memory::HookPriority::Normal, Actor,
+MYCLIENT_TYPE_INSTANCE_HOOK(NickHook, ll::memory::HookPriority::Normal, Actor,
                       ll::memory::SymbolView{NickSymbol}, std::string const&)
 {
     std::string const& original = origin();
     MyClientProfile::Scope prof(MyClientProfile::Nick);
     if (!nickWanted.load(std::memory_order_relaxed) || !active.load(std::memory_order_relaxed)) return original;
     try {
-        const auto client = ll::service::getClientInstance();
+        const auto client = MyClientGame::Client();
         const Actor* local = client ? static_cast<const Actor*>(client->getLocalPlayer()) : nullptr;
         if (local && local == static_cast<const Actor*>(this) && !nickName.empty()) {
             localTagColor.store(MyClientAutoRq::NameColor(original));   // Auto RQ still needs the team colour
@@ -2046,7 +2798,7 @@ bool BeginFullbright(BaseLightData& light, bool& savedActive, float& savedScale)
     return true;
 }
 
-LL_TYPE_INSTANCE_HOOK(LightHook, ll::memory::HookPriority::Normal, BaseLightTextureImageBuilder,
+MYCLIENT_TYPE_INSTANCE_HOOK(LightHook, ll::memory::HookPriority::Normal, BaseLightTextureImageBuilder,
                       ll::memory::SymbolView{BuildImageSymbol}, bool,
                       BaseLightData const& lightData, mce::Image* image, uint length, float a,
                       float ambientBoost, bool clampToMinimum)
@@ -2060,7 +2812,7 @@ LL_TYPE_INSTANCE_HOOK(LightHook, ll::memory::HookPriority::Normal, BaseLightText
     return result;
 }
 
-LL_TYPE_INSTANCE_HOOK(LightSplitHook, ll::memory::HookPriority::Normal, BaseLightTextureImageBuilder,
+MYCLIENT_TYPE_INSTANCE_HOOK(LightSplitHook, ll::memory::HookPriority::Normal, BaseLightTextureImageBuilder,
                       ll::memory::SymbolView{BuildImageSplitSymbol}, bool,
                       BaseLightData const& lightData, mce::Image* image, uint length, float a,
                       bool clampToMinimum)
@@ -2082,7 +2834,7 @@ LL_TYPE_INSTANCE_HOOK(LightSplitHook, ll::memory::HookPriority::Normal, BaseLigh
 constexpr const char* LightCreateSymbol =
     "?createBaseLightTextureData@BaseLightTextureImageBuilder@@UEAA?AV?$unique_ptr@VBaseLightData@@U?$default_delete@VBaseLightData@@@std@@@std@@PEAVIClientInstance@@AEBVBaseLightData@@@Z";
 
-LL_TYPE_INSTANCE_HOOK(LightCreateHook, ll::memory::HookPriority::Normal, BaseLightTextureImageBuilder,
+MYCLIENT_TYPE_INSTANCE_HOOK(LightCreateHook, ll::memory::HookPriority::Normal, BaseLightTextureImageBuilder,
                       ll::memory::SymbolView{LightCreateSymbol}, std::unique_ptr<BaseLightData>,
                       IClientInstance* client, BaseLightData const& currentData)
 {
@@ -2100,10 +2852,14 @@ namespace MyClientGame {
 bool StartDrawing(bool probe)
 {
     MyClientCompositor::Host host{};
-    host.info = [](const std::string& text) { ll::mod::NativeMod::current()->getLogger().info("{}", text); };
-    host.warn = [](const std::string& text) { ll::mod::NativeMod::current()->getLogger().warn("{}", text); };
+    host.info = [](const std::string& text) { MyClientLog::Get().info("{}", text); };
+    host.warn = [](const std::string& text) { MyClientLog::Get().warn("{}", text); };
     host.hook = [](void* target, void* detour, void** original) {
+#if MYCLIENT_OWN_HOOKS
+        return MyClientHook::Install(target, detour, original);
+#else
         return ll::memory::hook(target, detour, original, ll::memory::HookPriority::Normal);
+#endif
     };
     return MyClientCompositor::Start(host, probe);   // hooks once; later calls return the state
 }
@@ -2111,20 +2867,27 @@ bool EnableFeatures()
 {
     // Hooks remain installed until process exit. Disabled detours call origin;
     // the DLL cannot be dynamically unloaded, avoiding in-flight trampolines.
-    auto& log = ll::mod::NativeMod::current()->getLogger();
+    auto& log = MyClientLog::Get();
+    if (!sourcesInitAttempted) {
+        sourcesInitAttempted = true;
+        const bool hooked = MyClientGame::Target(SourcesInitSymbol) && SourcesInitHook::hook() == 0;
+        log.info("Texture packs: repository source initialization hook={}", hooked);
+    }
     // Every game hook is installed on its own and its result is written to the game log, so one
     // missing symbol no longer switches every other feature off (and the log says which one failed).
-    if (!damageValue) damageValue = reinterpret_cast<DamageFn>(ll::memory::SymbolView{"?getDamageValue@ItemStackBase@@QEBAFXZ"}.resolve());
+    if (!damageValue) damageValue = MyClientGame::ResolveFunction<DamageFn>("?getDamageValue@ItemStackBase@@QEBAFXZ");
     if (!damageValue) log.warn("Armor durability unavailable: symbol ?getDamageValue@ItemStackBase@@QEBAFXZ was not found.");
     // Manual registration checks errors; the macro's automatic-use counter is unused here.
     (void)FrameHook::_AutoHookCount; (void)FovHook::_AutoHookCount; (void)LightHook::_AutoHookCount; (void)LightSplitHook::_AutoHookCount; (void)LightCreateHook::_AutoHookCount;
     (void)NameTagHook::_AutoHookCount;
     (void)NickHook::_AutoHookCount;
     (void)ReplayReceiveHook::_AutoHookCount; (void)ReplaySendHook::_AutoHookCount; (void)HitEffectHook::_AutoHookCount;
+    (void)GameArgsTickPublicHook::_AutoHookCount; (void)GameArgsTickProtectedHook::_AutoHookCount; (void)GameArgsTickPrivateHook::_AutoHookCount;
     (void)LeftHandItemHook::_AutoHookCount; (void)LeftHandItemNewHook::_AutoHookCount;
     (void)LeftHandFirstPersonHook::_AutoHookCount; (void)LeftHandObjectHook::_AutoHookCount;
     (void)LeftHandMeshHook::_AutoHookCount;
     (void)PacksChangedHook::_AutoHookCount; (void)PacksChangedInnerHook::_AutoHookCount; (void)AtlasReloadedHook::_AutoHookCount;
+    (void)AtlasUpdatedHook::_AutoHookCount;
     (void)ActorRenderHook::_AutoHookCount; (void)ActorRenderAtHook::_AutoHookCount;
     (void)HitSelectHook::_AutoHookCount; (void)HighlightHook::_AutoHookCount; (void)CameraHook::_AutoHookCount;
     (void)NameTagsHook::_AutoHookCount;
@@ -2144,19 +2907,27 @@ bool EnableFeatures()
     // Optional hooks: failure only makes that feature report UNAVAILABLE.
     if (!brightHooked) {
         // Either light-map path is enough to report Full Bright as available.
-        const bool a = ll::memory::SymbolView{BuildImageSymbol}.resolve() && LightHook::hook() == 0;
-        const bool b = ll::memory::SymbolView{BuildImageSplitSymbol}.resolve() && LightSplitHook::hook() == 0;
-        const bool c = ll::memory::SymbolView{LightCreateSymbol}.resolve() && LightCreateHook::hook() == 0;
+        const bool a = MyClientGame::Target(BuildImageSymbol) && LightHook::hook() == 0;
+        const bool b = MyClientGame::Target(BuildImageSplitSymbol) && LightSplitHook::hook() == 0;
+        const bool c = MyClientGame::Target(LightCreateSymbol) && LightCreateHook::hook() == 0;
         if (!c) log.warn("Full Bright: createBaseLightTextureData hook not found; only the buildImage hooks are used.");
         brightHooked = a || b || c;
         if (!brightHooked) log.error("Full Bright hook failed (BaseLightTextureImageBuilder::buildImage / buildImageSplit / createBaseLightTextureData).");
     }
     if (!cullHooked) {
         // Entity render distance: either overload is enough; the game may route through one or both.
-        const bool a = ll::memory::SymbolView{ActorRenderSymbol}.resolve(true) && ActorRenderHook::hook() == 0;
-        const bool b = ll::memory::SymbolView{ActorRenderAtSymbol}.resolve(true) && ActorRenderAtHook::hook() == 0;
+        const bool a = MyClientGame::Target(ActorRenderSymbol) && ActorRenderHook::hook() == 0;
+        const bool b = MyClientGame::Target(ActorRenderAtSymbol) && ActorRenderAtHook::hook() == 0;
         cullHooked = a || b;
         if (!cullHooked) log.warn("Entity render distance unavailable: ActorRenderDispatcher::render not found.");
+    }
+    if (!queueChunkHooked && !blockActorHooked && !skyHooked) {
+        // Optimization rows on render hooks (once): each can be missing on its own.
+        queueChunkHooked = MyClientGame::Target(QueueChunkSymbol) && QueueChunkHook::hook() == 0;
+        blockActorHooked = MyClientGame::Target(BlockActorRenderAtSymbol) && BlockActorRenderHook::hook() == 0;
+        skyHooked = MyClientGame::Target(RenderSkySymbol) && RenderSkyHook::hook() == 0;
+        log.info("Optimization render hooks: vertical distance (queueChunk)={} block entity distance={} no sky={} "
+                 "(behind-camera culling uses the entity hook={})", queueChunkHooked, blockActorHooked, skyHooked, cullHooked);
     }
     if (!replayHooked) {
         replayHooked = ReplayReceiveHook::hook() == 0;
@@ -2169,11 +2940,11 @@ bool EnableFeatures()
     }
     if (!leftHandHooked) {
         // Either path is enough; the game may draw the held item through one or both.
-        const bool a = ll::memory::SymbolView{RenderItemSymbol}.resolve(true) && LeftHandItemHook::hook() == 0;
-        const bool b = ll::memory::SymbolView{RenderItemNewSymbol}.resolve(true) && LeftHandItemNewHook::hook() == 0;
-        const bool object = ll::memory::SymbolView{RenderObjectSymbol}.resolve(true) && LeftHandObjectHook::hook() == 0;
+        const bool a = MyClientGame::Target(RenderItemSymbol) && LeftHandItemHook::hook() == 0;
+        const bool b = MyClientGame::Target(RenderItemNewSymbol) && LeftHandItemNewHook::hook() == 0;
+        const bool object = MyClientGame::Target(RenderObjectSymbol) && LeftHandObjectHook::hook() == 0;
         // Without renderFirstPerson the first-person pass cannot be told apart (the flags never mark it).
-        const bool pass = ll::memory::SymbolView{RenderFirstPersonSymbol}.resolve(true) && LeftHandFirstPersonHook::hook() == 0;
+        const bool pass = MyClientGame::Target(RenderFirstPersonSymbol) && LeftHandFirstPersonHook::hook() == 0;
         const bool mesh = RenderMeshTarget() && LeftHandMeshHook::hook() == 0;   // where the mirror is made (MirrorMesh)
         const bool inHand = ItemInHandPassSymbol() && ItemInHandPassHook::hook() == 0;   // the whole pass (projection)
         if (!inHand) log.warn("Left Hand: InGamePlayScreen::_renderItemInHand could not be hooked.");
@@ -2200,33 +2971,32 @@ bool EnableFeatures()
         if (!replaySendHooked) log.warn("Replay send hook failed (BatchedNetworkPeer::sendPacket); recordings will not include your own movement.");
     }
     if (!nickHooked) {
-        nickHooked = ll::memory::SymbolView{NickSymbol}.resolve() && NickHook::hook() == 0;
+        nickHooked = MyClientGame::Target(NickSymbol) && NickHook::hook() == 0;
         if (!nickHooked) log.warn("Nick hook failed (Actor::getNameTag); Nick will not change the name.");
     }
     if (!nameTagsHooked) {
-        nameTagsHooked = ll::memory::SymbolView{"?extractNameTags@LevelRendererPlayer@@UEBA?AUNameTagRenderObjectCollection@@AEAVScreenContext@@@Z"}
-                             .resolve(true) && NameTagsHook::hook() == 0;
+        nameTagsHooked = MyClientGame::Target("?extractNameTags@LevelRendererPlayer@@UEBA?AUNameTagRenderObjectCollection@@AEAVScreenContext@@@Z") && NameTagsHook::hook() == 0;
         if (!nameTagsHooked) log.warn("Nick: LevelRendererPlayer::extractNameTags not found; Nick can only change the old name path.");
     }
     if (!nametagHooked) {
-        nametagHooked = ll::memory::SymbolView{NameTagSymbol}.resolve() && NameTagHook::hook() == 0;
+        nametagHooked = MyClientGame::Target(NameTagSymbol) && NameTagHook::hook() == 0;
         if (!nametagHooked) log.error("Nametag hook failed (Actor::canShowNameTag).");
     }
     if (!outlineHooked) {
         // The member's access level (public/private/protected) changes its mangled name: try each.
-        if (ll::memory::SymbolView{OutlineSymbolPublic}.resolve() && OutlineHookPublic::hook() == 0) outlineHooked = true;
-        else if (ll::memory::SymbolView{OutlineSymbolPrivate}.resolve() && OutlineHookPrivate::hook() == 0) outlineHooked = true;
-        else if (ll::memory::SymbolView{OutlineSymbolProtected}.resolve() && OutlineHookProtected::hook() == 0) outlineHooked = true;
-        hitSelectHooked = ll::memory::SymbolView{HitSelectSymbol}.resolve(true) && HitSelectHook::hook() == 0;
-        highlightHooked = ll::memory::SymbolView{HighlightSymbol}.resolve(true) && HighlightHook::hook() == 0;
+        if (MyClientGame::Target(OutlineSymbolPublic) && OutlineHookPublic::hook() == 0) outlineHooked = true;
+        else if (MyClientGame::Target(OutlineSymbolPrivate) && OutlineHookPrivate::hook() == 0) outlineHooked = true;
+        else if (MyClientGame::Target(OutlineSymbolProtected) && OutlineHookProtected::hook() == 0) outlineHooked = true;
+        hitSelectHooked = MyClientGame::Target(HitSelectSymbol) && HitSelectHook::hook() == 0;
+        highlightHooked = MyClientGame::Target(HighlightSymbol) && HighlightHook::hook() == 0;
         if (!hitSelectHooked) log.warn("Block Outline: LevelRendererPlayer::renderHitSelect was not found.");
         if (!highlightHooked) log.warn("Block Outline: LevelRendererPlayer::_renderHighlightSelection was not found.");
         outlineHooked = outlineHooked || hitSelectHooked || highlightHooked;
         if (!outlineHooked) log.error("Block Outline hook failed: no selection-drawing function was found.");
     }
     if (!tessColorHooked) {
-        const bool a = ll::memory::SymbolView{TessColorFloatSymbol}.resolve() && TessColorFloatHook::hook() == 0;
-        const bool b = ll::memory::SymbolView{TessColorObjectSymbol}.resolve() && TessColorObjectHook::hook() == 0;
+        const bool a = MyClientGame::Target(TessColorFloatSymbol) && TessColorFloatHook::hook() == 0;
+        const bool b = MyClientGame::Target(TessColorObjectSymbol) && TessColorObjectHook::hook() == 0;
         tessColorHooked = a || b;
         if (!tessColorHooked) log.warn("Tessellator::color hooks were not found; Block Outline relies on the shader colour only.");
     }
@@ -2240,16 +3010,24 @@ bool EnableFeatures()
         if (!textureReload) log.warn("Texture pack reload function (MinecraftGame::_loadLastGlobalResourcePacksFromFile) was not found.");
     }
     if (!focusLostHooked) {
-        focusLostHooked = ll::memory::SymbolView{"?onAppFocusLost@MinecraftGame@@UEAAXXZ"}.resolve(true) && FocusLostHook::hook() == 0;
+        focusLostHooked = MyClientGame::Target("?onAppFocusLost@MinecraftGame@@UEAAXXZ") && FocusLostHook::hook() == 0;
         if (!focusLostHooked) log.warn("MinecraftGame::onAppFocusLost not found; opening the HUD menu shows the pause screen for a moment.");
     }
+    if (!gameArgsTickHooked) {
+        // Replay playback joins through GameArguments (TickReplayJoin); the virtual's access level is not known.
+        if (MyClientGame::Target("?tick@GameArguments@@UEAAXXZ") && GameArgsTickPublicHook::hook() == 0) gameArgsTickHooked = true;
+        else if (MyClientGame::Target("?tick@GameArguments@@MEAAXXZ") && GameArgsTickProtectedHook::hook() == 0) gameArgsTickHooked = true;
+        else if (MyClientGame::Target("?tick@GameArguments@@EEAAXXZ") && GameArgsTickPrivateHook::hook() == 0) gameArgsTickHooked = true;
+        log.info("Replay playback: GameArguments::tick hook={} _deeplinkToServer={} (without them the HUD opens the minecraft:// link)",
+                 gameArgsTickHooked, DeeplinkFunction() != nullptr);
+    }
     if (!mouseFeedHooked) {
-        mouseFeedHooked = ll::memory::SymbolView{MouseFeedSymbol}.resolve(true) && MouseFeedHook::hook() == 0;
+        mouseFeedHooked = MyClientGame::Target(MouseFeedSymbol) && MouseFeedHook::hook() == 0;
         log.info("HUD menu: MouseDevice::feed hook {} (camera kept still behind the menu).", mouseFeedHooked ? "installed" : "NOT found");
     }
     if (textureReload && !packsChangedHooked) {
         static bool outer = false, inner = false;
-        if (!outer) outer = ll::memory::SymbolView{"?onActiveResourcePacksChanged@MinecraftGame@@UEAAXAEAVResourcePackManager@@@Z"}.resolve(true) &&
+        if (!outer) outer = MyClientGame::Target("?onActiveResourcePacksChanged@MinecraftGame@@UEAAXAEAVResourcePackManager@@@Z") &&
                             PacksChangedHook::hook() == 0;
         if (!inner) inner = PacksChangedInnerSymbol() && PacksChangedInnerHook::hook() == 0;
         // Both are needed to tell "the game did not reload" apart from "it reloaded another way".
@@ -2257,13 +3035,29 @@ bool EnableFeatures()
         if (!packsChangedHooked) log.warn("Textures: MinecraftGame::onActiveResourcePacksChanged not found; a switch in a world may need a rejoin.");
     }
     if (textureReload && !atlasHooked) {
-        atlasHooked = AtlasReloadedSymbol() && AtlasReloadedHook::hook() == 0;
-        if (!atlasHooked) log.warn("Textures: MinecraftGame::_onTerrainAtlasReloaded not found; chunks are rebuilt after a fixed wait.");
+        const bool common = AtlasUpdatedSymbol() && AtlasUpdatedHook::hook() == 0;
+        commonTerrainHooked = common;
+        const bool legacy = AtlasReloadedSymbol() && AtlasReloadedHook::hook() == 0;
+        atlasHooked = common || legacy;
+        log.info("Texture packs: completion hooks commonTerrain={} legacyWrapper={}", common, legacy);
+        if (!atlasHooked) log.warn("Textures: terrain completion hooks not found; chunks are rebuilt after a fixed wait.");
     }
     // In-game drawing of the HUD picture and the 3D lines (replaces the overlay window when it works).
     const bool composited = StartDrawing(true);
+    static bool notedLive = false;
+    if (!notedLive) {
+        notedLive = true;
+        // Nothing is hooked here (r42 did not patch the world render/prep/visibility callbacks: they go in when a
+        // switch is first applied in a world): only say whether this game build is identified. See EnsureLiveTextureHooks.
+        liveDrawingComposited = composited;
+        liveTextureKnown = composited && textureReload && packsChangedHooked && atlasHooked &&
+                           MyClientGame::RvaFallback(LiveInvalidSymbol) && MyClientGame::RvaFallback(LiveInGameSymbol) &&
+                           MyClientGame::RvaFallback(LiveRenderSymbol) && MyClientGame::RvaFallback(LivePrepSymbol) &&
+                           MyClientGame::RvaFallback(LiveVisibilitySymbol) && MyClientGame::RvaFallback(LoadsCompleteSymbol);
+        log.info("Texture packs: in-world apply possible={} (a switch made in a world is applied there; otherwise at the title screen)", liveTextureKnown);
+    }
     if (composited && !cameraHooked) {
-        cameraHooked = ll::memory::SymbolView{"?setupCamera@LevelRendererPlayer@@QEAAXAEAVCamera@mce@@M@Z"}.resolve(true) &&
+        cameraHooked = MyClientGame::Target("?setupCamera@LevelRendererPlayer@@QEAAXAEAVCamera@mce@@M@Z") &&
                        CameraHook::hook() == 0;
         if (!cameraHooked) log.warn("In-game drawing: LevelRendererPlayer::setupCamera not found; lines use the estimated camera.");
     }
@@ -2275,10 +3069,12 @@ bool EnableFeatures()
     std::lock_guard guard(featureMutex);
     if (!channel.Open(GetCurrentProcessId(), true)) return false;
     channel.Data()->telemetry.fullbrightAvailable = AvailabilityBits();
+    MyClientJavaChat::Enable();
     frames.Reset(); active.store(true); return true;
 }
 void DisableFeatures()
 {
+    MyClientJavaChat::Disable();
     active.store(false);
     {
         std::lock_guard guard(replayMutex);
@@ -2315,9 +3111,9 @@ void ApplyRenderDistance()
 {
     const uint32_t chunks = renderDistancePending.exchange(0);
     if (!chunks) return;
-    auto& log = ll::mod::NativeMod::current()->getLogger();
+    auto& log = MyClientLog::Get();
     try {
-        const auto client = ll::service::getClientInstance();
+        const auto client = MyClientGame::Client();
         if (!client) return;
         auto& options = client->getOptions();
         const int before = options.getViewDistanceChunks();
@@ -2334,9 +3130,9 @@ void ApplyRenderDistance()
 char LocalTeamColor()
 {
     using NameTagFn = std::string const& (*)(Actor const*);   // reference return: same ABI as `this` first
-    static const auto getNameTag = reinterpret_cast<NameTagFn>(ll::memory::SymbolView{NickSymbol}.resolve(true));
+    static const auto getNameTag = MyClientGame::ResolveFunction<NameTagFn>(NickSymbol);
     try {
-        const auto client = ll::service::getClientInstance();
+        const auto client = MyClientGame::Client();
         const Actor* local = client ? static_cast<const Actor*>(client->getLocalPlayer()) : nullptr;
         if (!local || !getNameTag) return 0;
         std::string const& tag = getNameTag(local);
@@ -2345,17 +3141,50 @@ char LocalTeamColor()
     } catch (...) { return 0; }
 }
 bool ShulkerHoverWanted() { return shulkerHoverWanted.load(); }
+bool UncapFpsWanted() { return uncapFpsWanted.load(); }
+bool TakeSkinRefresh()
+{
+    if (skinRefreshWanted.exchange(false)) return true;
+    uint64_t at = skinRefreshAt.load();
+    if (!at || GetTickCount64() < at) return false;
+    return skinRefreshAt.compare_exchange_strong(at, 0);
+}
 uint32_t FrameGenMultiplier(uint32_t field) { return MyClientFeatures::FrameGenMultiplierOf(field, frameGenWide.load()); }
+bool TextureReloadHeld() { return liveTextureBusy.load(); }
+uint64_t AvatarResourceEpoch() {
+    return (uint64_t(statPacksChanged.load()) << 32) | terrainAtlasUpdates.load();
+}
 uint32_t FrameGenField(bool& paused)
 {
     const uint32_t screens = gameScreenBits.load();
     // Only while playing: menus, loading and the title screen change the whole picture at once.
     // The HUD menu too: FocusLostHook keeps the game's pause screen away, so it no longer shows up as GameMenuOpen.
-    paused = (screens & MyClientFeatures::GameInWorld) == 0 || (screens & MyClientFeatures::GameMenuOpen) != 0 ||
-             hudMenuWanted.load();
-    return active.load() ? frameGenField.load() : 0u;
+    const bool inWorld = (screens & MyClientFeatures::GameInWorld) != 0;
+    const bool gameMenu = (screens & MyClientFeatures::GameMenuOpen) != 0;
+    const bool clientMenu = hudMenuWanted.load();
+    const bool reload = liveTextureBusy.load();
+    paused = !inWorld || gameMenu || clientMenu || reload;
+    const uint32_t field = active.load() ? frameGenField.load() : 0u;
+    if (MyClientFeatures::FrameGenMultiplierOf(field, frameGenWide.load()) >= 2) {
+        const uint32_t reason = (!inWorld ? 1u : 0u) | (gameMenu ? 2u : 0u) |
+                                (clientMenu ? 4u : 0u) | (reload ? 8u : 0u);
+        static std::atomic<uint32_t> lastReason{~0u};
+        static std::atomic<uint64_t> lastNote{0};
+        const uint64_t now = GetTickCount64();
+        uint64_t before = lastNote.load();
+        if (reason != lastReason.load() && now - before >= 1000 && lastNote.compare_exchange_strong(before, now)) {
+            lastReason.store(reason);
+            MyClientLog::Get().info("Frame Generation gate: paused={} inWorld={} gameMenu={} clientMenu={} resourceReload={}",
+                                  paused, inWorld, gameMenu, clientMenu, reload);
+        }
+    }
+    return field;
 }
-bool HitboxRequested() { return hitboxRequestedValue.load() && hitboxFilterValue.load() != 0; }
+bool HitboxRequested() {
+    const auto screens = gameScreenBits.load();
+    return hitboxRequestedValue.load() && hitboxFilterValue.load() != 0 && !hudMenuWanted.load() &&
+           !liveTextureBusy.load() && (screens & MyClientFeatures::GameInWorld) && !(screens & MyClientFeatures::GameMenuOpen);
+}
 void NoteHitboxActors(void* const* actors, const float* positions, uint32_t count)
 {
     std::lock_guard g(hitboxActorsMutex);
@@ -2367,7 +3196,11 @@ void NoteHitboxActors(void* const* actors, const float* positions, uint32_t coun
         hitboxActorPositions.push_back(Vec3{positions[i * 3], positions[i * 3 + 1], positions[i * 3 + 2]});
     }
 }
-bool OutlineWanted() { return outlineWanted.load(); }
+bool OutlineWanted() {
+    const auto screens = gameScreenBits.load();
+    return outlineWanted.load() && !hudMenuWanted.load() && !liveTextureBusy.load() &&
+           (screens & MyClientFeatures::GameInWorld) && !(screens & MyClientFeatures::GameMenuOpen);
+}
 uint32_t OutlineRgb() { return outlineRgbValue.load() & 0xFFFFFFu; }
 uint32_t HitboxFilter() { return hitboxFilterValue.load(); }
 void HitboxColors(uint32_t out[4])
@@ -2395,17 +3228,19 @@ void SampleArmor()
     if (!active.load()) return;
     MyClientFeatures::Armor armor[4]{};
     char items[4][32]{};
-    const auto client = ll::service::getClientInstance();
+    const auto client = MyClientGame::Client();
     const auto* player = client ? client->getLocalPlayer() : nullptr;
     if (!player) { ClearArmor(); return; }
     for (int i = 0; i < 4; ++i) {
-        const auto& stack = player->getArmor(static_cast<SharedTypes::Legacy::ArmorSlot>(i));
+        const ItemStack* armorStack = MyClientGame::ArmorOf(*player, i);
+        if (!armorStack) { armor[i] = MyClientFeatures::MakeArmor(false, 0, 0); continue; }
+        const auto& stack = *armorStack;
         if (!stack.mCount) armor[i] = MyClientFeatures::MakeArmor(false, 0, 0);
         else if (stack.mItem && damageValue) armor[i] = MyClientFeatures::MakeArmor(true, stack.mItem->getMaxDamage(), damageValue(&stack));
         else armor[i] = MyClientFeatures::MakeArmor(false, 0, 0);
         if (stack.mCount) {
             // Item id for the HUD's icon; "minecraft:" dropped, cut to fit (armor ids are short).
-            std::string id = stack.getTypeName();
+            std::string id = MyClientGame::TypeNameOf(stack);
             if (const auto colon = id.find(':'); colon != std::string::npos) id.erase(0, colon + 1);
             std::memcpy(items[i], id.data(), std::min<size_t>(id.size(), sizeof(items[i]) - 1));
         }
@@ -2418,4 +3253,40 @@ void SampleArmor()
     channel.Data()->telemetry.armorAt = GetTickCount64();
     channel.Unlock();
 }
+}
+
+// Title screen version text (2026-11-04 user request: OriginX instead of LeviLamina's "v26.51/LeviLamina-26.51.6").
+// LeviLamina rewrites the "#version" binding in its own ScreenController::bindString hook (Normal priority). This
+// hook runs inside it (Low priority), so it receives LeviLamina's text and replaces it once more. It goes through
+// LeviLamina's hook API like every other MyClient hook, so it follows whatever game version LeviLamina supports.
+MYCLIENT_AUTO_TYPE_INSTANCE_HOOK(
+    TitleVersionHook,
+    ll::memory::HookPriority::Low,
+    ScreenController,
+    // By name: the import library has no ScreenController::bindString (only LeviLamina's own exports).
+    ll::memory::SymbolView{"?bindString@ScreenController@@QEAAXAEBVStringHash@@V?$move_only_function@$$A8@@EBA?AV?$basic_string@"
+                           "DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ@brstd@@V?$move_only_function@$$A8@@EBA_NXZ@4@@Z"},
+    void,
+    StringHash const&                                  bindingName,
+    brstd::move_only_function<::std::string() const> callback,
+    brstd::move_only_function<bool() const>          condition
+) {
+    static const StringHash versionHash("#version");
+    if (bindingName == versionHash) {
+        origin(
+            bindingName,
+            []() -> std::string {
+                try {
+                    const auto game = ll::getGameVersion();
+                    // Same game numbers LeviLamina shows ("v26.51"), with OriginX in place of the loader.
+                    return "v" + std::to_string(game.minor) + "." + std::to_string(game.patch) + "/OriginX";
+                } catch (...) {
+                    return "OriginX";
+                }
+            },
+            []() -> bool { return true; }
+        );
+        return;
+    }
+    origin(bindingName, std::move(callback), std::move(condition));
 }

@@ -42,6 +42,7 @@ def package(sdk, output):
             raise RuntimeError("Missing upstream license: " + folder.name)
         for path in licenses:
             files[f"mods/MyClientData/licenses/{folder.name}/{path.name}"] = path
+    files["mods/MyClientData/licenses/minhook/LICENSE.txt"] = REPO / "client/vendor/minhook/LICENSE.txt"   # compiled into the DLL
     catalog = json.loads((REPO / "launcher/catalog.json").read_text())
     bundled = [release for release in catalog["versions"] if release["available"]]
     assert len(bundled) == 1 and bundled[0]["id"] == "26.51.1", "This bundle contains only the tested 26.51 adapter"

@@ -41,3 +41,10 @@ MyClientLauncher.exe embeds `gamelaunchhelper.dll`, built from the unchanged sou
 The launcher writes it into the Minecraft folder after installing a version, replacing the PC Bootstrapper.
 The fork is licensed under the GNU General Public License v3 (`LICENSE-GPL.md` in that folder); the original
 work by Aetopia is under the MIT License (`LICENSE-MIT.md`). Its source is available at the links above.
+
+## MinHook (MyClientData.dll)
+
+MyClientData.dll puts its function hooks in with **MinHook** (https://github.com/TsudaKageyu/minhook, commit
+8af6b4a), Copyright (C) 2009-2017 Tsuda Kageyu, including the Hacker Disassembler Engine 64 by Vyacheslav
+Patkov. The unchanged x64 source is vendored at `source/client/vendor/minhook` and compiled into the DLL. It is
+distributed under the BSD 2-Clause license (`LICENSE.txt` there, and `mods/MyClientData/licenses/minhook/`).

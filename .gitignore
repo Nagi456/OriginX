@@ -1,3 +1,4 @@
 source/build/
 graphify-out/
 __pycache__/
+source/worker/node_modules/

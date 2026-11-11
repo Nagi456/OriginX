@@ -80,7 +80,7 @@ SITE = Path(__file__).resolve().parents[1] / "site"
 class RealSiteTest(unittest.TestCase):
     def test_config_defaults(self):
         text = (SITE / "config.js").read_text(encoding="utf-8")
-        self.assertIn('workerUrl: ""', text)
+        self.assertIn('workerUrl: "https://originx.originx-client.workers.dev"', text)
         self.assertIn('sourceUrl: "https://github.com/Nagi456/OriginX"', text)
 
     def test_download_buttons_use_worker(self):
@@ -89,7 +89,7 @@ class RealSiteTest(unittest.TestCase):
         self.assertTrue(pages)
         for f in pages:
             for value in re.findall(r'data-href="(worker:[^"]*)"', f.read_text(encoding="utf-8")):
-                self.assertEqual(value, "worker:/login", f)
+                self.assertIn(value, ("worker:/login", "worker:/login?lang=en"), f)
 
 
 if __name__ == "__main__":

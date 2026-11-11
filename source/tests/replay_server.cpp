@@ -74,6 +74,72 @@ struct Client {
 
 int main()
 {
+    // Free camera: the packets are byte for byte what a 1.26.51 protocol encoder makes (bedrock-protocol 1.26.51,
+    // add_player with the same values), and the recorded player's PlayerList entry is found and renamed.
+    {
+        FreeCam::Player p; p.uuid = std::string(15, '\0') + "\x01"; p.name = "Recorder";
+        FreeCam::Start st; st.uniqueId = 1; st.runtimeId = 1; st.x = 1; st.y = 2; st.z = 3;
+        std::string add = FreeCam::AddRecordedPlayer(p, st);
+        add[1 + 15] = 0x01;   // compare with the UUID as given (AddRecordedPlayer changes its last byte)
+        const char* hex = "0c00000000000000000000000000000001085265636f7264657201000000803f00000040000040400000000000000000"
+                          "000000000000000000000000000000000000000000000000000000000100000000000000010000000007000000";
+        std::string want;
+        for (const char* c = hex; c[0] && c[1]; c += 2) want.push_back(static_cast<char>(std::stoi(std::string(c, 2), nullptr, 16)));
+        assert(add == want);
+        // MovePlayer since 1.26.40: a "teleport data present" byte before the tick
+        const std::string move = FreeCam::MoveRecorded(1, 0, 0, 0, 0, 0, 0, 5);
+        assert(move.size() == 1 + 1 + 24 + 1 + 1 + 1 + 1 + 1 && move[move.size() - 2] == 0 && move.back() == 5);
+        const std::string tp = MovePlayer(1, 0, 0, 0, 0, 0, 0, 5);
+        assert(tp.size() == move.size() + 8 && tp[29] == 1);
+        // a PlayerList with a removal and two players; the one with unique id -3 is found, skin and all
+        Out skin;
+        for (int i = 0; i < 3; ++i) skin.VarU64(0);                       // id, play fab id, resource patch
+        skin.U32le(2); skin.U32le(1); skin.VarU64(8); skin.Raw("12345678");  // 2x1 picture
+        skin.VarU64(1); skin.U32le(1); skin.U32le(1); skin.VarU64(4); skin.Raw("abcd"); skin.VarU64(0); skin.F32le(1); skin.VarU64(0);
+        skin.U32le(0); skin.U32le(0); skin.VarU64(0);                     // cape
+        for (int i = 0; i < 5; ++i) { skin.VarU64(1); skin.Raw("g"); }
+        skin.U8(1); skin.U32le(0);
+        skin.VarU64(1); skin.VarU64(2); skin.Raw("id"); skin.U32le(3); skin.Raw(std::string(16, 'u')); skin.U8(0); skin.VarU64(0);
+        skin.VarU64(1); skin.VarU64(4); skin.Raw("body"); for (int k = 0; k < 4; ++k) skin.U32le(k);
+        for (int i = 0; i < 5; ++i) skin.U8(0);
+        skin.VarU64(4); skin.Raw("true"); skin.VarU64(0);
+        auto entry = [&](char tag, int64_t uid, const std::string& name) {
+            Out e; e.VarU64(1); e.U8(0); e.Raw(std::string(16, tag)); e.VarU64(FreeCam::ZigZag(uid)); e.VarU64(name.size()); e.Raw(name);
+            e.VarU64(0); e.VarU64(0); e.U32le(7); e.Raw(skin.b); e.U8(0); e.U8(0); e.U8(0); e.U32le(0xFF00FF00u); return e.b;
+        };
+        Out list; list.Raw(Header(FreeCam::PlayerList)); list.VarU64(4);
+        list.VarU64(0); list.U8(1); list.Raw(std::string(16, 'r'));        // a removal: UUID only
+        list.Raw(entry('a', 5, "Other")); const std::string mine = entry('b', -3, "Me"); list.Raw(mine); list.Raw(entry('c', 9, "Third"));
+        FreeCam::Player found;
+        assert(FreeCam::FindPlayer(list.b, -3, found) && found.name == "Me" && found.record == mine && found.uuid == std::string(16, 'b'));
+        assert(!FreeCam::FindPlayer(list.b, 4, found) || found.name == "Me");
+        const std::string again = FreeCam::ReplayedPlayerList(found);
+        FreeCam::Player renamed;
+        assert(FreeCam::FindPlayer(again, -3, renamed) && renamed.uuid != found.uuid && renamed.uuid.substr(0, 15) == found.uuid.substr(0, 15));
+        // StartGame for the viewer: own ids, spectator, the rest untouched
+        Out sg; sg.Raw(Header(Id::StartGame)); sg.VarU64(FreeCam::ZigZag(-3)); sg.VarU64(7); sg.VarU64(FreeCam::ZigZag(1)); sg.F32le(1); sg.F32le(2); sg.F32le(3); sg.F32le(0); sg.F32le(90); sg.Raw("REST");
+        FreeCam::Start before; assert(FreeCam::ReadStart(sg.b, before) && before.uniqueId == -3 && before.runtimeId == 7 && before.gameMode == 1);
+        const std::string viewer = FreeCam::ViewerStartGame(sg.b);
+        FreeCam::Start after; assert(FreeCam::ReadStart(viewer, after) && after.uniqueId == FreeCam::ViewerUniqueId &&
+                                     after.runtimeId == FreeCam::ViewerRuntimeId && after.gameMode == FreeCam::Spectator && after.y == 2);
+        assert(viewer.substr(viewer.size() - 4) == "REST");
+    }
+    // ResourcePackClientResponse status: the one-byte form before 1.26.40, the varint + name form after.
+    {
+        assert(PackResponseStatus(In(std::string("\x03\x00\x00", 3))) == PackStatus::HaveAllPacks);
+        assert(PackResponseStatus(In(std::string("\x04\x00\x00", 3))) == PackStatus::Completed);
+        Out have; have.VarU64(2); have.VarU64(19); have.Raw("downloadingfinished");
+        assert(PackResponseStatus(In(have.b)) == PackStatus::HaveAllPacks);
+        Out done; done.VarU64(3); done.VarU64(25); done.Raw("resourcepackstackfinished");
+        assert(PackResponseStatus(In(done.b)) == PackStatus::Completed);
+        Out send; send.VarU64(1); send.VarU64(11); send.Raw("downloading"); send.U16le(0);
+        assert(PackResponseStatus(In(send.b)) == PackStatus::SendPacks);
+        assert(PackResponseStatus(In(std::string())) == 0);
+        // the recorded NetworkSettings with the compression threshold raised, everything else kept
+        Out ns; ns.Raw(Header(Id::NetworkSettings)); ns.U16le(1); ns.U16le(0); ns.U8(0); ns.U8(0); ns.F32le(0.f);
+        const std::string patched = UncompressedSettings(ns.b);
+        In p(patched); p.VarU64(); assert(p.U16le() == 0xFFFF && patched.size() == ns.b.size() && patched.substr(4) == ns.b.substr(4));
+    }
     // Varints, ACK ranges and frames survive a round trip.
     {
         Out o; o.VarU64(300); o.VarU64(193);
@@ -121,7 +187,7 @@ int main()
     Client c{s, 1000, 0, 0, 0, {}, {}, {}, false};
     // Offline handshake.
     { Out o; o.U8(Msg::UnconnectedPing); o.U64be(1); PutMagic(o); o.U64be(2); c.Datagram(o.b); }
-    assert(c.messages.size() == 1 && static_cast<uint8_t>(c.messages[0][0]) == Msg::UnconnectedPong && c.messages[0].find("MyClient Replay") != std::string::npos);
+    assert(c.messages.size() == 1 && static_cast<uint8_t>(c.messages[0][0]) == Msg::UnconnectedPong && c.messages[0].find("OriginX Replay") != std::string::npos);
     { Out o; o.U8(Msg::OpenRequest1); PutMagic(o); o.U8(11); o.Raw(std::string(1300, '\0')); c.Datagram(o.b); }
     assert(static_cast<uint8_t>(c.messages.back()[0]) == Msg::OpenReply1);
     { In r(c.messages.back()); r.U8(); r.Skip(16); r.U64be(); r.U8(); assert(r.U16be() == 1300 + 1 + 16 + 1 + 28); }
@@ -138,7 +204,7 @@ int main()
     // Game handshake: settings, login (split, compressed = unreadable), packs.
     c.Send(Batch({Packet(Id::RequestNetworkSettings, std::string("\x00\x00\x03\x20", 4))}, false));
     c.Pump(1);
-    assert(s.GetState() == State::Login && c.Games().back() == settings);
+    assert(s.GetState() == State::Login && c.Games().back() == UncompressedSettings(settings));   // threshold 65535: answers come uncompressed
     std::string login = "\xfe\x00" + std::string(5000, 'L');   // zlib-compressed batch
     c.SendSplit(login, 1000);
     c.Pump(1);

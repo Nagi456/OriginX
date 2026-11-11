@@ -26,6 +26,7 @@ struct Subpack {
 struct Pack {
     std::string name;      // shown in the list (UTF-8)
     std::string uuid;      // lower-case, 36 characters
+    std::string description;   // the header's, UTF-8, colour codes removed ("" = none)
     int version[3] = {1, 0, 0};
     fs::path folder;
     std::vector<Subpack> subpacks;   // empty = the pack has none
@@ -151,6 +152,44 @@ inline std::vector<Subpack> ParseSubpacks(const std::string& manifest)
 
 // manifest.json of a resource pack. The "header" fields and the subpack list are read; a manifest without a
 // "resources" module (behaviour packs, broken files) is refused.
+// Minecraft's formatting codes (\u00a7 + one character, e.g. "\u00a7b" for aqua) removed from UTF-8 text.
+inline std::string StripFormatting(const std::string& text)
+{
+    std::string out;
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (static_cast<unsigned char>(text[i]) == 0xC2 && i + 1 < text.size() && static_cast<unsigned char>(text[i + 1]) == 0xA7) {
+            i += 2;   // skip the code's character too (always ASCII)
+            continue;
+        }
+        out += text[i];
+    }
+    return out;
+}
+
+// The text of the {...} object after "header" (strings skipped while matching braces), "" if there is none.
+inline std::string HeaderObject(const std::string& text)
+{
+    const size_t header = text.find("\"header\"");
+    if (header == std::string::npos) return {};
+    const size_t open = text.find('{', header);
+    if (open == std::string::npos) return {};
+    int depth = 0;
+    bool inString = false, escaped = false;
+    for (size_t i = open; i < text.size(); ++i) {
+        const char c = text[i];
+        if (inString) {
+            if (escaped) escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == '"') inString = false;
+            continue;
+        }
+        if (c == '"') inString = true;
+        else if (c == '{') ++depth;
+        else if (c == '}' && --depth == 0) return text.substr(open, i - open + 1);
+    }
+    return {};
+}
+
 inline bool ParseManifest(const std::string& text, Pack& out)
 {
     const size_t header = text.find("\"header\"");
@@ -168,7 +207,15 @@ inline bool ParseManifest(const std::string& text, Pack& out)
     if (!ValidUuid(uuid)) return false;
     out.uuid = uuid;
     out.name.clear();
-    if (std::regex_search(tail, match, nameRe)) out.name = DecodeJsonString(match[1].str());
+    if (std::regex_search(tail, match, nameRe)) out.name = StripFormatting(DecodeJsonString(match[1].str()));
+    out.description.clear();
+    static const std::regex descriptionRe("\"description\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+    const std::string headerText = HeaderObject(text);
+    if (std::regex_search(headerText, match, descriptionRe)) {
+        out.description = StripFormatting(DecodeJsonString(match[1].str()));
+        if (out.description.rfind("pack.", 0) == 0 && out.description.find(' ') == std::string::npos)
+            out.description.clear();   // a translation key, not a text
+    }
     out.version[0] = 1; out.version[1] = 0; out.version[2] = 0;
     if (std::regex_search(tail, match, versionRe)) {
         for (int i = 0; i < 3; ++i) {

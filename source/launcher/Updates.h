@@ -5,7 +5,10 @@
 #include <regex>
 
 namespace MyClientLauncher {
-inline constexpr const char* CatalogUrl = "https://github.com/Nagi456/MyClient/releases/download/client-catalog/catalog.json";
+// The update list and the files it names are public downloads from OriginX's R2 (the Worker's /dl/stable/).
+inline constexpr const char* PublicDownloads = "https://originx.originx-client.workers.dev/dl/stable/";
+inline constexpr const char* CatalogUrl = "https://originx.originx-client.workers.dev/dl/stable/catalog.json";
+inline constexpr const char* HudFile = "hud/MyClient.exe";
 using HashFile = std::function<std::string(const fs::path&)>;
 using DownloadFile = std::function<void(const std::string&, const fs::path&, uint64_t)>;
 struct Release {
@@ -23,15 +26,17 @@ inline bool IsDigest(const std::string& s)
 }
 inline bool ReleaseUrl(const std::string& url)
 {
-    const std::string prefix = "https://github.com/Nagi456/MyClient/releases/download/";
-    return url.size() > prefix.size() && url.compare(0, prefix.size(), prefix) == 0 &&
-        url.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._/", prefix.size()) == std::string::npos &&
-        url.find("..", prefix.size()) == std::string::npos;
+    for (const std::string prefix : {"https://github.com/Nagi456/MyClient/releases/download/", PublicDownloads})
+        if (url.size() > prefix.size() && url.compare(0, prefix.size(), prefix) == 0 &&
+            url.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._/", prefix.size()) == std::string::npos &&
+            url.find("..", prefix.size()) == std::string::npos)
+            return true;
+    return false;
 }
 inline bool PackagePath(const std::string& name)
 {
     if (name == "runtime.lock.json" || name == "mods/MyClientData/MyClientData.dll" ||
-        name == "mods/MyClientData/manifest.json" || name == "mods/MyClientData/THIRD_PARTY_NOTICES.md") return true;
+        name == "mods/MyClientData/manifest.json" || name == "mods/MyClientData/THIRD_PARTY_NOTICES.md" || name == HudFile) return true;
     const std::string prefix = "mods/MyClientData/licenses/";
     if (name.compare(0, prefix.size(), prefix) != 0) return false;
     // License files only; do not let an update introduce a second loadable DLL.
@@ -62,7 +67,10 @@ inline Target ParseTarget(const Json& item)
     target.loader = item.value("loader", "");
     return target;
 }
-inline Catalog ParseCatalog(const Json& doc)
+// urlOk decides which file URLs a catalog may name: the public release downloads (the default), or, for a release
+// channel's catalog the Worker answered after a role check, the signed file links (Channels.h SignedFileUrl).
+using UrlCheck = std::function<bool(const std::string&)>;
+inline Catalog ParseCatalog(const Json& doc, const UrlCheck& urlOk = [](const std::string& url) { return ReleaseUrl(url); })
 {
     if (doc.at("schemaVersion") != 1 || !doc.at("versions").is_array() || doc.at("versions").size() > 128)
         throw std::runtime_error("このランチャーでは更新一覧を読み込めません。");
@@ -78,27 +86,34 @@ inline Catalog ParseCatalog(const Json& doc)
         release.available = item.at("available").get<bool>();
         if (release.available)
         {
-            if (item.at("launcherApi") != 1 || item.at("bridgeAbi") != 2 || item.at("platform") != "gdk-release-x64")
+            // launcherApi 1 = a LeviLamina mod (loader = its version); 2 = runs without LeviLamina (loader "standalone",
+            // no runtime.lock.json). Launchers before build 27 know only 1 and show "a newer launcher is needed" for 2.
+            const bool standalone = item.at("launcherApi") == 2;
+            if ((item.at("launcherApi") != 1 && !standalone) || item.at("bridgeAbi") != 2 || item.at("platform") != "gdk-release-x64")
             {
                 release.available = false;
                 release.reason = "新しいランチャーが必要です。使い方をご確認ください。";
             }
             else
             {
-                if (!std::regex_match(release.target.loader, std::regex("[0-9]+\\.[0-9]+\\.[0-9]+")))
+                if (standalone ? release.target.loader != "standalone"
+                               : !std::regex_match(release.target.loader, std::regex("[0-9]+\\.[0-9]+\\.[0-9]+")))
                     throw std::runtime_error("ローダー版が不正です。");
+                release.target.standalone = standalone;
                 release.revision = PositiveNumber(item.at("revision"));
                 release.files = item.at("files");
                 if (!release.files.is_object() || release.files.size() > 128) throw std::runtime_error("更新ファイル一覧が不正です。");
                 for (const char* required : {"runtime.lock.json", "mods/MyClientData/MyClientData.dll", "mods/MyClientData/manifest.json"})
-                    if (!release.files.contains(required)) throw std::runtime_error("更新ファイルが不足しています。");
+                    if (!release.files.contains(required) && !(standalone && std::string(required) == "runtime.lock.json"))
+                        throw std::runtime_error("更新ファイルが不足しています。");
+                if (standalone && release.files.contains("runtime.lock.json")) throw std::runtime_error("更新ファイル一覧が不正です。");
                 uint64_t total = 0;
                 std::set<std::string> names;
                 for (const auto& file : release.files.items())
                 {
                     const auto size = PositiveNumber(file.value().at("bytes"));
                     if (!PackagePath(file.key()) || !names.insert(Lower(file.key())).second ||
-                        !IsDigest(file.value().at("sha256")) || !ReleaseUrl(file.value().at("url")) || size > 128 * 1024 * 1024)
+                        !IsDigest(file.value().at("sha256")) || !urlOk(file.value().at("url")) || size > 128 * 1024 * 1024)
                         throw std::runtime_error("更新ファイルの配布情報が不正です。");
                     total += size;
                 }
@@ -133,9 +148,20 @@ inline void VerifyPackage(const fs::path& root, const Release& release, const Ha
             throw std::runtime_error("更新ファイルの検査に失敗しました: " + file.key());
     }
     RequireMod(root / "mods/MyClientData", release.target);
-    const auto lock = ReadJson(root / "runtime.lock.json");
-    if (lock.at("schemaVersion") != 1 || lock.at("gameVersion") != release.target.runtimeGame || lock.at("loaderVersion") != release.target.loader)
-        throw std::runtime_error("DLLとローダーの対応版が一致しません。");
+    if (release.files.contains(HudFile)) RequireX64Pe(root / HudFile);
+    if (release.target.standalone)
+    {
+        // No loader, so no lock to compare: the DLL itself must not need LeviLamina (it checks the game build when it starts).
+        const auto imports = ImportedDlls(root / "mods/MyClientData/MyClientData.dll");
+        if (imports.count("levilamina.dll") || imports.count("preloader.dll"))
+            throw std::runtime_error("単独版のはずのDLLがLeviLaminaを必要としています。");
+    }
+    else
+    {
+        const auto lock = ReadJson(root / "runtime.lock.json");
+        if (lock.at("schemaVersion") != 1 || lock.at("gameVersion") != release.target.runtimeGame || lock.at("loaderVersion") != release.target.loader)
+            throw std::runtime_error("DLLとローダーの対応版が一致しません。");
+    }
     // Extra code must never hitchhike into the mod installation from a cache.
     for (const auto& entry : fs::recursive_directory_iterator(root))
         if (entry.is_regular_file() && !release.files.contains(entry.path().lexically_relative(root).generic_u8string()))
@@ -191,5 +217,40 @@ inline fs::path AcquirePackage(const fs::path& cache, const Release& release,
     }
     catch (...) { std::error_code ignored; fs::remove_all(stage, ignored); throw; }
     return destination;
+}
+// Which MyClient.exe (the HUD) to run. A downloaded package brings the HUD built with its DLL: it is copied to
+// `managed` (%LOCALAPPDATA%\MyClient\hud), a folder that stays the same across updates because the HUD keeps
+// its settings (myclient_config.txt) next to itself; settings of a HUD that sat beside the launcher are copied
+// there once. Files shipped beside the launcher (`local`: the bundled list, or no HUD in the package) keep
+// using the HUD beside it; with none there, the last downloaded one.
+inline fs::path PlaceHud(const fs::path& package, const fs::path& managed, const fs::path& bundle, bool local, const HashFile& hash)
+{
+    const auto downloaded = package.empty() ? fs::path{} : package / HudFile;
+    const auto placed = managed / "MyClient.exe";
+    if (!local && !downloaded.empty() && fs::is_regular_file(downloaded))
+    {
+        fs::create_directories(managed);
+        if (!fs::is_regular_file(placed) || hash(placed) != hash(downloaded))
+        {
+            const auto stage = managed / "MyClient.exe.new";
+            std::error_code ec;
+            fs::copy_file(downloaded, stage, fs::copy_options::overwrite_existing, ec);
+            if (!ec) fs::rename(stage, placed, ec);
+            if (ec)
+            {
+                fs::remove(stage, ec);
+                throw std::runtime_error("HUD（MyClient.exe）を更新できません。起動中の MyClient.exe を終了してからもう一度お試しください。");
+            }
+        }
+        if (!fs::exists(managed / "myclient_config.txt") && fs::is_regular_file(bundle / "myclient_config.txt"))
+        {
+            std::error_code ignored;
+            fs::copy_file(bundle / "myclient_config.txt", managed / "myclient_config.txt", ignored);
+        }
+        return placed;
+    }
+    if (fs::is_regular_file(bundle / "MyClient.exe")) return bundle / "MyClient.exe";
+    if (fs::is_regular_file(placed)) return placed;
+    throw std::runtime_error("HUD（MyClient.exe）が見つかりません。Settings の「更新を確認」を押してから起動してください。");
 }
 }

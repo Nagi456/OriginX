@@ -1,0 +1,29 @@
+# 検証済みのテスト版（test/）を先行版（early/）へ移します。作り直さず、R2 の中で同じファイルをそのままコピーします。
+# 使い方: Actionsタブ →「promote-build」→「Run workflow」→ tag に移したい版の名前（例: myclient-26.51.1-r54-test1）。
+# Worker が test/<tag>/entry.json の各ファイルの SHA256 を確かめ、全部一致したらコピーし、early/catalog.json を最後に書きます。
+# 以前の tag で実行し直すと、先行版がその版に戻ります。認証は GitHub Actions の OIDC（このワークフロー名 promote-* だけが許可されます）。
+name: promote-build
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The verified test build to move to the early channel (e.g. myclient-26.51.1-r54-test1)"
+        required: true
+permissions:
+  contents: read
+  id-token: write   # the OIDC token that lets publish_r2.py promote
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: source
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Promote the test build to early/
+        run: python tools/publish_r2.py promote "$TAG"

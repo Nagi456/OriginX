@@ -164,6 +164,47 @@ struct VersionRow {
     size_t catalogIndex = 0;
 };
 
+inline bool ClientVersionVisible(const std::string& id)
+{
+    return id.rfind("26.", 0) == 0 && CompareVersionIds(id, "26.45.0") >= 0;
+}
+
+inline bool ClientVersionSelectable(const std::string& id, bool supported)
+{
+    return supported && ClientVersionVisible(id);
+}
+
+inline std::vector<VersionRow> ClientVersionRows(std::vector<VersionRow> rows)
+{
+    rows.erase(std::remove_if(rows.begin(), rows.end(), [](const VersionRow& row) {
+        return !ClientVersionVisible(row.id);
+    }), rows.end());
+    return rows;
+}
+
+// Canonical 26.x ids belong to the displayed 1.26 family; older ids already start with 1.
+inline std::string VersionFamily(const std::string& id)
+{
+    const auto dot = id.find('.');
+    if (dot == std::string::npos) return id;
+    if (id.substr(0, dot) != "1") return "1." + id.substr(0, dot);
+    return id.substr(0, id.find('.', dot + 1));
+}
+
+struct VersionFamilyRows { std::string label; std::vector<VersionRow> rows; };
+inline std::vector<VersionFamilyRows> GroupVersionRows(const std::vector<VersionRow>& rows)
+{
+    std::vector<VersionFamilyRows> groups;
+    for (const auto& row : rows)
+    {
+        const auto label = VersionFamily(row.id);
+        auto group = std::find_if(groups.begin(), groups.end(), [&](const VersionFamilyRows& g) { return g.label == label; });
+        if (group == groups.end()) groups.push_back({label, {row}});
+        else group->rows.push_back(row);
+    }
+    return groups;
+}
+
 // Every version from the three sources once, newest first.
 inline std::vector<VersionRow> VersionRows(const std::vector<std::string>& published, const std::vector<CatalogEntry>& catalog,
                                            const std::vector<std::string>& installed,

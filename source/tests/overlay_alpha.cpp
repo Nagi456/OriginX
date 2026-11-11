@@ -56,6 +56,18 @@ int main()
         assert(partial > 0);
     }
     {
+        // Corner shapes: top left cut at 45 degrees, top right square, the bottom ones round.
+        const Glass g{0, 0, 20, 20, 6, 0x00101010, 200, Corners(Cut, Square, Round, Round)};
+        assert(GlassCoverage(g, 0, 0) == 0 && GlassCoverage(g, 1, 1) == 0);    // cut away
+        assert(GlassCoverage(g, 5, 5) == 255);                                  // inside the cut line
+        const uint32_t onLine = GlassCoverage(g, 3, 2);                         // the cut runs through it
+        assert(onLine > 64 && onLine < 192);
+        assert(GlassCoverage(g, 19, 0) == 255);                                 // square corner
+        assert(GlassCoverage(g, 0, 19) == 0 && GlassCoverage(g, 19, 19) == 0);  // round corners
+        const Glass round{0, 0, 20, 20, 6, 0x00101010, 200};                    // default: all round
+        assert(round.corners == AllRound && GlassCoverage(round, 19, 0) == 0);
+    }
+    {
         // Dark text on a light translucent box: core solid, an edge pixel half ink / half box gets
         // half coverage over the box, a pixel of another colour (an icon) stays solid.
         const uint32_t box = 0xDEE3ECu, inkC = 0x222634u;

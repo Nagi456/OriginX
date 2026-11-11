@@ -1,9 +1,15 @@
 #include "Profile.h"
+#include "OwnHook.h"
+#include "GameState.h"
+#include "GameAccess.h"
+#include "Log.h"
 #include "PartyAdapter.h"
 #include "PartyChannel.h"
 #include "FeatureAdapter.h"
 #include "AutoRq.h"
+#include "ChatChannel.h"
 #include "mc/client/player/LocalPlayer.h"
+#include "GameSymbols.h"
 #include "ll/api/memory/Hook.h"
 #include "ll/api/service/Bedrock.h"
 #include "ll/api/mod/NativeMod.h"
@@ -24,6 +30,7 @@ namespace {
 std::atomic<bool> active{false};
 std::mutex mutex;
 MyClientParty::Channel channel;
+MyClientChat::Channel chatChannel;   // Command Hotkeys (HUD -> DLL)
 MyClientParty::Gate gate;
 bool hooked = false;
 using PacketFactory = std::shared_ptr<Packet> (*)(MinecraftPacketIds);
@@ -85,7 +92,7 @@ void NoteSkipped(unsigned type, bool localized, bool authored, const std::string
     const auto now = GetTickCount64();
     if (lastUnknownLog && now - lastUnknownLog < 30000) return;
     lastUnknownLog = now;
-    ll::mod::NativeMod::current()->getLogger().warn(
+    MyClientLog::Get().warn(
         "A party-related message was not read as an invite (packet type {}, localized {}, from a player {}). Chat contents are not logged.",
         type, localized, authored);
 }
@@ -101,12 +108,12 @@ std::atomic<uint64_t> partyOutAt{0};   // last "All members of your party are no
 void NoteElimination(const std::string& message) {
     if (MyClientAutoRq::PartyAllSpectating(message)) {
         partyOutAt.store(GetTickCount64());
-        ll::mod::NativeMod::current()->getLogger().info("Auto RQ: your whole party is spectating");
+        MyClientLog::Get().info("Auto RQ: your whole party is spectating");
         return;
     }
     if (MyClientAutoRq::GameOver(message)) {
         gameOverAt.store(GetTickCount64());
-        ll::mod::NativeMod::current()->getLogger().info("Auto RQ: game over (\"{}\")", MyClientAutoRq::Decode(message).text);
+        MyClientLog::Get().info("Auto RQ: game over (\"{}\")", MyClientAutoRq::Decode(message).text);
         return;
     }
     const auto e = MyClientAutoRq::TeamEliminated(message);
@@ -114,7 +121,7 @@ void NoteElimination(const std::string& message) {
     eliminatedColor.store(e.color);
     eliminatedAt.store(GetTickCount64());
     const char own = ownTeamColor.load();
-    ll::mod::NativeMod::current()->getLogger().info(
+    MyClientLog::Get().info(
         "Auto RQ: \"{}\" (team colour {}, your colour {}{})", e.text,
         e.color ? std::string(1, e.color) : std::string("none"), own ? std::string(1, own) : std::string("unknown"),
         e.color && e.color == own ? ", your team" : "");
@@ -161,14 +168,14 @@ void Receive(IClientInstance& client, TextPacket const& packet) {
         state = MyClientParty::Status::UnknownFormat;
         if (!lastUnknownLog || now - lastUnknownLog >= 30000) {
             lastUnknownLog = now;
-            ll::mod::NativeMod::current()->getLogger().warn("Hive party message format not recognized ({} bytes); ignored. Chat contents are not logged.", clean.size());
+            MyClientLog::Get().warn("Hive party message format not recognized ({} bytes); ignored. Chat contents are not logged.", clean.size());
         }
         Publish();
     }
 }
 // Pinned SDK virtual handle signature; symbol resolution is checked on enable.
-LL_TYPE_INSTANCE_HOOK(TextHook, ll::memory::HookPriority::Normal, ClientNetworkHandler,
-    ll::memory::SymbolView{"?handle@ClientNetworkHandler@@UEAAXAEBVNetworkIdentifier@@AEBVTextPacket@@@Z"},
+MYCLIENT_TYPE_INSTANCE_HOOK(TextHook, ll::memory::HookPriority::Normal, ClientNetworkHandler,
+    MyClientGame::Target("?handle@ClientNetworkHandler@@UEAAXAEBVNetworkIdentifier@@AEBVTextPacket@@@Z"),
     void, NetworkIdentifier const& source, TextPacket const& packet)
 {
     origin(source, packet);
@@ -192,7 +199,7 @@ bool CurrentServer(std::string& host, uint32_t& port, uint32_t& transport)
 {
     // A snapshot can only be released through the game destructor resolved by EnableParty().
     if (!destroyConnection) return false;
-    const auto client = ll::service::getClientInstance();
+    const auto client = MyClientGame::Client();
     if (!client) return false;
     ConnectionSnapshot snapshot(*client);
     const auto& connection = snapshot.Get();
@@ -205,13 +212,13 @@ bool CurrentServer(std::string& host, uint32_t& port, uint32_t& transport)
 }
 
 bool EnableParty() {
-    if (!createPacket) createPacket = reinterpret_cast<PacketFactory>(ll::memory::SymbolView{
-        "?createPacket@MinecraftPackets@@SA?AV?$shared_ptr@VPacket@@@std@@W4MinecraftPacketIds@@@Z"}.resolve());
-    if (!destroyConnection) destroyConnection = reinterpret_cast<ConnectionDtor>(ll::memory::SymbolView{
-        "??1GameConnectionInfo@Social@@QEAA@XZ"}.resolve());
+    if (!createPacket) createPacket = MyClientGame::ResolveFunction<PacketFactory>("?createPacket@MinecraftPackets@@SA?AV?$shared_ptr@VPacket@@@std@@W4MinecraftPacketIds@@@Z");
+    if (!destroyConnection) destroyConnection = MyClientGame::ResolveFunction<ConnectionDtor>("??1GameConnectionInfo@Social@@QEAA@XZ");
     if (!createPacket || !destroyConnection) return false;
     (void)TextHook::_AutoHookCount;
     if (!hooked) { if (TextHook::hook() != 0) return false; hooked = true; }
+    if (!chatChannel.IsOpen() && !chatChannel.Open(GetCurrentProcessId(), true))
+        MyClientLog::Get().warn("Command Hotkeys unavailable: shared memory could not be created (Windows error {}).", GetLastError());
     std::lock_guard guard(mutex);
     if (!channel.Open(GetCurrentProcessId(), true)) return false;
     pending.reset(); gate.Reset(); currentHost.clear(); sent = 0;
@@ -227,6 +234,56 @@ void ClearParty() {
 void DisableParty() {
     active.store(false); ClearParty();
     std::lock_guard guard(mutex); channel.Close();
+    chatChannel.Close();
+}
+// Command Hotkeys: the HUD's line for the chat. '/...' goes to the server as a command (like Auto RQ),
+// anything else as a chat message from the local player. Game thread, once per tick.
+void TickChatHotkeys() {
+    const DWORD pid = GetCurrentProcessId();
+    std::string line;
+    uint32_t serial = 0;
+    if (!chatChannel.TakePending(pid, line, serial)) return;
+    MyClientChat::Result result = MyClientChat::Result::Failed;
+    line = MyClientChat::Clean(line);
+    try {
+        const auto client = MyClientGame::Client();
+        auto* local = client ? client->getLocalPlayer() : nullptr;
+        if (line.empty()) result = MyClientChat::Result::Empty;
+        else if (!client || !local || !createPacket || !client->getPacketSender().isInitialized()) result = MyClientChat::Result::NoPlayer;
+        else if (MyClientChat::IsCommand(line)) {
+            auto packet = createPacket(MinecraftPacketIds::CommandRequest);
+            if (packet) {
+                auto& command = static_cast<CommandRequestPacket&>(*packet);
+                command.mCommand = line;
+                command.mOrigin->mType = CommandOriginType::Player;
+                command.mOrigin->mUUID = MyClientGame::RandomUuid();
+                command.mOrigin->mRequestId = std::string{};
+                command.mOrigin->mPlayerId = 0;
+                command.mVersion = CurrentCmdVersion::Latest;
+                command.mInternalSource = false;
+                client->getPacketSender().sendToServer(command);
+                result = MyClientChat::Result::Sent;
+            }
+        } else {
+            auto packet = createPacket(MinecraftPacketIds::Text);
+            if (packet) {
+                auto& text = static_cast<TextPacket&>(*packet);
+                text.mLocalize = false;
+                text.mXuid->assign(local->getXuid());
+                text.mPlatformId->clear();
+                text.mFilteredMessage->reset();
+                // emplace: constructs in place (AuthorAndMessage's move assignment is a game export).
+                text.mBody->emplace<TextPacketPayload::AuthorAndMessage>(TextPacketType::Chat, local->mName.get(), line);
+                client->getPacketSender().sendToServer(text);
+                result = MyClientChat::Result::Sent;
+            }
+        }
+    } catch (...) { result = MyClientChat::Result::Failed; }
+    chatChannel.Finish(pid, serial, result);
+    MyClientLog::Get().info("Command Hotkeys: {} \"{}\" ({})",
+        MyClientChat::IsCommand(line) ? "command" : "chat", line,
+        result == MyClientChat::Result::Sent ? "sent" : result == MyClientChat::Result::NoPlayer ? "not in a world" :
+        result == MyClientChat::Result::Empty ? "empty" : "failed");
 }
 // Auto RQ. Solo modes: the local player went from alive to dead/spectator on Hive -> send "/q <MODE>" once.
 // Team modes (Duos, Squads, Mega, Duels 2v2): ignore your own death and wait for Hive's
@@ -236,7 +293,7 @@ void TickAutoRq() {
     static IClientInstance* lastClient = nullptr;
     static uint64_t teamHandled = 0, gameOverHandled = 0, partyOutHandled = 0, lastFiredAt = 0;
     try {
-        const auto client = ll::service::getClientInstance();
+        const auto client = MyClientGame::Client();
         auto* player = client ? client->getLocalPlayer() : nullptr;
         if (!player || !createPacket) { rqGate.Reset(); lastClient = nullptr; return; }
         const uint32_t mode = MyClientGame::AutoRqMode();
@@ -245,8 +302,7 @@ void TickAutoRq() {
         const auto now = GetTickCount64();
         // Actor::isSpectator is not exported by LeviLamina; resolve it like createPacket (absent -> alive check only).
         using SpectatorFn = bool (*)(const Actor*);
-        static const auto isSpectator = reinterpret_cast<SpectatorFn>(
-            ll::memory::SymbolView{"?isSpectator@Actor@@QEBA_NXZ"}.resolve());
+        static const auto isSpectator = MyClientGame::ResolveFunction<SpectatorFn>(MyClientGame::Symbols::IsSpectator);
         const bool dead = !player->isAlive() || (isSpectator && isSpectator(player));
         // The game ended (also when you won): queue the next one in every mode, once per message.
         const uint64_t over = gameOverAt.load();
@@ -265,7 +321,7 @@ void TickAutoRq() {
                 const char color = MyClientGame::LocalTeamColor();
                 if (color && color != ownTeamColor.load()) {
                     ownTeamColor.store(color);
-                    ll::mod::NativeMod::current()->getLogger().info("Auto RQ: your team colour is {}", std::string(1, color));
+                    MyClientLog::Get().info("Auto RQ: your team colour is {}", std::string(1, color));
                 }
             }
             const uint64_t at = eliminatedAt.load();
@@ -287,18 +343,18 @@ void TickAutoRq() {
         const std::string text = MyClientAutoRq::Command(mode);
         command.mCommand = text;
         command.mOrigin->mType = CommandOriginType::Player;
-        command.mOrigin->mUUID = mce::UUID::random();
+        command.mOrigin->mUUID = MyClientGame::RandomUuid();
         command.mOrigin->mRequestId = std::string{};
         command.mOrigin->mPlayerId = 0;
         command.mVersion = CurrentCmdVersion::Latest;
         command.mInternalSource = false;
         client->getPacketSender().sendToServer(command);
-        ll::mod::NativeMod::current()->getLogger().info("Auto RQ: sent {}", text);
+        MyClientLog::Get().info("Auto RQ: sent {}", text);
     } catch (...) {}
 }
 void TickParty() {
     if (!active.load()) return;
-    const auto client = ll::service::getClientInstance();
+    const auto client = MyClientGame::Client();
     const auto host = client && client->getLocalPlayer() ? Hive(*client) : std::string{};
     std::optional<Pending> request;
     {
@@ -333,7 +389,7 @@ void TickParty() {
                 auto& command = static_cast<CommandRequestPacket&>(*packet);
                 command.mCommand = MyClientParty::AcceptCommand(request->tag);
                 command.mOrigin->mType = CommandOriginType::Player;
-                command.mOrigin->mUUID = mce::UUID::random();
+                command.mOrigin->mUUID = MyClientGame::RandomUuid();
                 command.mOrigin->mRequestId = std::string{};
                 command.mOrigin->mPlayerId = 0;
                 command.mVersion = CurrentCmdVersion::Latest;

@@ -1,5 +1,6 @@
 #include "FrameGenPacing.h"
 #include "FeatureData.h"
+#include "PresentPolicy.h"
 #include <cassert>
 #include <cstddef>
 #include <cmath>
@@ -7,6 +8,12 @@
 using namespace MyClientFrameGen;
 using namespace MyClientFeatures;
 int main() {
+    // Native V-Sync OFF remains uncapped when Optimization/FG are OFF. V-Sync ON and
+    // unsupported/exclusive swap chains must never receive ALLOW_TEARING.
+    assert(MyClientPresentation::AllowNativeTearing(0, true));
+    assert(!MyClientPresentation::AllowNativeTearing(1, true));
+    assert(!MyClientPresentation::AllowNativeTearing(2, true));
+    assert(!MyClientPresentation::AllowNativeTearing(0, false));
     // Bits 27..31 of command.autoRq, next to the other autoRq fields.
     assert(EncodeFrameGen(1, FrameGenMotion, true) == 0 && FrameGenMultiplierOf(0) == 1 && FrameGenPacingOf(0));
     assert(FrameGenMultiplierOf(EncodeFrameGen(2, FrameGenMotion, true)) == 2);
@@ -119,5 +126,20 @@ int main() {
 
     assert(FramePhase(1, 2) == 0.5f && std::abs(FramePhase(2, 3) - 2.f / 3) < 1e-6 && FramePhase(0, 2) == 1.f && FramePhase(1, 1) == 1.f);
     static_assert(offsetof(Shared, presentedFps) == 768 && offsetof(Shared, frameGen) == 772);
+    // The ~2026-10-28 numbers: 4.3 ms game frames, 1.25 ms per made-up frame, 0.8 ms for the real one: only two
+    // made-up frames fit, so x3..x10 all give x3 at most (what the HUD now shows next to the multiplier).
+    {
+        Cost cost; cost.made = 1.25; cost.real = 0.8; cost.madeAt = 100;
+        assert(FitCount(9, 4.3, cost, 200) == 2 && FitCount(1, 4.3, cost, 200) == 1 && FitCount(9, 0, cost, 200) == 9);
+        assert(FitCount(9, 4.3, cost, 100 + MyClientFrameGen::StaleMs + 1) == 9);   // stale: not known
+        Cost none; assert(FitCount(4, 4.3, none, 0) == 4);
+    }
+    // Shared.frameGen: the state stays in the low byte (FrameGenStateOf), the reach above it.
+    {
+        const uint32_t field = EncodeFrameGenStatus(FrameGenRunning, 3, 3);
+        assert(FrameGenStateOf(field) == FrameGenRunning && FrameGenShownOf(field) == 3 && FrameGenFitsOf(field) == 3);
+        assert(EncodeFrameGenStatus(FrameGenPaused, 0, 0) == FrameGenPaused && FrameGenShownOf(FrameGenUnavailable) == 0);
+        assert(FrameGenShownOf(EncodeFrameGenStatus(FrameGenRunning, 999, 1)) == 255 && FrameGenFitsOf(EncodeFrameGenStatus(FrameGenRunning, 999, 1)) == 1);
+    }
     std::cout << "framegen tests passed\n";
 }

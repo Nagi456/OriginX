@@ -1,0 +1,2100 @@
+{
+ "about": "OriginX sigs: MyClientData.dll が使う全ゲーム関数とゲームの版で変わる数値。編集したら python tools/make_sigs.py（ビルドも自動で実行）。手順は docs/version-update.md",
+ "supported": [
+  {
+   "version": "1.26.51.1",
+   "timestamp": "0x6AA482FD",
+   "imageSize": "0x12C0C000"
+  },
+  {
+   "version": "1.26.60.5",
+   "timestamp": "0x6AD79EE4",
+   "imageSize": "0x13846000"
+  }
+ ],
+ "signatures": [
+  {
+   "name": "PlayerUpdateSkinHook",
+   "purpose": "Player::updateSkin。自分のスキンの更新を捕まえる",
+   "breaks": "Closet のスキン反映",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?updateSkin@Player@@QEAAXAEBVSerializedSkinRef@@H@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x210140",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 48 01 00 00 48 8D AC 24 80 00 00 00 0F 29 B5 B0 00 00 00 48 C7 85 A8 00 00 00 FE FF FF FF 44 89 C3",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 48"
+    },
+    "1.26.60.5": {
+     "rva": "0x2E83C0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC F8 00 00 00 48 8D AC 24 80 00 00 00 0F 29 75 60 48 C7 45 58 FE FF FF FF 44 89 C3",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC F8"
+    }
+   }
+  },
+  {
+   "name": "MouseFeedHook",
+   "purpose": "MouseDevice::feed。HUD メニュー中にカメラを止める",
+   "breaks": "メニュー中の視点固定",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?feed@MouseDevice@@QEAAXDCFFFF_N@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x361AD0",
+     "pattern": "41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 48 44 89 CF 44 89 C3 89 D5 48 89 CE 44 0F B7 A4 24 C0 00 00 00",
+     "unique": true,
+     "check": "41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 48"
+    },
+    "1.26.60.5": {
+     "rva": "0x427650",
+     "pattern": "41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 48 44 89 CF 44 89 C3 89 D5 48 89 CE 44 0F B7 A4 24 C0 00 00 00",
+     "unique": true,
+     "check": "41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 48"
+    }
+   }
+  },
+  {
+   "name": "ReplaySendHook",
+   "purpose": "BatchedNetworkPeer::sendPacket。送信パケットの録画",
+   "breaks": "リプレイ録画（自分の動き）",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?sendPacket@BatchedNetworkPeer@@UEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@W4Reliability@NetworkPeer@@W4Compressibility@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x46EB60",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC 78 48 8D 6C 24 70 48 C7 45 00 FE FF FF FF 44 89 CB 48 89 D7",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC 78"
+    },
+    "1.26.60.5": {
+     "rva": "0x4BF1D0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC 78 48 8D 6C 24 70 48 C7 45 00 FE FF FF FF 44 89 CB 48 89 D7",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC 78"
+    }
+   }
+  },
+  {
+   "name": "ReplayReceiveHook",
+   "purpose": "BatchedNetworkPeer::_receivePacket。受信パケットの録画",
+   "breaks": "リプレイ録画",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?_receivePacket@BatchedNetworkPeer@@UEAA?AW4DataStatus@NetworkPeer@@AEAV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@AEBV?$shared_ptr@V?$time_point@Usteady_clock@chrono@std@@V?$duration@_JU?$ratio@$00$0DLJKMKAA@@std@@@23@@chrono@std@@@5@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x46ED40",
+     "pattern": "41 56 56 57 53 48 81 EC A8 00 00 00 48 89 D7 48 89 CE 48 8B 91 C0 00 00 00",
+     "unique": true,
+     "check": "41 56 56 57 53 48 81 EC A8 00 00 00 48 89 D7 48"
+    },
+    "1.26.60.5": {
+     "rva": "0x4BF3B0",
+     "pattern": "41 56 56 57 53 48 81 EC A8 00 00 00 48 89 D7 48 89 CE 48 8B 81 C0 00 00 00",
+     "unique": true,
+     "check": "41 56 56 57 53 48 81 EC A8 00 00 00 48 89 D7 48"
+    }
+   }
+  },
+  {
+   "name": "ItemInHandPassHook",
+   "purpose": "InGamePlayScreen::_renderItemInHand。一人称の手の描画パス",
+   "breaks": "Left Hand",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?_renderItemInHand@InGamePlayScreen@@UEAAXAEAVScreenContext@@AEAVPlayer@@@Z",
+    "?_renderItemInHand@InGamePlayScreen@@MEAAXAEAVScreenContext@@AEAVPlayer@@@Z",
+    "?_renderItemInHand@InGamePlayScreen@@EEAAXAEAVScreenContext@@AEAVPlayer@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x4C4400",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC F8 01 00 00 48 8D AC 24 80 00 00 00 44 0F 29 BD 60 01 00 00 44 0F 29 B5 50 01 00 00 44 0F 29 AD 40 01 00 00 44 0F 29 A5 30 01 00 00 44 0F 29 9D 20 01 00 00 44 0F 29 95 10 01 00 00 44 0F 29 8D 00 01 00 00 44 0F 29 85 F0 00 00 00 0F 29 BD E0 00 00 00 0F 29 B5 D0 00 00 00 48 C7 85 C8 00 00 00 FE FF FF FF 4D 89 C6",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC F8"
+    },
+    "1.26.60.5": {
+     "rva": "0x4E0F610",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 98 01 00 00 48 8D AC 24 80 00 00 00 44 0F 29 9D 00 01 00 00 44 0F 29 95 F0 00 00 00 44 0F 29 8D E0 00 00 00 44 0F 29 85 D0 00 00 00 0F 29 BD C0 00 00 00 0F 29 B5 B0 00 00 00 48 C7 85 A8 00 00 00 FE FF FF FF 4C 89 85 A0 00 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 98"
+    }
+   }
+  },
+  {
+   "name": "PacksChangedInnerHook",
+   "purpose": "MinecraftGame::_onActiveResourcePacksChanged。パック変更の完了検出",
+   "breaks": "テクスチャ切替の後処理",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?_onActiveResourcePacksChanged@MinecraftGame@@AEAAXAEAVResourcePackManager@@_N@Z",
+    "?_onActiveResourcePacksChanged@MinecraftGame@@IEAAXAEAVResourcePackManager@@_N@Z",
+    "?_onActiveResourcePacksChanged@MinecraftGame@@QEAAXAEAVResourcePackManager@@_N@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x7CCA00",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 28 01 00 00 48 8D AC 24 80 00 00 00 48 C7 85 A0 00 00 00 FE FF FF FF 44 88 85 9F 00 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 28"
+    },
+    "1.26.60.5": {
+     "rva": "0x873A20",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 28 01 00 00 48 8D AC 24 80 00 00 00 48 C7 85 A0 00 00 00 FE FF FF FF 44 88 85 9F 00 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 28"
+    }
+   }
+  },
+  {
+   "name": "AtlasReloadedHook",
+   "purpose": "MinecraftGame::_onTerrainAtlasReloaded。ブロックテクスチャ更新完了",
+   "breaks": "テクスチャ切替の後処理",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?_onTerrainAtlasReloaded@MinecraftGame@@AEAAXXZ",
+    "?_onTerrainAtlasReloaded@MinecraftGame@@IEAAXXZ",
+    "?_onTerrainAtlasReloaded@MinecraftGame@@QEAAXXZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x7EFE20",
+     "pattern": "55 56 57 48 81 EC A0 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 18 FE FF FF FF 48 89 CE 48 8B 89 88 08 00 00",
+     "unique": true,
+     "check": "55 56 57 48 81 EC A0 00 00 00 48 8D AC 24 80 00"
+    },
+    "1.26.60.5": {
+     "rva": "0x891F20",
+     "pattern": "55 56 57 48 81 EC A0 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 18 FE FF FF FF 48 89 CE 48 8B 81 10 1E 00 00",
+     "unique": true,
+     "check": "55 56 57 48 81 EC A0 00 00 00 48 8D AC 24 80 00"
+    }
+   }
+  },
+  {
+   "name": "FocusLostHook",
+   "purpose": "MinecraftGame::onAppFocusLost。メニューを開いた時のポーズ画面を防ぐ",
+   "breaks": "HUD メニュー時の一瞬のポーズ画面",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?onAppFocusLost@MinecraftGame@@UEAAXXZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x8035F0",
+     "pattern": "55 41 57 41 56 56 57 53 48 81 EC D8 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 50 FE FF FF FF 48 89 CF",
+     "unique": true,
+     "check": "55 41 57 41 56 56 57 53 48 81 EC D8 00 00 00 48"
+    },
+    "1.26.60.5": {
+     "rva": "0x8A36C0",
+     "pattern": "55 41 57 41 56 56 57 53 48 81 EC C8 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 40 FE FF FF FF 48 89 CF 48 8D B1 78 FF FF FF",
+     "unique": true,
+     "check": "55 41 57 41 56 56 57 53 48 81 EC C8 00 00 00 48"
+    }
+   }
+  },
+  {
+   "name": "PacksChangedHook",
+   "purpose": "MinecraftGame::onActiveResourcePacksChanged。パック変更の通知",
+   "breaks": "テクスチャ切替の後処理",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?onActiveResourcePacksChanged@MinecraftGame@@UEAAXAEAVResourcePackManager@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x823CE0",
+     "pattern": "55 41 57 41 56 56 57 53 48 81 EC C8 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 40 FE FF FF FF 48 89 D6 48 89 CF 48 8D 1D ?? ?? ?? ??",
+     "unique": true,
+     "check": "55 41 57 41 56 56 57 53 48 81 EC C8 00 00 00 48"
+    },
+    "1.26.60.5": {
+     "rva": "0x8C16E0",
+     "pattern": "55 41 57 41 56 56 57 53 48 81 EC C8 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 40 FE FF FF FF 48 89 D6 48 89 CF 48 8D 1D ?? ?? ?? ??",
+     "unique": true,
+     "check": "55 41 57 41 56 56 57 53 48 81 EC C8 00 00 00 48"
+    }
+   }
+  },
+  {
+   "name": "CanUseSkinHook",
+   "purpose": "ClientLevel::canUseSkin。他プレイヤーのスキン許可",
+   "breaks": "Closet のスキン（サーバー上の見え方）",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?canUseSkin@ClientLevel@@UEBA_NAEBVSerializedSkinRef@@AEBVNetworkIdentifier@@AEBUActorUniqueID@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x12F6060",
+     "pattern": "48 8B 89 78 07 00 00 E9 ?? ?? ?? ??",
+     "unique": true,
+     "check": "48 8B 89 78 07 00 00 E9 B4 3A 15 00 CC CC CC CC"
+    }
+   }
+  },
+  {
+   "name": "TextHook",
+   "purpose": "Text パケットの受信",
+   "breaks": "JAVA チャット / チャット系機能",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?handle@ClientNetworkHandler@@UEAAXAEBVNetworkIdentifier@@AEBVTextPacket@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x1306A90",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 78 01 00 00 48 8D AC 24 80 00 00 00 48 C7 85 F0 00 00 00 FE FF FF FF 41 0F B6 80 E8 00 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 78"
+    },
+    "1.26.60.5": {
+     "rva": "0x6B9E240",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 68 01 00 00 48 8D AC 24 80 00 00 00 48 C7 85 E0 00 00 00 FE FF FF FF 41 0F B6 80 E8 00 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 68"
+    }
+   }
+  },
+  {
+   "name": "HandlerStartGameHook",
+   "purpose": "StartGame パケットの受信",
+   "breaks": "ワールド情報（Hive モード判定など）",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?handle@LegacyClientNetworkHandler@@UEAAXAEBVNetworkIdentifier@@AEBVStartGamePacket@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x13323C0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 68 0F 00 00 48 8D AC 24 80 00 00 00 0F 29 B5 D0 0E 00 00 48 C7 85 C8 0E 00 00 FE FF FF FF 48 89 95 48 0E 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 68"
+    },
+    "1.26.60.5": {
+     "rva": "0x6BC8BC0",
+     "pattern": "E9 ?? ?? ?? ??",
+     "unique": false,
+     "check": "?? ?? ?? ?? ?? 41 55 41 54 56 57 53 48 81 EC 38",
+     "note": "パターンがこの関数だけに一致しない（中継関数か、同じ中身の関数が他にもある）。起動時は表の番地での一致だけを確かめる。新しい版では findsig の呼び出し元の照合で探す"
+    }
+   }
+  },
+  {
+   "name": "HandlerSetTimeHook",
+   "purpose": "SetTime パケットの受信",
+   "breaks": "Day Timer",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?handle@LegacyClientNetworkHandler@@UEAAXAEBVNetworkIdentifier@@AEBVSetTimePacket@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x13398B0",
+     "pattern": "56 57 48 83 EC 28 4C 89 C6 48 89 CF 48 8B 81 58 02 00 00",
+     "unique": true,
+     "check": "56 57 48 83 EC 28 4C 89 C6 48 89 CF 48 8B 81 58"
+    },
+    "1.26.60.5": {
+     "rva": "0x6BCF440",
+     "pattern": "56 57 48 83 EC 28 4C 89 C6 48 89 CF 48 8B 81 B0 02 00 00",
+     "unique": true,
+     "check": "56 57 48 83 EC 28 4C 89 C6 48 89 CF 48 8B 81 B0"
+    }
+   }
+  },
+  {
+   "name": "HandlerMoveDeltaHook",
+   "purpose": "MoveActorDelta パケットの受信",
+   "breaks": "Arrows / 目標座標",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?handle@LegacyClientNetworkHandler@@UEAAXAEBVNetworkIdentifier@@AEBVMoveActorDeltaPacket@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x133EF30",
+     "pattern": "56 57 53 48 83 EC 60 48 8B 05 ?? ?? ?? ?? 48 31 E0 48 89 44 24 58 48 8B 81 58 02 00 00",
+     "unique": true,
+     "check": "56 57 53 48 83 EC 60 48 8B 05 42 B1 49 10 48 31"
+    },
+    "1.26.60.5": {
+     "rva": "0x6BD3E00",
+     "pattern": "56 57 48 83 EC 58 48 8B 05 ?? ?? ?? ?? 48 31 E0 48 89 44 24 50 48 8B 81 B0 02 00 00",
+     "unique": true,
+     "check": "56 57 48 83 EC 58 48 8B 05 B3 42 73 0B 48 31 E0"
+    }
+   }
+  },
+  {
+   "name": "HandlerActorDataHook",
+   "purpose": "SetActorData パケットの受信",
+   "breaks": "Arrows / 体力系表示",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?handle@LegacyClientNetworkHandler@@UEAAXAEBVNetworkIdentifier@@AEBVSetActorDataPacket@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x1341480",
+     "pattern": "41 57 41 56 56 57 53 48 83 EC 50 48 8B 81 58 02 00 00",
+     "unique": true,
+     "check": "41 57 41 56 56 57 53 48 83 EC 50 48 8B 81 58 02"
+    },
+    "1.26.60.5": {
+     "rva": "0x6BD5FA0",
+     "pattern": "41 57 41 56 56 57 53 48 83 EC 40 48 8B 81 B0 02 00 00",
+     "unique": true,
+     "check": "41 57 41 56 56 57 53 48 83 EC 40 48 8B 81 B0 02"
+    }
+   }
+  },
+  {
+   "name": "NickHook",
+   "purpose": "Actor::getNameTag。自分の名前を差し替え",
+   "breaks": "Nick",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?getNameTag@Actor@@QEBAAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x1A14DB0",
+     "pattern": "56 48 83 EC 20 48 8B 81 28 01 00 00 48 85 C0 74 ?? 8B 50 08 48 8B 08 29 CA 81 E2 F8 FF 07 00 48 8D 05 ?? ?? ?? ??",
+     "unique": true,
+     "check": "56 48 83 EC 20 48 8B 81 28 01 00 00 48 85 C0 74"
+    },
+    "1.26.60.5": {
+     "rva": "0xBBE500",
+     "pattern": "56 48 83 EC 20 48 8B 81 50 01 00 00 48 85 C0 74 ?? 8B 50 08 48 8B 08 29 CA 81 E2 F8 FF 07 00 48 8D 05 ?? ?? ?? ??",
+     "unique": true,
+     "check": "56 48 83 EC 20 48 8B 81 50 01 00 00 48 85 C0 74"
+    }
+   }
+  },
+  {
+   "name": "NameTagHook",
+   "purpose": "Actor::canShowNameTag。名札の表示",
+   "breaks": "Nametag",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?canShowNameTag@Actor@@UEBA_NXZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x1A1B3C0",
+     "pattern": "48 8B 51 10 8B 41 18 48 8B 4A 48 4C 8B 42 50 49 29 C8 49 C1 E8 03 41 FF C8 41 81 E0 F3 26 74 C6 4E 8D 0C C1 48 8B 4A 68 0F 1F 84 00 00 00 00 00 4D 8B 01 49 83 F8 FF 0F 84 ?? ?? ?? ?? 49 C1 E0 05 4E 8D 0C 01 42 81 7C 01 08 F3 26 74 C6 75 ?? 4C 01 C1 48 39 4A 70 74 ?? 48 8B 49 10 48 85 C9 74 ?? 89 C2 81 E2 FF FF 03 00 41 89 D0 41 C1 E8 0B 4C 8B 49 08 4C 8B 51 10 4D 29 CA 49 C1 FA 03 4D 39 D0 73 ?? 4F 8B 04 C1 4D 85 C0 74 ?? 81 E2 FF 07 00 00 25 00 00 FC FF 41 8B 14 90 31 D0 3D FE FF 03 00 77 ?? 48 8B 41 50 89 D1 C1 E9 04 81 E1 F8 3F 00 00 48 8B 04 08 48 85 C0 74 ?? 81 E2 FF FF 03 00",
+     "unique": false,
+     "check": "48 8B 51 10 8B 41 18 48 8B 4A 48 4C 8B 42 50 49",
+     "note": "パターンがこの関数だけに一致しない（中継関数か、同じ中身の関数が他にもある）。起動時は表の番地での一致だけを確かめる。新しい版では findsig の呼び出し元の照合で探す"
+    }
+   }
+  },
+  {
+   "name": "SetAllDirty",
+   "purpose": "RenderChunkCoordinator::_setAllDirty。チャンクの作り直し",
+   "breaks": "テクスチャ切替（ワールド内）",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?_setAllDirty@RenderChunkCoordinator@@QEAAX_N0@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x1C9C6D0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC 78 48 8D 6C 24 70 0F 29 7D F0 0F 29 75 E0 48 C7 45 D8 FE FF FF FF 45 89 C6",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC 78"
+    },
+    "1.26.60.5": {
+     "rva": "0x7920F70",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC 78 48 8D 6C 24 70 0F 29 7D F0 0F 29 75 E0 48 C7 45 D8 FE FF FF FF 45 89 C6",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC 78"
+    }
+   }
+  },
+  {
+   "name": "ActorRenderAtHook",
+   "purpose": "ActorRenderDispatcher::render(位置付き)。エンティティ描画距離",
+   "breaks": "Optimization のエンティティ距離",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?render@ActorRenderDispatcher@@QEAAXAEAVBaseActorRenderContext@@AEAVActor@@AEBVVec3@@2AEBVVec2@@_N@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x1D51540",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC E8 00 00 00 48 8D AC 24 80 00 00 00 0F 29 7D 50 0F 29 75 40 48 C7 45 38 FE FF FF FF 4C 89 C6",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC E8"
+    },
+    "1.26.60.5": {
+     "rva": "0x594BE00",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC E8 00 00 00 48 8D AC 24 80 00 00 00 0F 29 7D 50 0F 29 75 40 48 C7 45 38 FE FF FF FF 4C 89 C6",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC E8"
+    }
+   }
+  },
+  {
+   "name": "ActorRenderHook",
+   "purpose": "ActorRenderDispatcher::render。エンティティ描画距離",
+   "breaks": "Optimization のエンティティ距離",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?render@ActorRenderDispatcher@@QEAAXAEAVBaseActorRenderContext@@AEAVActor@@_N@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x1D54C40",
+     "pattern": "41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC 08 01 00 00 44 0F 29 BC 24 F0 00 00 00 44 0F 29 B4 24 E0 00 00 00 44 0F 29 AC 24 D0 00 00 00 44 0F 29 A4 24 C0 00 00 00 44 0F 29 9C 24 B0 00 00 00 44 0F 29 94 24 A0 00 00 00 44 0F 29 8C 24 90 00 00 00 44 0F 29 84 24 80 00 00 00 0F 29 7C 24 70 0F 29 74 24 60 44 89 CB",
+     "unique": true,
+     "check": "41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC 08"
+    },
+    "1.26.60.5": {
+     "rva": "0x594F420",
+     "pattern": "41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC F8 00 00 00 44 0F 29 AC 24 E0 00 00 00 44 0F 29 A4 24 D0 00 00 00 44 0F 29 9C 24 C0 00 00 00 44 0F 29 94 24 B0 00 00 00 44 0F 29 8C 24 A0 00 00 00 44 0F 29 84 24 90 00 00 00 0F 29 BC 24 80 00 00 00 0F 29 74 24 70 44 89 CB",
+     "unique": true,
+     "check": "41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC F8"
+    }
+   }
+  },
+  {
+   "name": "HitEffectHook",
+   "purpose": "GameMode::attack。攻撃時の効果",
+   "breaks": "Hit Effect",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?attack@GameMode@@UEAA_NAEAVActor@@AEBVVec3@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x2599F00",
+     "pattern": "4D 89 C1 41 B0 01 E9 ?? ?? ?? ??",
+     "unique": true,
+     "check": "4D 89 C1 41 B0 01 E9 05 00 00 00 CC CC CC CC CC",
+     "note": "関数全体がこの長さしかない（短い関数）。一意には一致する"
+    },
+    "1.26.60.5": {
+     "rva": "0x3769340",
+     "pattern": "4D 89 C1 41 B0 01 E9 ?? ?? ?? ??",
+     "unique": false,
+     "check": "4D 89 C1 41 B0 01 E9 05 00 00 00 CC CC CC CC CC",
+     "note": "パターンがこの関数だけに一致しない（中継関数か、同じ中身の関数が他にもある）。起動時は表の番地での一致だけを確かめる。新しい版では findsig の呼び出し元の照合で探す"
+    }
+   }
+  },
+  {
+   "name": "RenderSkyHook",
+   "purpose": "LevelRendererPlayer の空描画",
+   "breaks": "Optimization の空を描かない",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?renderSky@LevelRendererCamera@@QEBAXAEAVScreenContext@@AEBUViewRenderObject@@AEBUBaseSceneDirectionalLightRenderData@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x4676870",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 48 04 00 00 48 8D AC 24 80 00 00 00 44 0F 29 BD B0 03 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 48"
+    },
+    "1.26.60.5": {
+     "rva": "0x53697C0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 18 04 00 00 48 8D AC 24 80 00 00 00 44 0F 29 BD 80 03 00 00 44 0F 29 B5 70 03 00 00 44 0F 29 AD 60 03 00 00 44 0F 29 A5 50 03 00 00 44 0F 29 9D 40 03 00 00 44 0F 29 95 30 03 00 00 44 0F 29 8D 20 03 00 00 44 0F 29 85 10 03 00 00 66 0F 7F BD 00 03 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 18"
+    }
+   }
+  },
+  {
+   "name": "QueueChunkHook",
+   "purpose": "チャンクの描画キュー",
+   "breaks": "Optimization の縦方向の距離",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?queueChunk@LevelRendererCamera@@QEAAXAEAUChunkRenderObjectCollection@@AEBVRenderChunkInstanced@@MMAEBVTerrainMaterialVariationManager@@V?$optional_ref@$$CBVTerrainMaterialVariationManager@@@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x468FB50",
+     "pattern": "41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC 88 00 00 00 0F 29 7C 24 70 0F 29 74 24 60 4D 8B 70 10",
+     "unique": true,
+     "check": "41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC 88"
+    },
+    "1.26.60.5": {
+     "rva": "0x537DDE0",
+     "pattern": "41 57 41 56 41 54 56 57 55 53 48 81 EC 80 00 00 00 0F 29 7C 24 70 0F 29 74 24 60 48 8B 05 ?? ?? ?? ??",
+     "unique": true,
+     "check": "41 57 41 56 41 54 56 57 55 53 48 81 EC 80 00 00"
+    }
+   }
+  },
+  {
+   "name": "NameTagsHook",
+   "purpose": "LevelRendererPlayer::extractNameTags。名札の一覧",
+   "breaks": "Nick / 他人の名札を隠す",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?extractNameTags@LevelRendererPlayer@@UEBA?AUNameTagRenderObjectCollection@@AEAVScreenContext@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x46B2F00",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 58 02 00 00 48 8D AC 24 80 00 00 00 0F 29 BD C0 01 00 00 0F 29 B5 B0 01 00 00 48 C7 85 A8 01 00 00 FE FF FF FF 48 89 CE",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 58"
+    },
+    "1.26.60.5": {
+     "rva": "0x5397810",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 58 02 00 00 48 8D AC 24 80 00 00 00 0F 29 BD C0 01 00 00 0F 29 B5 B0 01 00 00 48 C7 85 A8 01 00 00 FE FF FF FF 48 89 CE",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 58"
+    }
+   }
+  },
+  {
+   "name": "OutlineHookPublic",
+   "purpose": "LevelRendererPlayer::renderOutlineSelection。ブロックの枠",
+   "breaks": "Block Outline",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?_renderOutlineSelection@LevelRendererPlayer@@QEBAXAEAVBaseActorRenderContext@@AEBVBlock@@AEAVBlockSource@@AEBVBlockPos@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x46B5F30",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 18 02 00 00 48 8D AC 24 80 00 00 00 44 0F 29 95 80 01 00 00 44 0F 29 8D 70 01 00 00 44 0F 29 85 60 01 00 00 0F 29 BD 50 01 00 00 0F 29 B5 40 01 00 00 48 C7 85 38 01 00 00 FE FF FF FF 4C 89 CB",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 18"
+    },
+    "1.26.60.5": {
+     "rva": "0x539A550",
+     "pattern": "55 41 57 41 56 41 54 56 57 53 48 81 EC 20 02 00 00 48 8D AC 24 80 00 00 00 44 0F 29 85 90 01 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 54 56 57 53 48 81 EC 20 02 00"
+    }
+   }
+  },
+  {
+   "name": "HitSelectHook",
+   "purpose": "LevelRendererPlayer::renderHitSelect。ブロックの枠",
+   "breaks": "Block Outline",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?renderHitSelect@LevelRendererPlayer@@QEBAXAEAVBaseActorRenderContext@@AEAVBlockSource@@AEBVBlockPos@@_N@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x46B96B0",
+     "pattern": "41 57 41 56 56 57 55 53 48 83 EC 48 4D 89 CE",
+     "unique": true,
+     "check": "41 57 41 56 56 57 55 53 48 83 EC 48 4D 89 CE 4C"
+    },
+    "1.26.60.5": {
+     "rva": "0x539DAF0",
+     "pattern": "41 57 41 56 56 57 55 53 48 83 EC 48 4D 89 CE",
+     "unique": true,
+     "check": "41 57 41 56 56 57 55 53 48 83 EC 48 4D 89 CE 4C"
+    }
+   }
+  },
+  {
+   "name": "FovHook",
+   "purpose": "LevelRendererPlayer::getFov",
+   "breaks": "Zoom",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?getFov@LevelRendererPlayer@@QEBAMM_N@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x46BD180",
+     "pattern": "56 57 53 48 83 EC 60 44 0F 29 44 24 50 0F 29 7C 24 40 0F 29 74 24 30 44 89 C3 0F 28 F1",
+     "unique": true,
+     "check": "56 57 53 48 83 EC 60 44 0F 29 44 24 50 0F 29 7C"
+    },
+    "1.26.60.5": {
+     "rva": "0x5309B40",
+     "pattern": "56 57 53 48 83 EC 60 44 0F 29 44 24 50 0F 29 7C 24 40 0F 29 74 24 30 44 89 C3 0F 28 F1",
+     "unique": true,
+     "check": "56 57 53 48 83 EC 60 44 0F 29 44 24 50 0F 29 7C"
+    }
+   }
+  },
+  {
+   "name": "CameraHook",
+   "purpose": "LevelRendererPlayer::setupCamera。視点行列",
+   "breaks": "ゲーム内描画（Hitbox・枠）の正確なカメラ",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?setupCamera@LevelRendererPlayer@@QEAAXAEAVCamera@mce@@M@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x46CFE60",
+     "pattern": "41 57 41 56 41 54 56 57 53 48 81 EC 08 01 00 00 44 0F 29 AC 24 F0 00 00 00",
+     "unique": true,
+     "check": "41 57 41 56 41 54 56 57 53 48 81 EC 08 01 00 00"
+    },
+    "1.26.60.5": {
+     "rva": "0x53B3290",
+     "pattern": "41 57 41 56 41 54 56 57 53 48 81 EC E8 00 00 00 44 0F 29 9C 24 D0 00 00 00",
+     "unique": true,
+     "check": "41 57 41 56 41 54 56 57 53 48 81 EC E8 00 00 00"
+    }
+   }
+  },
+  {
+   "name": "FrameHook",
+   "purpose": "GameRenderer::renderCurrentFrame。毎フレームの入口。ClientInstance の取得・FPS・テクスチャ反映・リプレイ参加もここから",
+   "breaks": "ほぼ全機能（Client() が取れない）",
+   "fatal": true,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?renderCurrentFrame@GameRenderer@@QEAAXM@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x47A8BD0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 B8 28 36 00 00 E8 ?? ?? ?? ?? 48 29 C4 48 8D AC 24 80 00 00 00 44 0F 29 BD 90 35 00 00 44 0F 29 B5 80 35 00 00 44 0F 29 AD 70 35 00 00 44 0F 29 A5 60 35 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 B8 28 36 00"
+    },
+    "1.26.60.5": {
+     "rva": "0x53117B0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 B8 78 35 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 B8 78 35 00"
+    }
+   }
+  },
+  {
+   "name": "LeftHandObjectHook",
+   "purpose": "ItemInHandRenderer::renderObject",
+   "breaks": "Left Hand",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?renderObject@ItemInHandRenderer@@QEAAXAEAVBaseActorRenderContext@@AEBVItemRenderCall@@AEBURenderMetadata@dragon@@W4ItemContextFlags@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x47B4A90",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 78 02 00 00 48 8D AC 24 80 00 00 00 48 C7 85 F0 01 00 00 FE FF FF FF 4C 89 8D C0 01 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 78"
+    },
+    "1.26.60.5": {
+     "rva": "0x531A210",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 68 02 00 00 48 8D AC 24 80 00 00 00 48 C7 85 E0 01 00 00 FE FF FF FF 4D 89 CE 4C 89 C6",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 68"
+    }
+   }
+  },
+  {
+   "name": "LeftHandItemHook",
+   "purpose": "ItemInHandRenderer::renderItem",
+   "breaks": "Left Hand",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?renderItem@ItemInHandRenderer@@QEAAXAEAVBaseActorRenderContext@@AEAVActor@@AEBVItemStack@@_NW4ItemContextFlags@@33@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x47B5AD0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC D8 03 00 00 48 8D AC 24 80 00 00 00 44 0F 29 8D 40 03 00 00 44 0F 29 85 30 03 00 00 0F 29 BD 20 03 00 00 0F 29 B5 10 03 00 00 48 C7 85 08 03 00 00 FE FF FF FF 41 80 79 23 01",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC D8"
+    },
+    "1.26.60.5": {
+     "rva": "0x531B120",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 88 08 00 00 48 8D AC 24 80 00 00 00 44 0F 29 BD F0 07 00 00 44 0F 29 B5 E0 07 00 00 44 0F 29 AD D0 07 00 00 44 0F 29 A5 C0 07 00 00 44 0F 29 9D B0 07 00 00 44 0F 29 95 A0 07 00 00 44 0F 29 8D 90 07 00 00 44 0F 29 85 80 07 00 00 0F 29 BD 70 07 00 00 0F 29 B5 60 07 00 00 48 C7 85 58 07 00 00 FE FF FF FF 4C 89 CE 4D 89 C6",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 88"
+    }
+   }
+  },
+  {
+   "name": "LeftHandItemNewHook",
+   "purpose": "ItemInHandRenderer::renderItemNew",
+   "breaks": "Left Hand",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?renderItemNew@ItemInHandRenderer@@QEAAXAEAVBaseActorRenderContext@@AEAVActor@@AEBVItemStack@@W4ItemContextFlags@@UBrightness@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x47BFF80",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 58 01 00 00 48 8D AC 24 80 00 00 00 44 0F 29 8D C0 00 00 00 44 0F 29 85 B0 00 00 00 0F 29 BD A0 00 00 00 0F 29 B5 90 00 00 00 48 C7 85 88 00 00 00 FE FF FF FF 41 80 79 22 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 58"
+    },
+    "1.26.60.5": {
+     "rva": "0x5324DF0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 28 01 00 00 48 8D AC 24 80 00 00 00 0F 29 B5 90 00 00 00 48 C7 85 88 00 00 00 FE FF FF FF 41 80 79 22 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 28"
+    }
+   }
+  },
+  {
+   "name": "LeftHandFirstPersonHook",
+   "purpose": "ItemInHandRenderer::renderFirstPerson",
+   "breaks": "Left Hand",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?renderFirstPerson@ItemInHandRenderer@@QEAAXAEAVBaseActorRenderContext@@AEBVMatrix@@W4ItemContextFlags@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x47CA170",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 18 02 00 00 48 8D AC 24 80 00 00 00 44 0F 29 BD 80 01 00 00 44 0F 29 B5 70 01 00 00 44 0F 29 AD 60 01 00 00 44 0F 29 A5 50 01 00 00 44 0F 29 9D 40 01 00 00 44 0F 29 95 30 01 00 00 44 0F 29 8D 20 01 00 00 44 0F 29 85 10 01 00 00 0F 29 BD 00 01 00 00 0F 29 B5 F0 00 00 00 48 C7 85 E8 00 00 00 FE FF FF FF 44 88 4D 7F",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 18"
+    },
+    "1.26.60.5": {
+     "rva": "0x532B230",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 68 02 00 00 48 8D AC 24 80 00 00 00 44 0F 29 A5 D0 01 00 00 44 0F 29 9D C0 01 00 00 44 0F 29 95 B0 01 00 00 44 0F 29 8D A0 01 00 00 44 0F 29 85 90 01 00 00 0F 29 BD 80 01 00 00 0F 29 B5 70 01 00 00 48 C7 85 68 01 00 00 FE FF FF FF 44 89 CF",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 68"
+    }
+   }
+  },
+  {
+   "name": "UiUpdateHook",
+   "purpose": "UIScene::frameUpdate（計測のみ）",
+   "breaks": "Perf の HUD 計測行",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?frameUpdate@UIScene@@UEAAXAEAVMinecraftUIFrameUpdateContext@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x4857430",
+     "pattern": "41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 38 48 8B 41 40",
+     "unique": true,
+     "check": "41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 38"
+    },
+    "1.26.60.5": {
+     "rva": "0x4CCF370",
+     "pattern": "41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 38 48 8B 41 40",
+     "unique": true,
+     "check": "41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 38"
+    }
+   }
+  },
+  {
+   "name": "UiRenderHook",
+   "purpose": "UIScene::render（計測のみ）",
+   "breaks": "Perf の HUD 計測行",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?render@UIScene@@UEAAXAEAVScreenContext@@AEBUFrameRenderObject@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x48575E0",
+     "pattern": "55 56 57 53 48 81 EC D8 01 00 00 48 8D AC 24 80 00 00 00 48 C7 85 50 01 00 00 FE FF FF FF 48 89 D7 48 89 CB",
+     "unique": true,
+     "check": "55 56 57 53 48 81 EC D8 01 00 00 48 8D AC 24 80"
+    },
+    "1.26.60.5": {
+     "rva": "0x4CCF520",
+     "pattern": "55 56 57 53 48 81 EC D8 01 00 00 48 8D AC 24 80 00 00 00 48 C7 85 50 01 00 00 FE FF FF FF 48 89 D7 48 89 CB",
+     "unique": true,
+     "check": "55 56 57 53 48 81 EC D8 01 00 00 48 8D AC 24 80"
+    }
+   }
+  },
+  {
+   "name": "LeftHandMeshHook",
+   "purpose": "mce::Mesh::_renderMesh",
+   "breaks": "Left Hand",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?_renderMesh@Mesh@mce@@QEBAXAEAVMeshContext@2@AEBVMaterialPtr@2@V?$static_vector@V?$variant@Umonostate@std@@VTexturePtr@mce@@UClientTexture@4@UServerTexture@4@@std@@$07@brstd@@IIAEBUOffscreenCaptureDescription@@PEBVIndexBufferContainer@2@V?$optional@URenderMetadata@dragon@@@std@@@Z",
+    "?_renderMesh@Mesh@mce@@AEBAXAEAVMeshContext@2@AEBVMaterialPtr@2@V?$static_vector@V?$variant@Umonostate@std@@VTexturePtr@mce@@UClientTexture@4@UServerTexture@4@@std@@$07@brstd@@IIAEBUOffscreenCaptureDescription@@PEBVIndexBufferContainer@2@V?$optional@URenderMetadata@dragon@@@std@@@Z",
+    "?_renderMesh@Mesh@mce@@IEBAXAEAVMeshContext@2@AEBVMaterialPtr@2@V?$static_vector@V?$variant@Umonostate@std@@VTexturePtr@mce@@UClientTexture@4@UServerTexture@4@@std@@$07@brstd@@IIAEBUOffscreenCaptureDescription@@PEBVIndexBufferContainer@2@V?$optional@URenderMetadata@dragon@@@std@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x4B04470",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC E8 04 00 00 48 8D AC 24 80 00 00 00 0F 29 B5 50 04 00 00 48 C7 85 48 04 00 00 FE FF FF FF 4C 89 8D 38 04 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC E8"
+    }
+   }
+  },
+  {
+   "name": "ContainerSlotItem",
+   "purpose": "ContainerScreenController::_getItemStack。スロットのアイテム",
+   "breaks": "シュルカーの中身表示",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?_getItemStack@ContainerScreenController@@QEBAAEBVItemStack@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@H@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x4DD4150",
+     "pattern": "55 56 57 48 81 EC 80 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 F8 FE FF FF FF 48 89 CE 48 8D 7D A8 48 89 F9 E8 ?? ?? ?? ?? 48 8B 06 48 8B 80 D8 01 00 00 48 8D 55 D0 48 89 F1 49 89 F8 FF 15 ?? ?? ?? ?? 48 8B 45 C0 48 83 F8 10 72 ?? 48 8B 4D A8 48 8D 50 01 48 81 FA 00 10 00 00 72 ?? 4C 8B 41 F8 48 83 C1 F8 4C 29 C1 48 83 F9 20 0F 83 ?? ?? ?? ?? 48 83 C0 28 48 89 C2 4C 89 C1 E8 ?? ?? ?? ?? 48 83 7D E0 00 0F 94 C0 44 8B 45 F0 41 83 F8 FF 0F 94 C1 08 C1 75 ??",
+     "unique": true,
+     "check": "55 56 57 48 81 EC 80 00 00 00 48 8D AC 24 80 00"
+    }
+   }
+  },
+  {
+   "name": "ScreenTickHook",
+   "purpose": "ContainerScreenController::tick",
+   "breaks": "シュルカーの中身表示",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?tick@ContainerScreenController@@UEAA?AW4DirtyFlag@ui@@XZ",
+    "?tick@ContainerScreenController@@MEAA?AW4DirtyFlag@ui@@XZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x4DF8280",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC C8 00 00 00 48 8D AC 24 80 00 00 00 0F 29 75 30 48 C7 45 28 FE FF FF FF 48 89 CE 48 8D B9 F8 11 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC C8"
+    },
+    "1.26.60.5": {
+     "rva": "0x5007E60",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC C8 00 00 00 48 8D AC 24 80 00 00 00 0F 29 75 30 48 C7 45 28 FE FF FF FF 48 89 CE 48 8D B9 F8 11 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC C8"
+    }
+   }
+  },
+  {
+   "name": "SlotHoveredHook",
+   "purpose": "ContainerScreenController::_onContainerSlotHovered",
+   "breaks": "シュルカーの中身表示",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?_onContainerSlotHovered@ContainerScreenController@@MEAA?AW4ViewRequest@ui@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@H@Z",
+    "?_onContainerSlotHovered@ContainerScreenController@@UEAA?AW4ViewRequest@ui@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@H@Z",
+    "?_onContainerSlotHovered@ContainerScreenController@@EEAA?AW4ViewRequest@ui@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@H@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x4DFDB00",
+     "pattern": "41 57 41 56 56 57 53 48 83 EC 20 44 89 C6 48 89 D7 48 89 CB 80 B9 CC 10 00 00 01",
+     "unique": true,
+     "check": "41 57 41 56 56 57 53 48 83 EC 20 44 89 C6 48 89"
+    },
+    "1.26.60.5": {
+     "rva": "0x500D460",
+     "pattern": "41 57 41 56 56 57 53 48 83 EC 20 44 89 C6 48 89 D7 48 89 CB 80 B9 CC 10 00 00 01",
+     "unique": true,
+     "check": "41 57 41 56 56 57 53 48 83 EC 20 44 89 C6 48 89"
+    }
+   }
+  },
+  {
+   "name": "SlotUnhoveredHook",
+   "purpose": "ContainerScreenController::_onContainerSlotUnhovered",
+   "breaks": "シュルカーの中身表示",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?_onContainerSlotUnhovered@ContainerScreenController@@MEAA?AW4ViewRequest@ui@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@H@Z",
+    "?_onContainerSlotUnhovered@ContainerScreenController@@UEAA?AW4ViewRequest@ui@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@H@Z",
+    "?_onContainerSlotUnhovered@ContainerScreenController@@EEAA?AW4ViewRequest@ui@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@H@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x4DFDD50",
+     "pattern": "55 41 57 41 56 56 57 53 48 83 EC 58 48 8D 6C 24 50 48 C7 45 00 FE FF FF FF 44 89 C6 48 89 D7 48 89 CB",
+     "unique": true,
+     "check": "55 41 57 41 56 56 57 53 48 83 EC 58 48 8D 6C 24"
+    },
+    "1.26.60.5": {
+     "rva": "0x500D6B0",
+     "pattern": "55 41 57 41 56 56 57 53 48 83 EC 58 48 8D 6C 24 50 48 C7 45 00 FE FF FF FF 44 89 C6 48 89 D7 48 89 CB",
+     "unique": true,
+     "check": "55 41 57 41 56 56 57 53 48 83 EC 58 48 8D 6C 24"
+    }
+   }
+  },
+  {
+   "name": "HudTickHook",
+   "purpose": "HudScreenController::tick（計測のみ）",
+   "breaks": "Perf の HUD 計測行",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?tick@HudScreenController@@UEAA?AW4DirtyFlag@ui@@XZ",
+    "?tick@HudScreenController@@MEAA?AW4DirtyFlag@ui@@XZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x4EA00A0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC B8 03 00 00 48 8D AC 24 80 00 00 00 44 0F 29 85 20 03 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC B8"
+    }
+   }
+  },
+  {
+   "name": "TessColorObjectHook",
+   "purpose": "Tessellator::color(Color)",
+   "breaks": "Block Outline の色（補助）",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?color@Tessellator@@QEAAXAEBVColor@mce@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x59CA540",
+     "pattern": "80 B9 54 02 00 00 00 0F 85 ?? ?? ?? ?? F3 0F 10 05 ?? ?? ?? ?? F3 0F 10 0A",
+     "unique": true,
+     "check": "80 B9 54 02 00 00 00 0F 85 BE 00 00 00 F3 0F 10"
+    }
+   }
+  },
+  {
+   "name": "TessColorFloatHook",
+   "purpose": "Tessellator::color(float×4)",
+   "breaks": "Block Outline の色（補助）",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?color@Tessellator@@QEAAXMMMM@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x59CA610",
+     "pattern": "80 B9 54 02 00 00 00 0F 85 ?? ?? ?? ?? F3 0F 10 05 ?? ?? ?? ?? F3 0F 59 C8",
+     "unique": true,
+     "check": "80 B9 54 02 00 00 00 0F 85 AD 00 00 00 F3 0F 10"
+    },
+    "1.26.60.5": {
+     "rva": "0x5417520",
+     "pattern": "80 B9 54 02 00 00 00 0F 85 ?? ?? ?? ?? F3 0F 10 05 ?? ?? ?? ?? F3 0F 59 C8",
+     "unique": true,
+     "check": "80 B9 54 02 00 00 00 0F 85 AD 00 00 00 F3 0F 10"
+    }
+   }
+  },
+  {
+   "name": "BlockActorRenderHook",
+   "purpose": "ブロックエンティティの描画",
+   "breaks": "Optimization のブロックエンティティ距離",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?render@BlockActorRenderDispatcher@@QEAAXAEAVBaseActorRenderContext@@AEAVBlockSource@@AEAVIVanillaRenderBlockActorComponent@@AEBVBlock@@AEBVVec3@@AEBVBlockPos@@_NAEBVMaterialPtr@mce@@PEBUClientTexture@9@HV?$optional@URenderMetadata@dragon@@@std@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x6254F70",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 58 01 00 00 48 8D AC 24 80 00 00 00 48 C7 85 D0 00 00 00 FE FF FF FF 4C 89 CB 4D 89 C7",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 58"
+    },
+    "1.26.60.5": {
+     "rva": "0x6A5D390",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 38 01 00 00 48 8D AC 24 80 00 00 00 48 C7 85 B0 00 00 00 FE FF FF FF 4C 89 CB 4D 89 C7",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 38"
+    }
+   }
+  },
+  {
+   "name": "LightCreateHook",
+   "purpose": "BaseLightTextureImageBuilder::createBaseLightTextureData",
+   "breaks": "Full Bright",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?createBaseLightTextureData@BaseLightTextureImageBuilder@@UEAA?AV?$unique_ptr@VBaseLightData@@U?$default_delete@VBaseLightData@@@std@@@std@@PEAVIClientInstance@@AEBVBaseLightData@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x6618030",
+     "pattern": "55 41 57 41 56 56 57 53 48 83 EC 68 48 8D 6C 24 60 0F 29 75 F0 48 C7 45 E8 FE FF FF FF 4D 89 CF",
+     "unique": true,
+     "check": "55 41 57 41 56 56 57 53 48 83 EC 68 48 8D 6C 24"
+    },
+    "1.26.60.5": {
+     "rva": "0x5AECA80",
+     "pattern": "55 41 57 41 56 56 57 53 48 83 EC 68 48 8D 6C 24 60 0F 29 75 F0 48 C7 45 E8 FE FF FF FF 4D 89 CF",
+     "unique": true,
+     "check": "55 41 57 41 56 56 57 53 48 83 EC 68 48 8D 6C 24"
+    }
+   }
+  },
+  {
+   "name": "LightSplitHook",
+   "purpose": "BaseLightTextureImageBuilder::buildImageSplit",
+   "breaks": "Full Bright",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?buildImageSplit@BaseLightTextureImageBuilder@@UEAA_NAEBVBaseLightData@@PEAUImage@mce@@IM_N@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x66184D0",
+     "pattern": "41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC F8 01 00 00 44 0F 29 BC 24 E0 01 00 00 44 0F 29 B4 24 D0 01 00 00 44 0F 29 AC 24 C0 01 00 00 44 0F 29 A4 24 B0 01 00 00 44 0F 29 9C 24 A0 01 00 00 44 0F 29 94 24 90 01 00 00 44 0F 29 8C 24 80 01 00 00 44 0F 29 84 24 70 01 00 00 0F 29 BC 24 60 01 00 00 0F 29 B4 24 50 01 00 00 48 8B 41 08",
+     "unique": true,
+     "check": "41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC F8"
+    }
+   }
+  },
+  {
+   "name": "LightHook",
+   "purpose": "BaseLightTextureImageBuilder::buildImage",
+   "breaks": "Full Bright",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?buildImage@BaseLightTextureImageBuilder@@UEAA_NAEBVBaseLightData@@PEAUImage@mce@@IMM_N@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x6619C50",
+     "pattern": "41 57 41 56 56 57 55 53 48 81 EC D8 00 00 00 44 0F 29 BC 24 C0 00 00 00",
+     "unique": true,
+     "check": "41 57 41 56 56 57 55 53 48 81 EC D8 00 00 00 44"
+    }
+   }
+  },
+  {
+   "name": "ItemUpdateHook",
+   "purpose": "InventoryItemRenderer::update（計測のみ）",
+   "breaks": "Perf の HUD 計測行",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?update@InventoryItemRenderer@@UEAA_NAEAVIClientInstance@@AEAVUIControl@@AEBVUIScene@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x8DDA3A0",
+     "pattern": "55 56 57 53 48 83 EC 68 48 8D 6C 24 60 48 C7 45 00 FE FF FF FF 4C 89 C3 48 89 D7 48 89 CE 48 8B 02",
+     "unique": true,
+     "check": "55 56 57 53 48 83 EC 68 48 8D 6C 24 60 48 C7 45"
+    },
+    "1.26.60.5": {
+     "rva": "0x5755400",
+     "pattern": "55 56 57 53 48 83 EC 68 48 8D 6C 24 60 48 C7 45 00 FE FF FF FF 4C 89 C3 48 89 D7 48 89 CE 48 8B 02",
+     "unique": true,
+     "check": "55 56 57 53 48 83 EC 68 48 8D 6C 24 60 48 C7 45"
+    }
+   }
+  },
+  {
+   "name": "ItemRenderHook",
+   "purpose": "InventoryItemRenderer::render（計測のみ）",
+   "breaks": "Perf の HUD 計測行",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?render@InventoryItemRenderer@@UEAAXAEAVMinecraftUIRenderContext@@AEAVIClientInstance@@AEAVUIControl@@H@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x8DDB400",
+     "pattern": "55 41 57 41 56 41 54 56 57 53 48 81 EC 40 01 00 00 48 8D AC 24 80 00 00 00 0F 29 B5 B0 00 00 00 48 C7 85 A8 00 00 00 FE FF FF FF 48 8B 81 00 01 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 54 56 57 53 48 81 EC 40 01 00"
+    },
+    "1.26.60.5": {
+     "rva": "0x5756490",
+     "pattern": "55 41 57 41 56 41 54 56 57 53 48 81 EC 40 01 00 00 48 8D AC 24 80 00 00 00 0F 29 B5 B0 00 00 00 48 C7 85 A8 00 00 00 FE FF FF FF 48 8B 81 00 01 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 54 56 57 53 48 81 EC 40 01 00"
+    }
+   }
+  },
+  {
+   "name": "DollBuildHook",
+   "purpose": "PaperDollClientInstanceUpdateContext::createOrUpdateSkin",
+   "breaks": "ホーム/一時停止の人形のスキン",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?createOrUpdateSkin@PaperDollClientInstanceUpdateContext@@UEAAXAEAVAnimationComponent@@AEBVSerializedSkinRef@@AEBUSkinImages@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x8DE2520",
+     "pattern": "48 81 EC 88 00 00 00 48 8B 05 ?? ?? ?? ?? 48 31 E0 48 89 84 24 80 00 00 00 48 C7 44 24 78 00 00 00 00",
+     "unique": true,
+     "check": "48 81 EC 88 00 00 00 48 8B 05 52 7B 9F 08 48 31"
+    },
+    "1.26.60.5": {
+     "rva": "0x575CAF0",
+     "pattern": "48 81 EC 88 00 00 00 48 8B 05 ?? ?? ?? ?? 48 31 E0 48 89 84 24 80 00 00 00 48 C7 44 24 78 00 00 00 00",
+     "unique": true,
+     "check": "48 81 EC 88 00 00 00 48 8B 05 C2 B5 BA 0C 48 31"
+    }
+   }
+  },
+  {
+   "name": "DollReadyHook",
+   "purpose": "人形のスキン準備判定（26.51 isAnySkinOfNameInitialized / 26.60 isSkinReadyToRender）",
+   "breaks": "ホーム/一時停止の人形のスキン",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?isAnySkinOfNameInitialized@PaperDollClientInstanceUpdateContext@@UEBA_NV?$basic_string_view@DU?$char_traits@D@std@@@std@@@Z",
+    "?isSkinReadyToRender@PaperDollClientInstanceUpdateContext@@UEBA_NV?$basic_string_view@DU?$char_traits@D@std@@@std@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x8DE21A0",
+     "pattern": "48 83 EC 38 48 8B 05 ?? ?? ?? ?? 48 31 E0 48 89 44 24 30 0F 10 02 0F 29 44 24 20 48 8B 49 08",
+     "unique": true,
+     "check": "48 83 EC 38 48 8B 05 D5 7E 9F 08 48 31 E0 48 89"
+    },
+    "1.26.60.5": {
+     "rva": "0x575C7B0",
+     "pattern": "56 57 48 83 EC 38 48 89 D7 48 8B 05 ?? ?? ?? ?? 48 31 E0 48 89 44 24 30 48 8B 49 08",
+     "unique": true,
+     "check": "56 57 48 83 EC 38 48 89 D7 48 8B 05 00 B9 BA 0C"
+    }
+   }
+  },
+  {
+   "name": "DollSkinHook",
+   "purpose": "PaperDollClientInstanceUpdateContext::getSkinFromPlayer",
+   "breaks": "ホーム/一時停止の人形のスキン",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?getSkinFromPlayer@PaperDollClientInstanceUpdateContext@@UEAA?AV?$optional@UPaperDollPlayerSkinInfo@@@std@@AEBVUUID@mce@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x8DE27F0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC 58 48 8D 6C 24 50 48 C7 45 00 FE FF FF FF 4D 89 C6 48 89 D6 48 89 CB",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC 58"
+    }
+   }
+  },
+  {
+   "name": "DollUpdateHook",
+   "purpose": "PaperDollRenderer::_update",
+   "breaks": "ホーム/一時停止の人形のスキン",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?_update@PaperDollRenderer@@QEAAXAEAVIPaperDollUpdateContext@@AEBUPaperDollUpdateOwnerData@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x8DE5A00",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 38 03 00 00 48 8D AC 24 80 00 00 00 0F 29 BD A0 02 00 00 0F 29 B5 90 02 00 00 48 C7 85 88 02 00 00 FE FF FF FF 4C 89 C7 48 89 CE",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 38"
+    },
+    "1.26.60.5": {
+     "rva": "0x57629A0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC B8 02 00 00 48 8D AC 24 80 00 00 00 0F 29 BD 20 02 00 00 0F 29 B5 10 02 00 00 48 C7 85 08 02 00 00 FE FF FF FF 4D 89 C6",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC B8"
+    }
+   }
+  },
+  {
+   "name": "??1GameConnectionInfo@Social@@QEAA@XZ",
+   "purpose": "Social::GameConnectionInfo の破棄（呼ぶだけ）",
+   "breaks": "リプレイ参加（26.51）",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "??1GameConnectionInfo@Social@@QEAA@XZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0xC6A80",
+     "pattern": "56 57 48 83 EC 28 48 89 CE 48 8B B9 08 03 00 00",
+     "unique": true,
+     "check": "56 57 48 83 EC 28 48 89 CE 48 8B B9 08 03 00 00"
+    }
+   }
+  },
+  {
+   "name": "?_buildClientStack@MinecraftGame@@QEAAXXZ",
+   "purpose": "MinecraftGame::_buildClientStack（パック積み直し）",
+   "breaks": "テクスチャ切替",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?_buildClientStack@MinecraftGame@@QEAAXXZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x7C4050",
+     "pattern": "55 41 56 56 57 53 48 81 EC C0 00 00 00 48 8D AC 24 80 00 00 00 0F 29 75 30 48 C7 45 28 FE FF FF FF 48 89 CE 48 8B 0D ?? ?? ?? ?? 48 8B 01 48 8B 40 10 B2 4E FF 15 ?? ?? ?? ?? 88 45 27 48 8B 0D ?? ?? ?? ?? 48 8B 01 48 8B 40 08 BA 28 00 00 00 FF 15 ?? ?? ?? ?? 48 89 C7 48 85 C0 0F 84 ?? ?? ?? ?? 48 8D 05 ?? ?? ?? ?? 48 89 07 0F 57 F6 0F 11 77 08 0F 11 77 18 48 89 7D F8 48 89 7D E0",
+     "unique": true,
+     "check": "55 41 56 56 57 53 48 81 EC C0 00 00 00 48 8D AC"
+    }
+   }
+  },
+  {
+   "name": "?_composeFullStack@ResourcePackManager@@QEAAXXZ",
+   "purpose": "ResourcePackManager::_composeFullStack",
+   "breaks": "テクスチャ切替",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?_composeFullStack@ResourcePackManager@@QEAAXXZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x14C9010",
+     "pattern": "55 41 56 56 57 53 48 83 EC 30 48 8D 6C 24 30 48 C7 45 F8 FE FF FF FF 48 89 CE 48 8B 79 60",
+     "unique": true,
+     "check": "55 41 56 56 57 53 48 83 EC 30 48 8D 6C 24 30 48"
+    },
+    "1.26.60.5": {
+     "rva": "0x17CC040",
+     "pattern": "55 41 57 41 56 56 57 53 48 83 EC 38 48 8D 6C 24 30 48 C7 45 00 FE FF FF FF 48 89 CE 48 8B B9 F8 00 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 56 57 53 48 83 EC 38 48 8D 6C 24"
+    }
+   }
+  },
+  {
+   "name": "?_deeplinkToServer@GameArguments@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@H_N@Z",
+   "purpose": "GameArguments::_deeplinkToServer。サーバーへ接続させる",
+   "breaks": "リプレイ再生の自動参加（無いと minecraft:// リンク）",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?_deeplinkToServer@GameArguments@@QEAAXAEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@H_N@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x95AE90",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC F8 01 00 00 48 8D AC 24 80 00 00 00 0F 29 B5 60 01 00 00 48 C7 85 58 01 00 00 FE FF FF FF 45 88 CC",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC F8"
+    }
+   }
+  },
+  {
+   "name": "?_deserializeGlobalResourcePacks@MinecraftGame@@QEAA?AV?$unique_ptr@VResourcePackStack@@U?$default_delete@VResourcePackStack@@@std@@@std@@XZ",
+   "purpose": "MinecraftGame::_deserializeGlobalResourcePacks",
+   "breaks": "テクスチャ切替の診断",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?_deserializeGlobalResourcePacks@MinecraftGame@@QEAA?AV?$unique_ptr@VResourcePackStack@@U?$default_delete@VResourcePackStack@@@std@@@std@@XZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x773490",
+     "pattern": "55 41 56 56 57 53 48 81 EC 60 01 00 00 48 8D AC 24 80 00 00 00 48 C7 85 D8 00 00 00 FE FF FF FF 48 89 D6 48 89 CF 8B 05 ?? ?? ?? ??",
+     "unique": true,
+     "check": "55 41 56 56 57 53 48 81 EC 60 01 00 00 48 8D AC"
+    }
+   }
+  },
+  {
+   "name": "?_loadLastGlobalResourcePacksFromFile@MinecraftGame@@QEAAX_N@Z",
+   "purpose": "MinecraftGame::_loadLastGlobalResourcePacksFromFile。パック一覧の再読込",
+   "breaks": "テクスチャ切替",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?_loadLastGlobalResourcePacksFromFile@MinecraftGame@@QEAAX_N@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x773030",
+     "pattern": "55 41 57 41 56 41 54 56 57 53 48 81 EC B0 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 28 FE FF FF FF 88 D3",
+     "unique": true,
+     "check": "55 41 57 41 56 41 54 56 57 53 48 81 EC B0 00 00"
+    },
+    "1.26.60.5": {
+     "rva": "0x837E80",
+     "pattern": "55 41 57 41 56 41 54 56 57 53 48 81 EC B0 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 28 FE FF FF FF 88 D3",
+     "unique": true,
+     "check": "55 41 57 41 56 41 54 56 57 53 48 81 EC B0 00 00"
+    }
+   }
+  },
+  {
+   "name": "?buildDescriptionName@Block@@QEBA?AV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ",
+   "purpose": "Block::buildDescriptionName",
+   "breaks": "Block Details",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?buildDescriptionName@Block@@QEBA?AV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@XZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x2A6DF00",
+     "pattern": "55 56 57 53 48 83 EC 38 48 8D 6C 24 30 48 C7 45 00 FE FF FF FF 48 89 D6 48 89 CB E8 ?? ?? ?? ?? 48 85 C0 74 ?? 48 89 C7 8B 05 ?? ?? ?? ??",
+     "unique": true,
+     "check": "55 56 57 53 48 83 EC 38 48 8D 6C 24 30 48 C7 45"
+    },
+    "1.26.60.5": {
+     "rva": "0x3169A70",
+     "pattern": "55 56 57 53 48 83 EC 38 48 8D 6C 24 30 48 C7 45 00 FE FF FF FF 48 89 D6 48 89 CB E8 ?? ?? ?? ?? 48 85 C0 74 ?? 48 89 C7 8B 05 ?? ?? ?? ??",
+     "unique": true,
+     "check": "55 56 57 53 48 83 EC 38 48 8D 6C 24 30 48 C7 45"
+    }
+   }
+  },
+  {
+   "name": "?createPacket@MinecraftPackets@@SA?AV?$shared_ptr@VPacket@@@std@@W4MinecraftPacketIds@@@Z",
+   "purpose": "MinecraftPackets::createPacket",
+   "breaks": "Closet のスキン送信 / パーティ",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?createPacket@MinecraftPackets@@SA?AV?$shared_ptr@VPacket@@@std@@W4MinecraftPacketIds@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x16AD850",
+     "pattern": "E9 ?? ?? ?? ??",
+     "unique": false,
+     "check": "?? ?? ?? ?? ?? 48 89 CE 81 FA 61 01 00 00 77 12",
+     "note": "パターンがこの関数だけに一致しない（中継関数か、同じ中身の関数が他にもある）。起動時は表の番地での一致だけを確かめる。新しい版では findsig の呼び出し元の照合で探す"
+    },
+    "1.26.60.5": {
+     "rva": "0x23768C0",
+     "pattern": "E9 ?? ?? ?? ??",
+     "unique": false,
+     "check": "?? ?? ?? ?? ?? 48 89 CE 81 FA 69 01 00 00 77 12",
+     "note": "パターンがこの関数だけに一致しない（中継関数か、同じ中身の関数が他にもある）。起動時は表の番地での一致だけを確かめる。新しい版では findsig の呼び出し元の照合で探す"
+    }
+   }
+  },
+  {
+   "name": "?getBiome@BlockSource@@QEBAAEBVBiome@@AEBVBlockPos@@@Z",
+   "purpose": "BlockSource::getBiome",
+   "breaks": "座標表示のバイオーム",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?getBiome@BlockSource@@QEBAAEBVBiome@@AEBVBlockPos@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x2D8CDD0",
+     "pattern": "56 57 48 83 EC 28 48 89 D7 48 89 CE 48 8B 01 48 8B 80 40 01 00 00",
+     "unique": true,
+     "check": "56 57 48 83 EC 28 48 89 D7 48 89 CE 48 8B 01 48"
+    },
+    "1.26.60.5": {
+     "rva": "0x32DC640",
+     "pattern": "56 57 48 83 EC 28 48 89 D7 48 89 CE 48 8B 01 48 8B 80 40 01 00 00",
+     "unique": true,
+     "check": "56 57 48 83 EC 28 48 89 D7 48 89 CE 48 8B 01 48"
+    }
+   }
+  },
+  {
+   "name": "?getBrightnessPair@BlockSource@@QEBA?AUBrightnessPair@@AEBVBlockPos@@@Z",
+   "purpose": "BlockSource::getBrightnessPair",
+   "breaks": "Block Details の明るさ",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?getBrightnessPair@BlockSource@@QEBA?AUBrightnessPair@@AEBVBlockPos@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x2D81300",
+     "pattern": "56 57 53 48 83 EC 30 4C 89 C7 48 89 D6 48 89 CB 48 8B 05 ?? ?? ?? ?? 48 31 E0 48 89 44 24 28 41 8B 00",
+     "unique": true,
+     "check": "56 57 53 48 83 EC 30 4C 89 C7 48 89 D6 48 89 CB"
+    },
+    "1.26.60.5": {
+     "rva": "0x32D1190",
+     "pattern": "56 57 53 48 83 EC 30 4C 89 C7 48 89 D6 48 89 CB 48 8B 05 ?? ?? ?? ?? 48 31 E0 48 89 44 24 28 41 8B 00",
+     "unique": true,
+     "check": "56 57 53 48 83 EC 30 4C 89 C7 48 89 D6 48 89 CB"
+    }
+   }
+  },
+  {
+   "name": "?getDamageValue@ItemStackBase@@QEBAFXZ",
+   "purpose": "ItemStackBase::getDamageValue",
+   "breaks": "Armor の耐久値",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?getDamageValue@ItemStackBase@@QEBAFXZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x24879D0",
+     "pattern": "56 57 48 83 EC 38 48 8B 05 ?? ?? ?? ?? 48 31 E0 48 89 44 24 30 48 8B 41 08 48 85 C0 74 ?? 48 83 38 00",
+     "unique": true,
+     "check": "56 57 48 83 EC 38 48 8B 05 A3 26 35 0F 48 31 E0"
+    },
+    "1.26.60.5": {
+     "rva": "0x1ACF510",
+     "pattern": "56 57 48 83 EC 38 48 8B 05 ?? ?? ?? ?? 48 31 E0 48 89 44 24 30 48 8B 41 08 48 85 C0 74 ?? 48 83 38 00",
+     "unique": true,
+     "check": "56 57 48 83 EC 38 48 8B 05 A3 8B 83 10 48 31 E0"
+    }
+   }
+  },
+  {
+   "name": "?getDimension@Actor@@QEBAAEAVDimension@@XZ",
+   "purpose": "Actor::getDimension",
+   "breaks": "Full Bright（ジ・エンド判定）・座標系",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?getDimension@Actor@@QEBAAEAVDimension@@XZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x19F6BE0",
+     "pattern": "56 57 48 83 EC 28 48 8B 91 D0 01 00 00 8B 42 08 44 8D 40 01 F0 44 0F B1 42 08 75 ?? 48 8B B1 C8 01 00 00 48 8B B9 D0 01 00 00 48 85 FF 74 ?? F0 FF 4F 08 75 ?? 48 8B 07 48 8B 00 48 89 F9 FF 15 ?? ?? ?? ?? F0 FF 4F 0C 75 ?? 48 8B 07 48 8B 40 08 48 89 F9 FF 15 ?? ?? ?? ?? 48 89 F0",
+     "unique": true,
+     "check": "56 57 48 83 EC 28 48 8B 91 D0 01 00 00 8B 42 08"
+    },
+    "1.26.60.5": {
+     "rva": "0xBA16E0",
+     "pattern": "56 57 48 83 EC 28 48 8B 91 F8 01 00 00 8B 42 08 44 8D 40 01 F0 44 0F B1 42 08 75 ?? 48 8B B1 F0 01 00 00 48 8B B9 F8 01 00 00 48 85 FF 74 ?? F0 FF 4F 08 75 ?? 48 8B 07 48 8B 00 48 89 F9 FF 15 ?? ?? ?? ?? F0 FF 4F 0C 75 ?? 48 8B 07 48 8B 40 08 48 89 F9 FF 15 ?? ?? ?? ?? 48 89 F0",
+     "unique": true,
+     "check": "56 57 48 83 EC 28 48 8B 91 F8 01 00 00 8B 42 08"
+    }
+   }
+  },
+  {
+   "name": "?getDimensionBlockSource@Actor@@QEBAAEAVBlockSource@@XZ",
+   "purpose": "Actor::getDimensionBlockSource",
+   "breaks": "Block Details / 資源カウンター",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?getDimensionBlockSource@Actor@@QEBAAEAVBlockSource@@XZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x19EA3A0",
+     "pattern": "56 57 48 83 EC 28 48 8B 91 D0 01 00 00 8B 42 08 44 8D 40 01 F0 44 0F B1 42 08 75 ?? 48 8B B1 C8 01 00 00 48 8B B9 D0 01 00 00 48 85 FF 74 ?? F0 FF 4F 08 75 ?? 48 8B 07 48 8B 00 48 89 F9 FF 15 ?? ?? ?? ?? F0 FF 4F 0C 75 ?? 48 8B 07 48 8B 40 08 48 89 F9 FF 15 ?? ?? ?? ?? 48 8B 06",
+     "unique": true,
+     "check": "56 57 48 83 EC 28 48 8B 91 D0 01 00 00 8B 42 08"
+    },
+    "1.26.60.5": {
+     "rva": "0xB950B0",
+     "pattern": "56 57 48 83 EC 28 48 8B 91 F8 01 00 00 8B 42 08 44 8D 40 01 F0 44 0F B1 42 08 75 ?? 48 8B B1 F0 01 00 00 48 8B B9 F8 01 00 00 48 85 FF 74 ?? F0 FF 4F 08 75 ?? 48 8B 07 48 8B 00 48 89 F9 FF 15 ?? ?? ?? ?? F0 FF 4F 0C 75 ?? 48 8B 07 48 8B 40 08 48 89 F9 FF 15 ?? ?? ?? ?? 48 8B 06",
+     "unique": true,
+     "check": "56 57 48 83 EC 28 48 8B 91 F8 01 00 00 8B 42 08"
+    }
+   }
+  },
+  {
+   "name": "?getDisplayObjective@Scoreboard@@QEBAPEBVDisplayObjective@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z",
+   "purpose": "Scoreboard::getDisplayObjective",
+   "breaks": "Hive 統計",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?getDisplayObjective@Scoreboard@@QEBAPEBVDisplayObjective@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x557990",
+     "pattern": "41 57 41 56 56 57 53 48 83 EC 20 48 89 D6 48 8B 7A 10 48 83 7A 18 10 72 ?? 48 8B 36 49 B9 25 23 22 84 E4 9C F2 CB 48 85 FF 74 ?? 48 B8 B3 01 00 00 00 01 00 00 89 FA 83 E2 03 48 83 FF 04 73 ?? 45 31 C0 EB ??",
+     "unique": false,
+     "check": "41 57 41 56 56 57 53 48 83 EC 20 48 89 D6 48 8B",
+     "note": "パターンがこの関数だけに一致しない（中継関数か、同じ中身の関数が他にもある）。起動時は表の番地での一致だけを確かめる。新しい版では findsig の呼び出し元の照合で探す"
+    }
+   }
+  },
+  {
+   "name": "?getEntityTypeId@Actor@@QEBA?AW4ActorType@@XZ",
+   "purpose": "Actor::getEntityTypeId",
+   "breaks": "Arrows / Hitbox / エンティティ分類",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?getEntityTypeId@Actor@@QEBA?AW4ActorType@@XZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x19F2180",
+     "pattern": "48 83 EC 28 48 8B 51 10 8B 41 18 48 8B 4A 48 4C 8B 42 50 49 29 C8 49 C1 E8 03 41 FF C8 41 81 E0 19 A4 6B 4F 4E 8D 0C C1 48 8B 4A 68 0F 1F 40 00 4D 8B 01 49 83 F8 FF 0F 84 ?? ?? ?? ?? 49 C1 E0 05 4E 8D 0C 01 42 81 7C 01 08 19 A4 6B 4F 75 ?? 4C 01 C1 48 39 4A 70 74 ?? 48 8B 49 10 48 85 C9 74 ?? 89 C2 81 E2 FF FF 03 00 41 89 D0 41 C1 E8 0B 4C 8B 49 08 4C 8B 51 10 4D 29 CA 49 C1 FA 03 4D 39 D0 73 ?? 4F 8B 04 C1 4D 85 C0 74 ?? 81 E2 FF 07 00 00 25 00 00 FC FF 41 8B 14 90 31 D0 3D FE FF 03 00 77 ?? 48 8B 41 50 89 D1 C1 E9 04 81 E1 F8 3F 00 00 48 8B 04 08 48 85 C0 74 ?? 81 E2 FF FF 03 00",
+     "unique": false,
+     "check": "48 83 EC 28 48 8B 51 10 8B 41 18 48 8B 4A 48 4C",
+     "note": "パターンがこの関数だけに一致しない（中継関数か、同じ中身の関数が他にもある）。起動時は表の番地での一致だけを確かめる。新しい版では findsig の呼び出し元の照合で探す"
+    },
+    "1.26.60.5": {
+     "rva": "0xB9CAB0",
+     "pattern": "48 83 EC 28 48 8B 51 10 8B 41 18 48 8B 4A 48 4C 8B 42 50 49 29 C8 49 C1 E8 03 41 FF C8 41 81 E0 19 A4 6B 4F 4E 8D 0C C1 48 8B 4A 68 0F 1F 40 00 4D 8B 01 49 83 F8 FF 0F 84 ?? ?? ?? ?? 49 C1 E0 05 4E 8D 0C 01 42 81 7C 01 08 19 A4 6B 4F 75 ?? 4C 01 C1 48 39 4A 70 74 ?? 48 8B 49 10 48 85 C9 74 ?? 89 C2 81 E2 FF FF 03 00 41 89 D0 41 C1 E8 0B 4C 8B 49 08 4C 8B 51 10 4D 29 CA 49 C1 FA 03 4D 39 D0 73 ?? 4F 8B 04 C1 4D 85 C0 74 ?? 81 E2 FF 07 00 00 25 00 00 FC FF 41 8B 14 90 31 D0 3D FE FF 03 00 77 ?? 48 8B 41 50 89 D1 C1 E9 04 81 E1 F8 3F 00 00 48 8B 04 08 48 85 C0 74 ?? 81 E2 FF FF 03 00",
+     "unique": false,
+     "check": "48 83 EC 28 48 8B 51 10 8B 41 18 48 8B 4A 48 4C",
+     "note": "パターンがこの関数だけに一致しない（中継関数か、同じ中身の関数が他にもある）。起動時は表の番地での一致だけを確かめる。新しい版では findsig の呼び出し元の照合で探す"
+    }
+   }
+  },
+  {
+   "name": "?getEyePos@Actor@@QEBA?AVVec3@@XZ",
+   "purpose": "Actor::getEyePos",
+   "breaks": "Arrows / カメラ推定",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?getEyePos@Actor@@QEBA?AVVec3@@XZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x19F7FC0",
+     "pattern": "56 57 48 83 EC 38 48 89 D6 48 89 CF 48 8D 54 24 2C",
+     "unique": true,
+     "check": "56 57 48 83 EC 38 48 89 D6 48 89 CF 48 8D 54 24"
+    },
+    "1.26.60.5": {
+     "rva": "0xBA2930",
+     "pattern": "56 57 48 83 EC 38 48 89 D6 48 89 CF 48 8D 54 24 28",
+     "unique": true,
+     "check": "56 57 48 83 EC 38 48 89 D6 48 89 CF 48 8D 54 24"
+    }
+   }
+  },
+  {
+   "name": "?getHealth@ActorAttribute@@YAHAEBVEntityContext@@@Z",
+   "purpose": "ActorAttribute::getHealth",
+   "breaks": "体力表示",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?getHealth@ActorAttribute@@YAHAEBVEntityContext@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x25397A0",
+     "pattern": "48 83 EC 28 48 8B 51 08 8B 49 10 48 8B 42 48 4C 8B 42 50 49 29 C0 49 C1 E8 03 41 FF C8 41 81 E0 13 06 3B FD 4E 8D 14 C0 4C 8B 42 68 31 C0 66 90 4D 8B 0A 49 83 F9 FF 0F 84 ?? ?? ?? ?? 49 C1 E1 05 4F 8D 14 08 43 81 7C 08 08 13 06 3B FD 75 ?? 4D 01 C8 4C 39 42 70 0F 84 ?? ?? ?? ?? 49 8B 50 10 48 85 D2 0F 84 ?? ?? ?? ?? 41 89 C8 41 81 E0 FF FF 03 00 45 89 C1 41 C1 E9 0B 4C 8B 52 08 4C 8B 5A 10 4D 29 D3 49 C1 FB 03 4D 39 D9 73 ?? 4F 8B 0C CA 4D 85 C9 74 ?? 41 81 E0 FF 07 00 00 81 E1 00 00 FC FF 47 8B 04 81 44 31 C1 81 F9 FE FF 03 00 77 ?? 48 8B 4A 50 44 89 C2 C1 EA 04 81 E2 F8 3F 00 00",
+     "unique": false,
+     "check": "48 83 EC 28 48 8B 51 08 8B 49 10 48 8B 42 48 4C",
+     "note": "パターンがこの関数だけに一致しない（中継関数か、同じ中身の関数が他にもある）。起動時は表の番地での一致だけを確かめる。新しい版では findsig の呼び出し元の照合で探す"
+    }
+   }
+  },
+  {
+   "name": "?getInterpolatedPosition@Actor@@QEBA?AVVec3@@M@Z",
+   "purpose": "Actor::getInterpolatedPosition",
+   "breaks": "Hitbox の位置合わせ",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?getInterpolatedPosition@Actor@@QEBA?AVVec3@@M@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x1A244E0",
+     "pattern": "56 48 83 EC 10 0F 29 34 24 48 89 D0",
+     "unique": true,
+     "check": "56 48 83 EC 10 0F 29 34 24 48 89 D0 4C 8B 41 10"
+    },
+    "1.26.60.5": {
+     "rva": "0xBCDA70",
+     "pattern": "56 48 89 D0 4C 8B 41 10 8B 51 18 4D 8B 48 48",
+     "unique": true,
+     "check": "56 48 89 D0 4C 8B 41 10 8B 51 18 4D 8B 48 48 4D"
+    }
+   }
+  },
+  {
+   "name": "?handle@LegacyClientNetworkHandler@@UEAAXAEBVNetworkIdentifier@@AEBVPlayerSkinPacket@@@Z",
+   "purpose": "PlayerSkinPacket の受信",
+   "breaks": "Closet（他人からの見え方の追跡）",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?handle@LegacyClientNetworkHandler@@UEAAXAEBVNetworkIdentifier@@AEBVPlayerSkinPacket@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x134A4C0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC 48 48 8D 6C 24 40 48 C7 45 00 FE FF FF FF 48 8B 81 58 02 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC 48"
+    }
+   }
+  },
+  {
+   "name": "?isEnchanted@ItemStackBase@@QEBA_NXZ",
+   "purpose": "ItemStackBase::isEnchanted",
+   "breaks": "アイテム表示の光沢",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?isEnchanted@ItemStackBase@@QEBA_NXZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x24886B0",
+     "pattern": "48 83 EC 38 48 8B 05 ?? ?? ?? ?? 48 31 E0 48 89 44 24 30 48 8B 49 10 48 85 C9 74 ?? 48 8D 05 ?? ?? ?? ??",
+     "unique": true,
+     "check": "48 83 EC 38 48 8B 05 C5 19 35 0F 48 31 E0 48 89"
+    }
+   }
+  },
+  {
+   "name": "?isSpectator@Actor@@QEBA_NXZ",
+   "purpose": "Actor::isSpectator",
+   "breaks": "Hitbox / エンティティ分類",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?isSpectator@Actor@@QEBA_NXZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x19E0B30",
+     "pattern": "56 48 83 EC 20 48 8B 51 10 8B 41 18 4C 8B 42 48 4C 8B 4A 50 4D 29 C1 49 C1 E9 03 41 FF C9 41 81 E1 DF ED D3 88 4F 8D 14 C8 4C 8B 42 68 0F 1F 00 4D 8B 0A 49 83 F9 FF 0F 84 ?? ?? ?? ?? 49 C1 E1 05 4F 8D 14 08 43 81 7C 08 08 DF ED D3 88 75 ?? 4D 01 C8 4C 39 42 70 0F 84 ?? ?? ?? ?? 49 8B 50 10 48 85 D2 0F 84 ?? ?? ?? ?? 41 89 C0 41 81 E0 FF FF 03 00 45 89 C1 41 C1 E9 0B 4C 8B 52 08 4C 8B 5A 10 4D 29 D3 49 C1 FB 03 4D 39 D9 73 ?? 4F 8B 0C CA 4D 85 C9 74 ?? 41 81 E0 FF 07 00 00 25 00 00 FC FF 47 8B 04 81 44 31 C0 3D FE FF 03 00 77 ?? 48 8B 42 50 44 89 C2 C1 EA 04 81 E2 F8 3F 00 00",
+     "unique": false,
+     "check": "56 48 83 EC 20 48 8B 51 10 8B 41 18 4C 8B 42 48",
+     "note": "パターンがこの関数だけに一致しない（中継関数か、同じ中身の関数が他にもある）。起動時は表の番地での一致だけを確かめる。新しい版では findsig の呼び出し元の照合で探す"
+    },
+    "1.26.60.5": {
+     "rva": "0xB8B580",
+     "pattern": "56 48 83 EC 20 48 8B 51 10 8B 41 18 4C 8B 42 48 4C 8B 4A 50 4D 29 C1 49 C1 E9 03 41 FF C9 41 81 E1 DF ED D3 88 4F 8D 14 C8 4C 8B 42 68 0F 1F 00 4D 8B 0A 49 83 F9 FF 0F 84 ?? ?? ?? ?? 49 C1 E1 05 4F 8D 14 08 43 81 7C 08 08 DF ED D3 88 75 ?? 4D 01 C8 4C 39 42 70 0F 84 ?? ?? ?? ?? 49 8B 50 10 48 85 D2 0F 84 ?? ?? ?? ?? 41 89 C0 41 81 E0 FF FF 03 00 45 89 C1 41 C1 E9 0B 4C 8B 52 08 4C 8B 5A 10 4D 29 D3 49 C1 FB 03 4D 39 D9 73 ?? 4F 8B 0C CA 4D 85 C9 74 ?? 41 81 E0 FF 07 00 00 25 00 00 FC FF 47 8B 04 81 44 31 C0 3D FE FF 03 00 77 ?? 48 8B 42 50 44 89 C2 C1 EA 04 81 E2 F8 3F 00 00",
+     "unique": false,
+     "check": "56 48 83 EC 20 48 8B 51 10 8B 41 18 4C 8B 42 48",
+     "note": "パターンがこの関数だけに一致しない（中継関数か、同じ中身の関数が他にもある）。起動時は表の番地での一致だけを確かめる。新しい版では findsig の呼び出し元の照合で探す"
+    }
+   }
+  },
+  {
+   "name": "?markLocalPlayerAsDirty@PaperDollClientInstanceUpdateContext@@UEAAXXZ",
+   "purpose": "人形の更新要求",
+   "breaks": "ホーム/一時停止の人形のスキン",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?markLocalPlayerAsDirty@PaperDollClientInstanceUpdateContext@@UEAAXXZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x8DE2220",
+     "pattern": "55 56 57 53 48 83 EC 48 48 8D 6C 24 40 48 C7 45 00 FE FF FF FF 48 89 CF 48 8B 49 08",
+     "unique": true,
+     "check": "55 56 57 53 48 83 EC 48 48 8D 6C 24 40 48 C7 45"
+    }
+   }
+  },
+  {
+   "name": "?setStack@ResourcePackManager@@QEAA_NV?$unique_ptr@VResourcePackStack@@U?$default_delete@VResourcePackStack@@@std@@@std@@W4ResourcePackStackType@@@Z",
+   "purpose": "ResourcePackManager::setStack",
+   "breaks": "テクスチャ切替",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?setStack@ResourcePackManager@@QEAA_NV?$unique_ptr@VResourcePackStack@@U?$default_delete@VResourcePackStack@@@std@@@std@@W4ResourcePackStackType@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x14C7F20",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC C8 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 40 FE FF FF FF 44 89 C7",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC C8"
+    },
+    "1.26.60.5": {
+     "rva": "0x17CABD0",
+     "pattern": "55 41 57 41 56 41 54 56 57 53 48 81 EC 80 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 F8 FE FF FF FF 44 89 C7 48 89 55 E8",
+     "unique": true,
+     "check": "55 41 57 41 56 41 54 56 57 53 48 81 EC 80 00 00"
+    }
+   }
+  },
+  {
+   "name": "?tick@GameArguments@@UEAAXXZ",
+   "purpose": "GameArguments::tick。リプレイ参加をゲームのスレッドで行う",
+   "breaks": "リプレイ再生の自動参加",
+   "fatal": false,
+   "lastUpdated": "1.26.51.1",
+   "symbols": [
+    "?tick@GameArguments@@UEAAXXZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x94A9D0",
+     "pattern": "56 57 53 48 83 EC 20 48 8B 79 20 48 8B 59 28 48 39 DF 74 ?? 48 89 CE 66 0F 1F 84 00 00 00 00 00",
+     "unique": true,
+     "check": "56 57 53 48 83 EC 20 48 8B 79 20 48 8B 59 28 48"
+    }
+   }
+  },
+  {
+   "name": "?$_subTick@ClientLevel@@QEAAXXZ",
+   "purpose": "ClientLevel::_subTick。ワールドに居ることと Level の取得",
+   "breaks": "起動処理（enable が失敗）。ワールド依存の全機能",
+   "fatal": true,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?$_subTick@ClientLevel@@QEAAXXZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x12F4BB0",
+     "pattern": "55 56 57 53 48 81 EC D8 00 00 00 48 8D AC 24 80 00 00 00 44 0F 29 6D 40",
+     "unique": true,
+     "check": "55 56 57 53 48 81 EC D8 00 00 00 48 8D AC 24 80"
+    },
+    "1.26.60.5": {
+     "rva": "0x6B8D550",
+     "pattern": "55 56 57 53 48 81 EC D8 00 00 00 48 8D AC 24 80 00 00 00 44 0F 29 6D 40",
+     "unique": true,
+     "check": "55 56 57 53 48 81 EC D8 00 00 00 48 8D AC 24 80"
+    }
+   }
+  },
+  {
+   "name": "?$onLevelExit@ClientInstance@@QEAAXXZ",
+   "purpose": "ClientInstance::onLevelExit。ワールドから出たことの検出",
+   "breaks": "起動処理（enable が失敗）",
+   "fatal": true,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?$onLevelExit@ClientInstance@@QEAAXXZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x5DB4220",
+     "pattern": "55 56 57 53 48 83 EC 38 48 8D 6C 24 30 48 C7 45 00 FE FF FF FF 48 89 CF 48 8D B1 78 FF FF FF",
+     "unique": true,
+     "check": "55 56 57 53 48 83 EC 38 48 8D 6C 24 30 48 C7 45"
+    },
+    "1.26.60.5": {
+     "rva": "0x65A3350",
+     "pattern": "55 56 57 53 48 83 EC 38 48 8D 6C 24 30 48 C7 45 00 FE FF FF FF 48 89 CF 48 8D B1 78 FF FF FF",
+     "unique": true,
+     "check": "55 56 57 53 48 83 EC 38 48 8D 6C 24 30 48 C7 45"
+    }
+   }
+  },
+  {
+   "name": "?_updateTextureAtlasPBRData@MinecraftGame@@QEAAXAEBVTextureAtlas@@_N@Z",
+   "purpose": "MinecraftGame::_updateTextureAtlasPBRData。地形テクスチャ更新完了",
+   "breaks": "テクスチャ切替（ワールド内）",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?_updateTextureAtlasPBRData@MinecraftGame@@QEAAXAEBVTextureAtlas@@_N@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x7F0130",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC F8 00 00 00 48 8D AC 24 80 00 00 00 44 0F 29 4D 60 44 0F 29 45 50 0F 29 7D 40 0F 29 75 30 48 C7 45 28 FE FF FF FF 48 89 D6",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC F8"
+    },
+    "1.26.60.5": {
+     "rva": "0x8923F0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC D8 00 00 00 48 8D AC 24 80 00 00 00 0F 29 75 40 48 C7 45 38 FE FF FF FF 48 89 D6 48 89 CF 45 84 C0",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC D8"
+    }
+   }
+  },
+  {
+   "name": "LiveInvalidHook",
+   "purpose": "MinecraftGame::onFullPackStackInvalid",
+   "breaks": "テクスチャのワールド内反映",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?onFullPackStackInvalid@MinecraftGame@@UEAA_NXZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x824200",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 98 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 10 FE FF FF FF 48 89 CE 48 81 C1 70 FF FF FF",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 98"
+    },
+    "1.26.60.5": {
+     "rva": "0x8C1B10",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 88 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 00 FE FF FF FF 48 89 CE 48 81 C1 78 FF FF FF",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 88"
+    }
+   }
+  },
+  {
+   "name": "LiveInGameHook",
+   "purpose": "MinecraftGame::isInGame",
+   "breaks": "テクスチャのワールド内反映",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?isInGame@MinecraftGame@@UEBA_NXZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x7F4620",
+     "pattern": "0F B6 81 28 05 00 00 24 01 C3",
+     "unique": true,
+     "check": "0F B6 81 28 05 00 00 24 01 C3 CC CC CC CC CC CC",
+     "note": "関数全体がこの長さしかない（短い関数）。一意には一致する"
+    },
+    "1.26.60.5": {
+     "rva": "0x896430",
+     "pattern": "0F B6 81 38 05 00 00 24 01 C3",
+     "unique": true,
+     "check": "0F B6 81 38 05 00 00 24 01 C3 CC CC CC CC CC CC",
+     "note": "関数全体がこの長さしかない（短い関数）。一意には一致する"
+    }
+   }
+  },
+  {
+   "name": "LiveLoadsComplete",
+   "purpose": "ResourceLoadManager::isComplete",
+   "breaks": "テクスチャのワールド内反映",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?isComplete@ResourceLoadManager@@QEBA_NXZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x192FDA0",
+     "pattern": "41 56 56 57 53 48 83 EC 28 48 89 CE 48 8B 59 70",
+     "unique": true,
+     "check": "41 56 56 57 53 48 83 EC 28 48 89 CE 48 8B 59 70"
+    },
+    "1.26.60.5": {
+     "rva": "0x1872B60",
+     "pattern": "41 56 56 57 53 48 83 EC 28 48 89 CE 48 8B 59 70",
+     "unique": true,
+     "check": "41 56 56 57 53 48 83 EC 28 48 89 CE 48 8B 59 70"
+    }
+   }
+  },
+  {
+   "name": "LiveWaitActors",
+   "purpose": "MinecraftGame::_onResumeWaitReloadActors",
+   "breaks": "テクスチャのワールド内反映",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?_onResumeWaitReloadActors@MinecraftGame@@AEAA?AW4WorkResult@SerialWorkList@@XZ",
+    "?_onResumeWaitReloadActors@MinecraftGame@@IEAA?AW4WorkResult@SerialWorkList@@XZ",
+    "?_onResumeWaitReloadActors@MinecraftGame@@QEAA?AW4WorkResult@SerialWorkList@@XZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x7EC5A0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC B8 00 00 00 48 8D AC 24 80 00 00 00 0F 29 75 20 48 C7 45 18 FE FF FF FF 48 8B 81 90 06 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC B8"
+    },
+    "1.26.60.5": {
+     "rva": "0x88F410",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC A8 00 00 00 48 8D AC 24 80 00 00 00 0F 29 75 10 48 C7 45 08 FE FF FF FF 48 8B 81 A0 06 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC A8"
+    }
+   }
+  },
+  {
+   "name": "LiveWorldRenderHook",
+   "purpose": "LevelRenderer::renderLevel",
+   "breaks": "テクスチャのワールド内反映（描画の保留）",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?renderLevel@LevelRenderer@@QEAAXAEAVScreenContext@@AEBUFrameRenderObject@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x47F84A0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 48 02 00 00 48 8D AC 24 80 00 00 00 44 0F 29 AD B0 01 00 00 44 0F 29 A5 A0 01 00 00 44 0F 29 9D 90 01 00 00 44 0F 29 95 80 01 00 00 44 0F 29 8D 70 01 00 00 44 0F 29 85 60 01 00 00 0F 29 BD 50 01 00 00 0F 29 B5 40 01 00 00 48 C7 85 38 01 00 00 FE FF FF FF 4D 89 C6",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 48"
+    },
+    "1.26.60.5": {
+     "rva": "0x535F980",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC F8 01 00 00 48 8D AC 24 80 00 00 00 44 0F 29 9D 60 01 00 00 44 0F 29 95 50 01 00 00 66 44 0F 7F 8D 40 01 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC F8"
+    }
+   }
+  },
+  {
+   "name": "LiveWorldPrepHook",
+   "purpose": "LevelRenderer::preRenderUpdate",
+   "breaks": "テクスチャのワールド内反映（描画の保留）",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?preRenderUpdate@LevelRenderer@@QEAAXAEAVScreenContext@@AEAULevelRenderPreRenderUpdateParameters@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x47F49A0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 18 04 00 00 48 8D AC 24 80 00 00 00 44 0F 29 8D 80 03 00 00 44 0F 29 85 70 03 00 00 0F 29 BD 60 03 00 00 0F 29 B5 50 03 00 00 48 C7 85 48 03 00 00 FE FF FF FF 4C 89 85 10 03 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 18"
+    },
+    "1.26.60.5": {
+     "rva": "0x5359660",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 88 04 00 00 48 8D AC 24 80 00 00 00 44 0F 29 BD F0 03 00 00 44 0F 29 B5 E0 03 00 00 44 0F 29 AD D0 03 00 00 44 0F 29 A5 C0 03 00 00 44 0F 29 9D B0 03 00 00 44 0F 29 95 A0 03 00 00 44 0F 29 8D 90 03 00 00 44 0F 29 85 80 03 00 00 0F 29 BD 70 03 00 00 0F 29 B5 60 03 00 00 48 C7 85 58 03 00 00 FE FF FF FF 4C 89 85 38 03 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 88"
+    }
+   }
+  },
+  {
+   "name": "LiveVisibilityHook",
+   "purpose": "RenderChunkCoordinator::_handleVisibilityUpdates",
+   "breaks": "テクスチャのワールド内反映",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?_handleVisibilityUpdates@RenderChunkCoordinator@@QEAAXXZ"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x1C9D140",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 48 01 00 00 48 8D AC 24 80 00 00 00 0F 29 BD B0 00 00 00 0F 29 B5 A0 00 00 00 48 C7 85 98 00 00 00 FE FF FF FF 48 83 B9 98 00 00 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 48"
+    },
+    "1.26.60.5": {
+     "rva": "0x79219B0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 48 01 00 00 48 8D AC 24 80 00 00 00 0F 29 BD B0 00 00 00 0F 29 B5 A0 00 00 00 48 C7 85 98 00 00 00 FE FF FF FF 48 83 B9 98 00 00 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 48"
+    }
+   }
+  },
+  {
+   "name": "LiveSceneRenderHook",
+   "purpose": "InGamePlayScreen::_renderLevel",
+   "breaks": "テクスチャのワールド内反映（任意）",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?_renderLevel@InGamePlayScreen@@UEAAXAEAVScreenContext@@AEBUFrameRenderObject@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x4BE360",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 58 01 00 00 48 8D AC 24 80 00 00 00 0F 29 B5 C0 00 00 00 48 C7 85 B8 00 00 00 FE FF FF FF 4D 89 C7",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 58"
+    },
+    "1.26.60.5": {
+     "rva": "0x4E0B490",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 68 01 00 00 48 8D AC 24 80 00 00 00 0F 29 B5 D0 00 00 00 48 C7 85 C8 00 00 00 FE FF FF FF 4D 89 C7",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 68"
+    }
+   }
+  },
+  {
+   "name": "LiveScenePrepHook",
+   "purpose": "InGamePlayScreen::_renderLevelPrep",
+   "breaks": "テクスチャのワールド内反映（任意）",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?_renderLevelPrep@InGamePlayScreen@@UEAAXAEAVScreenContext@@AEAVLevelRenderer@@AEAVActor@@@Z"
+   ],
+   "builds": {
+    "1.26.51.1": {
+     "rva": "0x4BA840",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 58 06 00 00 48 8D AC 24 80 00 00 00 44 0F 29 9D C0 05 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 58"
+    },
+    "1.26.60.5": {
+     "rva": "0x4E090C0",
+     "pattern": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 28 06 00 00 48 8D AC 24 80 00 00 00 44 0F 29 8D 90 05 00 00",
+     "unique": true,
+     "check": "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 28"
+    }
+   }
+  },
+  {
+   "name": "?_getItemStack@ContainerScreenController@@QEBAAEBVItemStack@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@H@Z",
+   "purpose": "ContainerScreenController::_getItemStack（名前で登録）",
+   "breaks": "シュルカーの中身表示",
+   "fatal": false,
+   "lastUpdated": "1.26.60.5",
+   "symbols": [
+    "?_getItemStack@ContainerScreenController@@QEBAAEBVItemStack@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@H@Z"
+   ],
+   "builds": {
+    "1.26.60.5": {
+     "rva": "0x4FE4ED0",
+     "pattern": "55 56 57 48 81 EC 80 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 F8 FE FF FF FF 48 89 CE 48 8D 7D A8 48 89 F9 E8 ?? ?? ?? ?? 48 8B 06 48 8B 80 D8 01 00 00 48 8D 55 D0 48 89 F1 49 89 F8 FF 15 ?? ?? ?? ?? 90 48 8B 45 C0 48 83 F8 10 72 ?? 48 8B 4D A8 48 8D 50 01 48 81 FA 00 10 00 00 72 ?? 4C 8B 41 F8 48 83 C1 F8 4C 29 C1 48 83 F9 20 0F 83 ?? ?? ?? ?? 48 83 C0 28 48 89 C2 4C 89 C1 E8 ?? ?? ?? ?? 48 83 7D E0 00 74 ??",
+     "unique": true,
+     "check": "55 56 57 48 81 EC 80 00 00 00 48 8D AC 24 80 00"
+    }
+   }
+  }
+ ],
+ "offsets": [
+  {
+   "name": "MinecraftGame.ResourcePackListener",
+   "purpose": "MinecraftGame の中の ResourcePackListener 基底の位置（テクスチャのワールド内反映が、ゲームの listener を直接呼ぶ）",
+   "breaks": "テクスチャのワールド内反映（0 なら使わず、タイトル画面で反映）",
+   "manual": "MinecraftGame のコンストラクタが vtable を書く位置を逆アセンブルで見る（26.51: game+0xC0、26.60: game+0xB8）。FeatureAdapter.cpp BeginLiveTextureReload は、その位置の vtable の slot 1/2 が onActiveResourcePacksChanged / onFullPackStackInvalid の番地と一致するか毎回確かめるので、誤った値ではワールド内反映が断られるだけ",
+   "builds": {
+    "1.26.51.1": "0xC0",
+    "1.26.60.5": "0xB8"
+   }
+  }
+ ]
+}

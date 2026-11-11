@@ -206,6 +206,10 @@ MSVC CRT 14.44、Windows SDK 10.0.26100、LLVM 21.1.8でクロスビルドしま
 ```sh
 g++ -std=c++17 -Wall -Wextra -Werror -I. -Ilauncher/vendor tests/launcher_updates.cpp launcher/vendor/tinyxml2/tinyxml2.cpp -o /tmp/myclient-updates
 /tmp/myclient-updates
+g++ -std=c++17 -Wall -Wextra -Werror -I. -Ilauncher/vendor tests/launcher_self_update.cpp launcher/vendor/tinyxml2/tinyxml2.cpp -o /tmp/myclient-self-update
+/tmp/myclient-self-update
+g++ -std=c++17 -Wall -Wextra -Werror -I. -Ilauncher/vendor tests/launcher_channels.cpp launcher/vendor/tinyxml2/tinyxml2.cpp -o /tmp/myclient-channels
+/tmp/myclient-channels   # テスト版・先行版（配信チャンネル）の判定: 署名付きリンク・アイコンURLの許可、権限が無いときの安定版への切り替え
 python3 tests/update_package.py
 ```
 

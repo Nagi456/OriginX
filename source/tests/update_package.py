@@ -51,7 +51,17 @@ with tempfile.TemporaryDirectory(prefix='myclient-publisher-') as temp:
     with zipfile.ZipFile(output / 'MyClient-update-release-assets.zip') as z:
         assert z.testzip() is None
         assert all(not name.startswith('myclient-26.51.1-r1/') for name in z.namelist())
+    assert all(f['url'].startswith(publisher.BASE_URL + '/myclient-26.51.1-r2/') for f in new['versions'][2]['files'].values())
+    # The HUD rides along as hud/MyClient.exe; it must be an x64 program.
+    hud = root / 'MyClient.exe'
+    hud.write_bytes(b'not a program')
+    reject(lambda: publisher.package(root, root / 'out-hud', revision=3, sequence=3, catalog_path=prior, package_dir=source, hud=hud))
+    hud.write_bytes(b'MZ' + b'\0' * 58 + (64).to_bytes(4, 'little') + b'PE\0\0\x64\x86' + b'\0' * 64)
+    publisher.package(root, root / 'out-hud', revision=3, sequence=3, catalog_path=prior, package_dir=source, hud=hud)
+    with_hud = json.loads((root / 'out-hud/catalog.json').read_bytes())
+    assert with_hud['versions'][2]['files']['hud/MyClient.exe']['url'] == publisher.BASE_URL + '/myclient-26.51.1-r3/hud__MyClient.exe'
+    assert (root / 'out-hud/myclient-26.51.1-r3/hud__MyClient.exe').read_bytes() == hud.read_bytes()
     reject(lambda: publisher.package(root, output, revision=3, sequence=3, package_dir=source, version='26.52.3'))
     (source / 'mods/MyClientData/extra.dll').write_text('unregistered DLL')
     reject(lambda: publisher.package(root, output, revision=3, sequence=3, package_dir=source))
-print('PASS: revision/catalog increments, same-revision rejection preserves outputs, prior versions retained, runtime mismatch and extra DLL rejection.')
+print('PASS: R2 URLs, the HUD, revision/catalog increments, same-revision rejection preserves outputs, prior versions retained, runtime mismatch and extra DLL rejection.')

@@ -78,6 +78,34 @@ int main()
     assert(rows[3].id == "26.40.5" && !rows[3].published && rows[3].installed && !rows[3].inCatalog);
     assert(rows[4].id == "1.21.132.1");
 
+    // All patches remain reachable within their family, including more than the old 12-row cap.
+    assert(VersionFamily("26.51.1") == "1.26");
+    assert(VersionFamily("1.21.132.1") == "1.21");
+    assert(VersionFamily("1.20.81.1") == "1.20");
+    std::vector<std::string> many;
+    for (int patch = 1; patch <= 20; ++patch) many.push_back("26." + std::to_string(patch) + ".1");
+    many.push_back("1.21.132.1");
+    many.push_back("1.20.81.1");
+    const auto families = GroupVersionRows(VersionRows(many, {}, {}));
+    assert(families.size() == 3 && families[0].label == "1.26" && families[0].rows.size() == 20);
+    assert(families[0].rows.front().id == "26.20.1" && families[0].rows.back().id == "26.1.1");
+    assert(families[1].label == "1.21" && families[2].label == "1.20");
+    assert(GroupVersionRows({}).empty());
+
+    // Only 1.26, starting at 26.45. Keep newer unsupported versions visible but never actionable.
+    const auto clientRows = ClientVersionRows(VersionRows(
+        {"26.44.9", "26.45.0", "26.45.1", "26.51.1", "26.62.1", "1.21.132.1", "27.1.0"},
+        {{"26.51.1", true}, {"26.62.1", false}}, {"26.62.1"}, {"26.62.1"}));
+    assert(clientRows.size() == 4 && clientRows.front().id == "26.62.1" && clientRows.back().id == "26.45.0");
+    assert(GroupVersionRows(clientRows).size() == 1);
+    assert(clientRows.front().installed && clientRows.front().downloadable);
+    assert(!ClientVersionSelectable(clientRows.front().id, clientRows.front().supported));
+    assert(ClientVersionSelectable("26.51.1", true));
+    assert(!ClientVersionSelectable("26.51.1", false));
+    assert(!ClientVersionSelectable("26.44.9", true));
+    assert(!ClientVersionSelectable("1.21.132.1", true));
+    assert(!ClientVersionSelectable("27.1.0", true));
+
     // Download links: only Minecraft packages on the Xbox CDN, HTTPS tried first, .cn mirrors last.
     const std::string cdn = "http://assets1.xboxlive.com/11/a/b/1.26.6005.0.c/Microsoft.MinecraftUWP_1.26.6005.0_x64__8wekyb3d8bbwe.msixvc";
     assert(GamePackageUrl(cdn));

@@ -1,0 +1,59 @@
+# Analyses a game image written by MyClientData.dll (client/GameImageDump.cpp), the way to find game functions
+# without LeviLamina's symbol table. The image is the user's own copy of the game, so it is kept out of the
+# repository: it is attached to a release of this private repository, and only the text results are committed.
+# 使い方: Releases に Minecraft.Windows-<版>-<時刻>.image と .image.txt（または両方を入れた zip）を添付 →
+#         Actions「analyze-game」→ tag（リリースのタグ）と asset（ファイル名）→ 結果は source/tools/game-analysis/<名前>/ にコミット。
+name: analyze-game
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag the image is attached to"
+        required: true
+      asset:
+        description: "Attached file: the .image (with its .image.txt next to it) or a .zip holding both"
+        required: true
+permissions:
+  contents: write
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      ASSET: ${{ inputs.asset }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download the image
+        run: |
+          mkdir -p "$RUNNER_TEMP/game"
+          gh release download "$TAG" -p "$ASSET" -D "$RUNNER_TEMP/game"
+          case "$ASSET" in
+            *.zip) (cd "$RUNNER_TEMP/game" && unzip -o -q "$ASSET" && rm -f "$ASSET") ;;
+            *.image) gh release download "$TAG" -p "$ASSET.txt" -D "$RUNNER_TEMP/game" || true ;;
+          esac
+          find "$RUNNER_TEMP/game" -name '*.image*' -exec ls -la {} \;
+      - name: Flarial's public signatures (only read, for comparison)
+        run: git clone -q --depth 1 https://github.com/flarialmc/dll "$RUNNER_TEMP/flarial"
+      - name: Analyse
+        run: |
+          image=$(find "$RUNNER_TEMP/game" -name '*.image' | head -1)
+          name=$(basename "$image" .image)
+          out="source/tools/game-analysis/$name"
+          python source/tools/analyze_game_image.py "$image" --classes-from source/client/GameSymbolList.inc \
+            --sigs "$RUNNER_TEMP/flarial/src/Utils/Memory/Game/Sig/SigInit.cpp" --out "$out"
+          echo "OUT=$out" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: game-analysis
+          path: ${{ env.OUT }}
+      - name: Commit the results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          git add "$OUT"
+          git commit -q -m "Game analysis: $(basename "$OUT")"
+          git push origin "HEAD:$GITHUB_REF_NAME"

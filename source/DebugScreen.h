@@ -203,4 +203,23 @@ inline std::wstring Utf8(const std::string& s)
     }
     return out;
 }
+
+// Coordinates (the HUD module): your block position like Java's "Block" line (feet, not the camera),
+// or with one decimal; then, optionally, the way you face ("North (-Z)").
+inline std::wstring FacingShort(float yaw)
+{
+    const float y = NormalYaw(yaw);
+    if (y >= -45.f && y < 45.f) return L"South (+Z)";
+    if (y >= 45.f && y < 135.f) return L"West (-X)";
+    if (y >= -135.f && y < -45.f) return L"East (+X)";
+    return L"North (-Z)";
+}
+inline std::vector<std::wstring> CoordinateLines(float eyeX, float eyeY, float eyeZ, float yaw, bool decimals, bool facing)
+{
+    const float feetY = eyeY - EyeHeight;
+    const auto one = [decimals](float v) { return decimals ? Fixed(v, 1) : std::to_wstring(Floor(v)); };
+    std::vector<std::wstring> lines{L"X: " + one(eyeX) + L"  Y: " + one(feetY) + L"  Z: " + one(eyeZ)};
+    if (facing) lines.push_back(L"Facing: " + FacingShort(yaw));
+    return lines;
+}
 }

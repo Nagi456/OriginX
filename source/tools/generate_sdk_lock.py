@@ -9,6 +9,7 @@ Example:
 """
 import argparse
 import hashlib
+import io
 import json
 from pathlib import Path
 import re
@@ -25,8 +26,12 @@ NOT_IN_XMAKE = {"debug_assert"}  # transitive dependency of type_safe
 
 
 def fetch(url, timeout=180):
-    with urllib.request.urlopen(url, timeout=timeout) as response:
-        return response.read()
+    request = urllib.request.Request(url, headers={"User-Agent": "MyClient-sdk-lock/1"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
+    except Exception as error:
+        raise SystemExit(f"Download failed: {url}: {error}")
 
 
 def requires(tag):
@@ -59,12 +64,10 @@ def main():
                    f"levilamina-{args.tag}-client-release-windows-x64.zip")
     print("SDK commit", commit, flush=True)
     sdk_data = fetch(sdk_url)
-    with tempfile.NamedTemporaryFile(suffix=".tar.gz") as tmp:
-        tmp.write(sdk_data)
-        tmp.flush()
-        with tarfile.open(tmp.name) as archive:
-            if not any("/src-client/" in member.name for member in archive.getmembers()):
-                raise SystemExit(args.tag + " has no src-client/ (not a client-capable SDK)")
+    # Read from memory: on Windows a NamedTemporaryFile cannot be opened again while it is open.
+    with tarfile.open(fileobj=io.BytesIO(sdk_data), mode="r:gz") as archive:
+        if not any("/src-client/" in member.name for member in archive.getmembers()):
+            raise SystemExit(args.tag + " has no src-client/ (not a client-capable SDK)")
     runtime = fetch(runtime_url)
     client = re.search(r'bedrockdata\s+(v[\w.\-]+-client[\w.\-]*)', text)
     headers = []

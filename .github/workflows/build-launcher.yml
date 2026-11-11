@@ -1,9 +1,21 @@
 # ランチャー MyClientLauncher.exe を、GitHub上でビルドします（MinGW-w64 クロスコンパイル）。
 # std::thread を使うため posix スレッド版の MinGW を使います。
 # 使い方: Actionsタブ →「build-launcher」→「Run workflow」。完了後、Artifactsから MyClientLauncher.exe を取得します。
+# publish を true にすると、サイトのダウンロード（R2 の launcher/MyClientLauncher.exe）も置き換えます
+# （GitHub Actions の OIDC トークンで認証するので秘密の設定は要りません）。
+# 実行番号がランチャーの build 番号になり、publish すると stable/launcher.json も更新され、
+# 古いランチャーは起動時に自分を新しい版へ入れ替えます（launcher/SelfUpdate.h）。
 name: build-launcher
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: "Replace the launcher the site hands out (R2 launcher/MyClientLauncher.exe)"
+        type: boolean
+        default: false
+permissions:
+  contents: read
+  id-token: write   # the OIDC token that lets publish_r2.py upload to R2
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -25,12 +37,18 @@ jobs:
             -lntdll -lkernel32 -luser32 -lwtsapi32 -o build/gamelaunchhelper.dll
           x86_64-w64-mingw32-windres -O coff -o build/helper_res.o launcher/helper.rc
           x86_64-w64-mingw32-g++-posix -std=c++17 -O2 -Wall -Wextra -Wno-unknown-pragmas \
-            -DNOMINMAX -D_WIN32_WINNT=0x0601 -static -static-libgcc -static-libstdc++ \
+            -DNOMINMAX -D_WIN32_WINNT=0x0601 -DMYCLIENT_LAUNCHER_BUILD=${{ github.run_number }} -static -static-libgcc -static-libstdc++ \
             -Ilauncher/vendor -I. \
             launcher/MyClientLauncher.cpp launcher/vendor/tinyxml2/tinyxml2.cpp build/myclient_res.o build/helper_res.o \
             -o build/MyClientLauncher.exe \
-            -municode -mwindows -luser32 -lgdi32 -lcomdlg32 -lshell32 -lole32 -luuid -lbcrypt -lversion -lwinhttp
+            -municode -mwindows -luser32 -lgdi32 -lcomdlg32 -lshell32 -lole32 -luuid -lbcrypt -lversion -lwinhttp \
+            -lws2_32 -lwindowscodecs -lmsimg32
       - uses: actions/upload-artifact@v4
         with:
           name: MyClientLauncher
           path: source/build/MyClientLauncher.exe
+      - name: Upload to R2 for the site
+        if: inputs.publish
+        run: |
+          python3 tools/publish_r2.py file build/MyClientLauncher.exe launcher/MyClientLauncher.exe
+          python3 tools/publish_r2.py launcher build/MyClientLauncher.exe ${{ github.run_number }}

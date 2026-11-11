@@ -3,17 +3,52 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <mutex>
+#include <string>
+#include <vector>
 
 // Game functions the SDK declares (MCAPI) but LeviLamina.dll does not export: linking them directly
 // fails, so they are looked up by their MSVC-mangled name at runtime. A null result means this game
 // build lacks the symbol; callers must check it and switch the feature off instead of crashing.
 namespace MyClientGame {
+// A game function's real address from client/GameRvaTable.inc (GameRva.cpp): only for a game build the table has
+// and when the function's first bytes are the expected ones, else 0. Used before LeviLamina's symbols.
+uintptr_t RvaFallback(const char* symbol);
+std::string RvaReport();   // for the log: how many of the table's functions were used / refused
+
+// Every name looked up at runtime, kept for the signature dump (client/SignatureDump.cpp): names built
+// by macros never appear as one string literal in the source, so tools/list_game_symbols.py misses them.
+inline std::mutex& LookedUpMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+inline std::vector<std::string>& LookedUpNames()
+{
+    static std::vector<std::string> names;
+    return names;
+}
+inline void NoteLookup(const char* symbol)
+{
+    if (!symbol) return;
+    try
+    {
+        std::lock_guard lock(LookedUpMutex());
+        auto& names = LookedUpNames();
+        if (names.size() < 4096) names.emplace_back(symbol);
+    }
+    catch (...) {}
+}
+
 template <class Fn>
 Fn ResolveMember(const char* symbol)
 {
     static_assert(sizeof(Fn) == sizeof(void*), "expects a single-inheritance member function pointer");
     Fn fn{};
-    if (void* address = ll::memory::SymbolView{symbol}.resolve(true)) std::memcpy(&fn, &address, sizeof(address));
+    NoteLookup(symbol);
+    void* address = reinterpret_cast<void*>(RvaFallback(symbol));   // the game's own code first (GameRva)
+    if (!address) address = ll::memory::SymbolView{symbol}.resolve(true);
+    if (address) std::memcpy(&fn, &address, sizeof(address));
     return fn;
 }
 
@@ -22,13 +57,30 @@ Fn ResolveMember(const char* symbol)
 template <class Fn>
 Fn ResolveFunction(const char* symbol)
 {
-    return reinterpret_cast<Fn>(ll::memory::SymbolView{symbol}.resolve(true));
+    NoteLookup(symbol);
+    void* address = reinterpret_cast<void*>(RvaFallback(symbol));
+    if (!address) address = ll::memory::SymbolView{symbol}.resolve(true);
+    return reinterpret_cast<Fn>(address);
+}
+
+// A hook target by name (0 = none): the game's own code from the table (RvaFallback), else LeviLamina's symbol
+// (a PreLoader stub on 26.51: only LeviLamina's hook can patch it, see OwnHook.h).
+inline uintptr_t Target(const char* symbol)
+{
+    NoteLookup(symbol);
+    if (const uintptr_t address = RvaFallback(symbol)) return address;
+    return reinterpret_cast<uintptr_t>(ll::memory::SymbolView{symbol}.resolve(true));
 }
 
 // First symbol of the list that this game build has, as a hook target (0 = none). Used where the
 // game's access level (public / protected / private changes the mangled name) is not known for sure.
 inline uintptr_t ResolveFirst(std::initializer_list<const char*> symbols)
 {
+    for (const char* symbol : symbols)
+    {
+        NoteLookup(symbol);
+        if (const uintptr_t address = RvaFallback(symbol)) return address;   // the game's own code first
+    }
     for (const char* symbol : symbols)
         if (void* address = ll::memory::SymbolView{symbol}.resolve(true)) return reinterpret_cast<uintptr_t>(address);
     return 0;

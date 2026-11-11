@@ -1,8 +1,10 @@
 # HUD本体 MyClient.exe を、GitHub上でビルドします（MinGW-w64 クロスコンパイル）。
 # 使い方: Actionsタブ →「build-hud」→「Run workflow」。完了後、Artifactsから MyClient.exe を取得します。
+# build-dll の publish からも呼ばれます（DLL と同じ版の HUD を一緒に配布するため）。
 name: build-hud
 on:
   workflow_dispatch:
+  workflow_call:
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -12,14 +14,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install MinGW-w64
-        run: sudo apt-get update && sudo apt-get install -y mingw-w64
+        timeout-minutes: 10
+        run: |
+          # The Azure mirror stalled downloading the toolchain on 2026-11-06. Use the Ubuntu archive and
+          # omit the unused 32-bit compilers; keep the x64 variants selected by the existing build commands.
+          sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends g++-mingw-w64-x86-64
       - name: Build MyClient.exe
         run: |
           mkdir -p build
           x86_64-w64-mingw32-windres -O coff -o build/myclient_res.o myclient.rc
+          x86_64-w64-mingw32-windres -O coff -o build/capes_res.o assets/capes/capes.rc
           x86_64-w64-mingw32-g++ -std=c++17 -O2 -Wall -Wextra -Wno-unknown-pragmas \
             -DNOMINMAX -D_WIN32_WINNT=0x0601 -static -static-libgcc -static-libstdc++ \
-            MyClient.cpp MinecraftDataProvider.cpp PingMonitor.cpp ReplayPlayer.cpp build/myclient_res.o -o build/MyClient.exe \
+            MyClient.cpp MinecraftDataProvider.cpp PingMonitor.cpp ReplayPlayer.cpp build/myclient_res.o build/capes_res.o -o build/MyClient.exe \
             -mwindows -luser32 -lgdi32 -lshell32 -lws2_32 -lwinhttp -lwinmm -lole32 -luuid -lwindowscodecs -lmsimg32
       - uses: actions/upload-artifact@v4
         with:

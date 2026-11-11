@@ -263,5 +263,18 @@ int main()
     dependentMod["dependencies"] = Json::array({{{"name", "LeviLamina"}, {"version", "=" + alternate.loader}}});
     Write(source / "manifest.json", dependentMod.dump());
     Reject([&] { RequireMod(source, alternate); });
+    // Many small files (the game's data folder): progress moves while the folder is copied, not only at its end.
+    {
+        const auto many = root / "many-small";
+        for (int n = 0; n < 40; ++n) Write(many / ("f" + std::to_string(n) + ".bin"), std::string(1u << 20, char('a' + n % 26)));
+        const unsigned long long total = TreeBytes(many);
+        unsigned long long done = 0;
+        std::vector<unsigned long long> seen;
+        CopyEntryProgress(many, root / "many-small-copy", done, total,
+                          [&](unsigned long long d, unsigned long long) { seen.push_back(d); });
+        assert(done == total && total == 40ull << 20);
+        assert(seen.size() >= 5 && seen.front() < total && seen.back() == total);
+        for (size_t n = 1; n < seen.size(); ++n) assert(seen[n] >= seen[n - 1]);
+    }
     std::cout << "PASS: GDK XML/version/x64/PE guards, managed game copy/source preservation, transactional install, backup/settings preservation, disabled mod enable, invalid input isolation, Windows argv quoting and HUD PID parsing.\n";
 }

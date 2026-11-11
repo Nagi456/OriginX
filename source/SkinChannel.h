@@ -5,10 +5,12 @@
 // A second mapping (Request) goes the other way: the Closet asks the DLL to wear a skin.
 // Pure helpers (format conversion, face extraction) are unit-tested: tests/skin.cpp.
 #include <cstdint>
+#include <cstddef>
 #include <cstring>
 #include <string>
 #include <type_traits>
 #include <vector>
+#include <algorithm>
 #ifdef _WIN32
 #include <windows.h>
 #include <string>
@@ -65,11 +67,72 @@ inline bool ToRgba(uint32_t format, const uint8_t* bytes, size_t size, uint32_t 
     return false;
 }
 
+// The resource-patch spelling is customSlim, but the native resolved model cache uses lowercase names.
+// Player::updateSkin normalizes it; a private menu skin goes straight to the model builder instead.
+inline const char* NativeGeometryName(bool slim) {
+    return slim ? "geometry.humanoid.customslim" : "geometry.humanoid.custom";
+}
+
 inline uint32_t Hash(const std::vector<uint8_t>& rgba, uint32_t w, uint32_t h) {
     uint32_t x = 2166136261u ^ w ^ (h << 16);
     for (uint8_t b : rgba) { x ^= b; x *= 16777619u; }
     return x;
 }
+
+// A saved choice has a stable pixel hash, but each separately owned native model must have a distinct key.
+// Reusing a title doll's key for a later world lets the old doll's removal callback evict the world's texture.
+inline std::string InstanceId(const std::string& selection, uint64_t serial) {
+    return selection + "_OX" + std::to_string(serial);
+}
+inline bool MatchesSelection(const std::string& instance, const std::string& selection) {
+    if (selection.empty()) return false;
+    if (instance == selection) return true; // saved skins from older clients
+    const std::string prefix = selection + "_OX";
+    return instance.size() > prefix.size() && instance.compare(0, prefix.size(), prefix) == 0 &&
+           std::all_of(instance.begin() + prefix.size(), instance.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+// Bounded recovery for a menu texture load that never completes. Normal asynchronous loads keep their key.
+struct AvatarLoadRetry {
+    uint64_t since = 0;
+    unsigned attempts = 0;
+    bool Retry(uint64_t now, bool ready) {
+        if (ready) { since = 0; return false; }
+        if (!since) { since = now; return false; }
+        if (now < since || now - since < 3000 || attempts >= 2) return false;
+        since = now;
+        ++attempts;
+        return true;
+    }
+};
+
+struct AvatarResources {
+    uint64_t epoch = 0;
+    bool observed = false;
+    bool Changed(uint64_t next) {
+        const bool changed = observed && epoch != next;
+        epoch = next;
+        observed = true;
+        return changed;
+    }
+};
+
+struct AvatarLifecycle {
+    uint32_t generation = 0;
+    bool nativeReady = false, overriding = false, initialized = false;
+    struct Change { bool changed, rebuild; };
+    Change Select(uint32_t nextGeneration, bool selected, bool retainedNative = false) {
+        // A loaded animation can rebuild from an owned skin even if the account pack
+        // is temporarily unavailable after reload. This is NOT texture readiness.
+        const bool want = selected && (nativeReady || (initialized && retainedNative));
+        const bool changed = generation != nextGeneration || overriding != want;
+        const bool rebuild = changed && (overriding || want);
+        generation = nextGeneration;
+        overriding = want;
+        return {changed, rebuild};
+    }
+    void ObserveNative(bool ready) { if (!overriding && ready) nativeReady = initialized = true; }
+};
 
 // One square part of the skin picture (face, hat ...), given in 64-wide skin units and scaled to the
 // picture's real width. Out: side*side RGBA (side = w / 8 for the face).
@@ -116,9 +179,13 @@ inline const char* ResourcePatch(bool slim) {
 }
 
 // HUD -> DLL: "wear this skin" (the Closet). Like Shared, the DLL owns the mapping; the HUD writes a
-// request (serial goes up) and the DLL applies it on the next world tick, then answers in handled/result.
-constexpr uint32_t RequestMagic = 0x4d435352, RequestVersion = 1;   // "MCSR"
-enum class Result : uint32_t { None = 0, Sent = 1, NoPlayer = 2, Failed = 3 };
+// request (serial goes up). The DLL applies it on a world tick (Sent), or saves it from the title avatar
+// callback without a server/player (Saved), then answers in handled/result. Saved is not proof of rendering.
+constexpr uint32_t RequestMagic = 0x4d435352, RequestVersion = 2;   // "MCSR"; v2 adds independent capes
+constexpr uint32_t CapeWidth = 64, CapeHeight = 32, CapeBytes = CapeWidth * CapeHeight * 4;
+enum class Cape : uint32_t { Account = 0, Founding = 1, Supporter = 2 };
+enum class Operation : uint32_t { Skin = 0, Cape = 1 };
+enum class Result : uint32_t { None = 0, Sent = 1, NoPlayer = 2, Failed = 3, Saved = 4, Unsupported = 5 };
 struct Request {
     uint32_t magic, version, size, pid;
     uint32_t serial;          // HUD: goes up with every new request
@@ -128,8 +195,10 @@ struct Request {
     uint32_t slim;            // 1 = thin arms (geometry.humanoid.customSlim)
     char name[64];            // UTF-8 skin name, NUL-terminated
     uint8_t rgba[MaxSide * MaxSide * 4];   // straight RGBA, rows top to bottom
+    uint32_t operation, skinOverride, capeId, equippedCapeId;
+    uint8_t capeRgba[CapeBytes];
 };
-static_assert(sizeof(Request) == 104 + MaxSide * MaxSide * 4);
+static_assert(sizeof(Request) == 104 + MaxSide * MaxSide * 4 + 16 + CapeBytes);
 static_assert(std::is_trivially_copyable<Request>::value);
 
 inline bool Valid(const Request& data, uint32_t pid) {
@@ -138,7 +207,8 @@ inline bool Valid(const Request& data, uint32_t pid) {
 
 // The skin of a request, checked: the size must be a classic skin shape and the bytes must fit.
 inline bool UsableRequest(const Request& r) {
-    return r.width >= 64 && r.width <= MaxSide && r.width % 64 == 0 && (r.height == r.width || r.height == r.width / 2);
+    return r.width >= 64 && r.width <= MaxSide && r.width % 64 == 0 && (r.height == r.width || r.height == r.width / 2) &&
+        r.capeId <= static_cast<uint32_t>(Cape::Supporter);
 }
 
 #ifdef _WIN32
@@ -233,7 +303,7 @@ public:
     }
     bool Open(DWORD pid, bool producer) {
         Close();
-        const auto name = L"Local\\MyClient.SkinRequest.v1." + std::to_wstring(pid);
+        const auto name = L"Local\\MyClient.SkinRequest.v2." + std::to_wstring(pid);
         mutex_ = producer ? CreateMutexW(nullptr, FALSE, (name + L".Lock").c_str())
             : OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, (name + L".Lock").c_str());
         if (!mutex_) return false;
@@ -262,16 +332,44 @@ public:
     bool Send(DWORD pid, const std::vector<uint8_t>& rgba, uint32_t w, uint32_t h, bool slim, const std::string& name, uint32_t& serial) {
         if (!data_ || w > MaxSide || h > MaxSide || rgba.size() < static_cast<size_t>(w) * h * 4 || !Lock(20)) return false;
         bool sent = false;
-        if (Valid(*data_, pid)) {
+        if (Valid(*data_, pid) && data_->serial == data_->handled) {
             data_->width = w; data_->height = h; data_->slim = slim ? 1 : 0;
+            data_->operation = static_cast<uint32_t>(Operation::Skin);
+            data_->skinOverride = w && h ? 1 : 0;
+            data_->capeId = 0;
             std::memset(data_->name, 0, sizeof(data_->name));
             std::memcpy(data_->name, name.data(), std::min(name.size(), sizeof(data_->name) - 1));
-            std::memcpy(data_->rgba, rgba.data(), static_cast<size_t>(w) * h * 4);
+            if (w && h) std::memcpy(data_->rgba, rgba.data(), static_cast<size_t>(w) * h * 4);
             serial = ++data_->serial;
             sent = true;
         }
         Unlock();
         return sent;
+    }
+    bool SendCape(DWORD pid, uint32_t cape, const std::vector<uint8_t>& rgba, uint32_t& serial) {
+        if (!data_ || cape > 2 || (cape && rgba.size() != CapeBytes) || !Lock(20)) return false;
+        bool sent = false;
+        if (Valid(*data_, pid) && data_->serial == data_->handled) {
+            data_->operation = static_cast<uint32_t>(Operation::Cape);
+            data_->capeId = cape;
+            data_->width = data_->height = 0;
+            if (cape) std::memcpy(data_->capeRgba, rgba.data(), CapeBytes);
+            serial = ++data_->serial;
+            sent = true;
+        }
+        Unlock();
+        return sent;
+    }
+    void PublishCapeChoice(DWORD pid, uint32_t cape) {
+        if (!data_ || cape > 2 || !Lock(20)) return;
+        if (Valid(*data_, pid)) data_->equippedCapeId = cape;
+        Unlock();
+    }
+    uint32_t CapeChoice(DWORD pid) {
+        if (!data_ || !Lock()) return 0;
+        const uint32_t choice = Valid(*data_, pid) ? data_->equippedCapeId : 0;
+        Unlock();
+        return choice <= 2 ? choice : 0;
     }
     // HUD: the DLL's answer to `serial` (Result::None while it has not answered yet).
     Result Answer(DWORD pid, uint32_t serial) {

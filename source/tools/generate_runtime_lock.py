@@ -59,6 +59,8 @@ def main():
     parser.add_argument("--loader", required=True)
     parser.add_argument("--preloader", required=True)
     parser.add_argument("--runtime-data", required=True)
+    parser.add_argument("--crashlogger", help="CrashLogger version (default: keep the base lock's)")
+    parser.add_argument("--loc", help="levilamina-loc version (default: keep the base lock's)")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     major, minor, patch = map(int, args.game.split("."))
@@ -81,6 +83,15 @@ def main():
             lock["assets"][index] = retarget(asset, v,
                 f"https://github.com/LiteLDev/bedrock-runtime-data/releases/download/v{v}/bedrock-runtime-data-v{v}-windows-x64.zip",
                 raw.format("bedrock-runtime-data", v))
+        elif name == "CrashLogger" and args.crashlogger:
+            lock["assets"][index] = retarget(asset, args.crashlogger,
+                f"https://github.com/LiteLDev/CrashLogger/releases/download/v{args.crashlogger}/CrashLogger-windows-x64.zip",
+                raw.format("CrashLogger", args.crashlogger))
+        elif name == "levilamina-loc" and args.loc:
+            moved = dict(asset, archivePrefix=f"levilamina-loc-{args.loc}/")
+            lock["assets"][index] = retarget(moved, args.loc,
+                f"https://codeload.github.com/LiteLDev/levilamina-loc/zip/refs/tags/v{args.loc}",
+                raw.format("levilamina-loc", args.loc))
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(lock, indent=2) + "\n")
     print("Wrote", args.out)

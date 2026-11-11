@@ -1,6 +1,7 @@
 #pragma once
 #include <winhttp.h>
 #include "Updates.h"
+#include "Channels.h"
 #include "GameVersions.h"
 #include <atomic>
 namespace MyClientLauncher {
@@ -8,19 +9,22 @@ namespace MyClientLauncher {
 // public version list are accepted as initial URLs. Redirects must remain HTTPS.
 inline void DownloadHttps(const std::string& url, const fs::path& destination, uint64_t limit)
 {
-    if (!ReleaseUrl(url) && url != VersionDbUrl) throw std::runtime_error("許可されていない更新配布先です。");
+    // The public releases, the version list, or a signed link the Worker gave to a channel's file after a role check.
+    if (!ReleaseUrl(url) && !SignedFileUrl(url) && url != VersionDbUrl) throw std::runtime_error("許可されていない更新配布先です。");
     const std::wstring wide(url.begin(), url.end());
     URL_COMPONENTS parts{}; parts.dwStructSize = sizeof parts;
-    parts.dwHostNameLength = parts.dwUrlPathLength = static_cast<DWORD>(-1);
+    parts.dwHostNameLength = parts.dwUrlPathLength = parts.dwExtraInfoLength = static_cast<DWORD>(-1);
     if (!WinHttpCrackUrl(wide.c_str(), 0, 0, &parts) || parts.nScheme != INTERNET_SCHEME_HTTPS)
         throw std::runtime_error("更新URLが不正です。");
+    // (a signed link carries its expiry and signature in the part after the path)
+    const std::wstring requestPath = std::wstring(parts.lpszUrlPath, parts.dwUrlPathLength) + std::wstring(parts.lpszExtraInfo, parts.dwExtraInfoLength);
     struct HttpHandle { HINTERNET value; ~HttpHandle() { if (value) WinHttpCloseHandle(value); } };
     HttpHandle session{WinHttpOpen(L"MyClient/1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0)};
     if (!session.value || !WinHttpSetTimeouts(session.value, 10000, 10000, 15000, 15000))
         throw std::runtime_error("更新通信を開始できません。");
     HttpHandle connection{WinHttpConnect(session.value, std::wstring(parts.lpszHostName, parts.dwHostNameLength).c_str(), parts.nPort, 0)};
     if (!connection.value) throw std::runtime_error("更新配布先に接続できません。");
-    HttpHandle request{WinHttpOpenRequest(connection.value, L"GET", std::wstring(parts.lpszUrlPath, parts.dwUrlPathLength).c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE)};
+    HttpHandle request{WinHttpOpenRequest(connection.value, L"GET", requestPath.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE)};
     DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
     if (!request.value || !WinHttpSetOption(request.value, WINHTTP_OPTION_REDIRECT_POLICY, &redirect, sizeof redirect) ||
         !WinHttpSendRequest(request.value, L"Cache-Control: no-cache\r\n", static_cast<DWORD>(-1), WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||

@@ -15,7 +15,7 @@ flags=(-std=c++17 -O2 -Wall -Wextra -Wno-unknown-pragmas -DNOMINMAX -D_WIN32_WIN
 "$compiler" "${flags[@]}" MyClient.cpp MinecraftDataProvider.cpp PingMonitor.cpp ReplayPlayer.cpp \
     build/myclient_res.o -o build/MyClient.exe -mwindows -luser32 -lgdi32 -lshell32 -lws2_32 -lwinhttp -lwinmm -lole32 -luuid -lwindowscodecs -lmsimg32
 "$compiler" "${flags[@]}" -Ilauncher/vendor -I. launcher/MyClientLauncher.cpp launcher/vendor/tinyxml2/tinyxml2.cpp build/myclient_res.o \
-    -o build/MyClientLauncher.exe -municode -mwindows -luser32 -lgdi32 -lcomdlg32 -lshell32 -lole32 -luuid -lbcrypt -lversion -lwinhttp
+    -o build/MyClientLauncher.exe -municode -mwindows -luser32 -lgdi32 -lcomdlg32 -lshell32 -lole32 -luuid -lbcrypt -lversion -lwinhttp -lws2_32 -lwindowscodecs -lmsimg32
 "$compiler" "${flags[@]}" -I. tests/bridge_smoke.cpp MinecraftDataProvider.cpp \
     -o build/bridge_smoke.exe build/libMyClientBridge.dll.a -luser32
 echo 'Built Windows x64 launcher, bridge DLL, overlay, and bridge smoke test in build/.'

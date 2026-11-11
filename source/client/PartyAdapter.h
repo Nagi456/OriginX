@@ -9,5 +9,6 @@ bool EnableParty();
 void DisableParty();
 void TickParty();
 void TickAutoRq();
+void TickChatHotkeys();   // Command Hotkeys: sends the HUD's line (ChatChannel.h)
 void ClearParty();
 }

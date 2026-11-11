@@ -22,6 +22,7 @@ struct Command { uint64_t at; uint32_t zoom, key, fullbright, nametag, outline, 
 // fullbrightAvailable / fullbrightActive carry one bit per light/name feature so the layout
 // (and the ABI version) stay the same; an older DLL only ever sets bit 0.
 constexpr uint32_t FlagFullbright = 1, FlagNametag = 2, FlagOutline = 4, FlagOutlineColored = 8, FlagTextures = 16;
+constexpr uint32_t FlagLiveTextures = 32;   // all live-reload barriers/hooks available, separate from title reload
 // Available: bit FlagOutline = the outline hook is installed.
 // Active:    FlagOutline = the game ran the outline code recently, FlagOutlineColored = a colour call was overridden.
 inline bool HasFlag(uint32_t value, uint32_t flag) { return (value & flag) != 0; }
@@ -177,8 +178,15 @@ inline bool WantsFullbright(const Command& command, uint64_t now) {
 }
 // True once per HUD request. The first live command only records the counter (so attaching to a game
 // never triggers a reload); after that every change of texReload is one request.
+// texturesOn is two bits (same field and layout as before): bit 0 = switching on, bit 1 (TexturesLive) = the HUD
+// knows the DLL applies a switch inside a world (2026-11-10; older DLLs saw only the value 1, so the HUD sets
+// bit 1 only when the DLL reports FlagLiveTextures). The DLL applies in the world whenever it can, bit or not.
+constexpr uint32_t TexturesOn = 1, TexturesLive = 2;
+inline bool WantsLiveTextures(const Command& command, uint64_t now) {
+    return (command.texturesOn & (TexturesOn | TexturesLive)) == (TexturesOn | TexturesLive) && Fresh(command.at, now, CommandLeaseMs);
+}
 inline bool TextureReloadRequested(const Command& command, uint64_t now, uint32_t& seen, bool& primed) {
-    if (command.texturesOn != 1 || !Fresh(command.at, now, CommandLeaseMs)) return false;
+    if (!(command.texturesOn & TexturesOn) || command.texturesOn > (TexturesOn | TexturesLive) || !Fresh(command.at, now, CommandLeaseMs)) return false;
     if (!primed) { primed = true; seen = command.texReload; return false; }
     if (command.texReload == seen) return false;
     seen = command.texReload;
@@ -221,6 +229,15 @@ inline bool ShulkerHoverOf(uint32_t field) { return (field & ShulkerHoverBit) !=
 // 29..30 = how the extra frames are made (FrameGenMethod); bit 31 = no pacing (extra frames go out at once).
 enum FrameGenMethod : uint32_t { FrameGenMotion = 0, FrameGenBlend = 1, FrameGenCopy = 2 };
 enum FrameGenState : uint32_t { FrameGenOff = 0, FrameGenRunning = 1, FrameGenPaused = 2, FrameGenUnavailable = 3 };
+// Shared.frameGen: the FrameGenState in bits 0..7; while running, bits 8..15 = frames shown per game frame right now
+// (1 + the made-up ones) and bits 16..23 = the most the measured GPU cost fits in one game frame (any multiplier).
+// 0 there = not known (older DLL). The HUD shows them next to the multiplier, which is only an upper limit.
+inline uint32_t EncodeFrameGenStatus(uint32_t state, uint32_t shownPerFrame, uint32_t fitsPerFrame) {
+    return (state & 0xFFu) | (std::min(shownPerFrame, 255u) << 8) | (std::min(fitsPerFrame, 255u) << 16);
+}
+inline uint32_t FrameGenStateOf(uint32_t field) { return field & 0xFFu; }
+inline uint32_t FrameGenShownOf(uint32_t field) { return (field >> 8) & 0xFFu; }
+inline uint32_t FrameGenFitsOf(uint32_t field) { return (field >> 16) & 0xFFu; }
 inline uint32_t EncodeFrameGen(uint32_t multiplier, uint32_t method, bool pacing) {
     const uint32_t extra = multiplier >= 3 ? 2u : multiplier == 2 ? 1u : 0u;
     if (!extra) return 0;
@@ -275,15 +292,50 @@ inline uint32_t EntityDistanceBlocks(uint32_t reserved) {
 inline bool EntityDistancePlayers(uint32_t reserved) { return EntityDistanceBlocks(reserved) != 0 && ((reserved >> 28) & 1u) != 0; }
 // Shared.optimize: which kinds of actor the entity distance above hides (bit 0 mobs, bit 1 dropped items,
 // bit 2 projectiles and everything else), bit 3 hides other actors' name tags, and bits 4..8 a separate
-// distance for players in steps of 8 blocks (0 = players are always drawn).
-constexpr uint32_t CullMobsBit = 1u, CullItemsBit = 2u, CullMiscBit = 4u, HideNameTagsBit = 8u;
-inline uint32_t EncodeOptimize(bool mobs, bool items, bool misc, bool hideNameTags, uint32_t playerBlocks) {
+// distance for players in steps of 8 blocks (0 = players are always drawn). Bit 9 lifts the FPS cap (the game's
+// presents go out with ALLOW_TEARING, past the refresh rate): only while Optimization is on. Older HUDs leave it 0.
+constexpr uint32_t CullMobsBit = 1u, CullItemsBit = 2u, CullMiscBit = 4u, HideNameTagsBit = 8u, UncapFpsBit = 1u << 9;
+inline uint32_t EncodeOptimize(bool mobs, bool items, bool misc, bool hideNameTags, uint32_t playerBlocks, bool uncapFps = false) {
     const uint32_t steps = std::min(playerBlocks / EntityDistanceStep, EntityDistanceMax / EntityDistanceStep);
     return (mobs ? CullMobsBit : 0u) | (items ? CullItemsBit : 0u) | (misc ? CullMiscBit : 0u) |
-           (hideNameTags ? HideNameTagsBit : 0u) | (steps << 4);
+           (hideNameTags ? HideNameTagsBit : 0u) | (steps << 4) | (uncapFps ? UncapFpsBit : 0u);
 }
 inline uint32_t PlayerDistanceBlocks(uint32_t optimize) {
     return std::min((optimize >> 4) & 0x1Fu, EntityDistanceMax / EntityDistanceStep) * EntityDistanceStep;
+}
+// More of Shared.optimize (2026-11-04, the Optimization rows that need the DLL's render hooks): bits 10..13 how many
+// sub-chunk rows (16 blocks) above and below the camera are drawn (0 = all), bits 14..18 the block entity distance
+// (chests, signs, banners...) in steps of 8 blocks (0 = all), bit 19 skips the sky itself, bit 20 skips actors behind
+// the camera, bit 21 controls clouds through the game's options. Older DLLs ignore these bits; older HUDs leave them 0.
+constexpr uint32_t VerticalRowsMax = 8, NoSkyBit = 1u << 19, CullBehindBit = 1u << 20, NoCloudsBit = 1u << 21;
+struct OptimizeExtras { uint32_t verticalRows = 0, blockEntityBlocks = 0; bool noSky = false, cullBehind = false, noClouds = false; };
+inline uint32_t EncodeOptimizeExtras(const OptimizeExtras& e) {
+    const uint32_t rows = std::min(e.verticalRows, VerticalRowsMax);
+    const uint32_t steps = std::min(e.blockEntityBlocks / EntityDistanceStep, EntityDistanceMax / EntityDistanceStep);
+    return (rows << 10) | (steps << 14) | (e.noSky ? NoSkyBit : 0u) | (e.cullBehind ? CullBehindBit : 0u) |
+           (e.noClouds ? NoCloudsBit : 0u);
+}
+inline OptimizeExtras DecodeOptimizeExtras(uint32_t optimize) {
+    OptimizeExtras e;
+    e.verticalRows = std::min((optimize >> 10) & 0xFu, VerticalRowsMax);
+    e.blockEntityBlocks = std::min((optimize >> 14) & 0x1Fu, EntityDistanceMax / EntityDistanceStep) * EntityDistanceStep;
+    e.noSky = (optimize & NoSkyBit) != 0;
+    e.cullBehind = (optimize & CullBehindBit) != 0;
+    e.noClouds = (optimize & NoCloudsBit) != 0;
+    return e;
+}
+// A sub-chunk row (`chunkRow`, block y / 16) is left out when it is more than `rows` rows away from the camera's.
+inline bool OutsideVerticalRows(int chunkRow, int cameraRow, uint32_t rows) {
+    return rows != 0 && (chunkRow > cameraRow + static_cast<int>(rows) || chunkRow < cameraRow - static_cast<int>(rows));
+}
+// An actor behind the camera: farther than `near` blocks and in the half-space behind the view direction
+// (with a little margin for big models). `forward` is the camera's unit view direction.
+inline bool BehindCamera(const float camera[3], const float forward[3], const float pos[3], float closeBy = 4.f) {
+    const float d[3] = {pos[0] - camera[0], pos[1] - camera[1], pos[2] - camera[2]};
+    const float dist2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    if (dist2 <= closeBy * closeBy) return false;
+    const float along = d[0] * forward[0] + d[1] * forward[1] + d[2] * forward[2];
+    return along < -2.f;
 }
 // `reserved` carries the zoom factor x100 (wheel zoom). 0 (older HUD) means the classic 3x.
 inline float ZoomFactor(uint32_t x100) { return x100 >= 110 && x100 <= 2000 ? x100 / 100.f : 3.f; }

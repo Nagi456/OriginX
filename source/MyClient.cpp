@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <tuple>
 #include <cmath>
 #include <cstring>
 #include <chrono>
@@ -18,6 +19,7 @@
 #include "launcher/PidOption.h"
 #include "SkinChannel.h"
 #include "SkinLibrary.h"
+#include "CapeLibrary.h"
 #include "SkinModel.h"
 #include "MinecraftDataProvider.h"
 #include "AutoRq.h"
@@ -30,6 +32,7 @@
 #include "HudFrameChannel.h"
 #include "PingMonitor.h"
 #include "DebugScreen.h"
+#include "ClientTimer.h"
 #include "BlockDetails.h"
 #include <mutex>
 #include <thread>
@@ -100,7 +103,8 @@ bool featureListEnabled = false;
 // Shulker Preview: lists what the shulker boxes in your inventory contain
 bool shulkerEnabled = false;
 // Tab List: names of the players in this world / server
-bool tabListEnabled = false;
+bool tabListEnabled = true;    // on by default (2026-11-03 user request)
+bool tabListShown = false;     // ...shown now: only while its key is held (the switch only makes the key work)
 bool chunkBorderEnabled = false;
 bool replayEnabled = false;      // Replay Mod: record the game's incoming packets to a file
 bool menuSoundsEnabled = true;   // Menu Sounds: a sound with the on/off toast
@@ -124,7 +128,7 @@ bool hiveEnabled = true;
 int hiveSection = 0;          // details page tab: 0 = Party Auto Accept, 1 = Auto RQ
 
 // Texture pack switching (Textures page)
-bool texturesEnabled = false;
+bool texturesEnabled = true;   // on by default (2026-11-03 user request)
 // Lite (FPS): generated resource pack hiding clouds / sun+moon / fog / rain+snow
 bool liteEnabled = false;
 // Presets: named snapshots of which modules are ON (myclient_presets.txt next to the config)
@@ -150,6 +154,58 @@ bool healthWarningEnabled = false;  // Health Warning: the screen edges glow red
 int healthWarningAt = 6;            // ...at or below this many points (1 = half a heart; 6 = 3 hearts)
 int healthWarningStrength = 70;     // ...how strong the glow is (percent)
 bool healthWarningPulse = true;     // ...it beats like a heart (faster the lower you are)
+bool coordinatesEnabled = false;    // Coordinates: your X / Y / Z on the HUD
+bool coordinatesDecimals = false;   // ...with one decimal (off: block numbers, like Java's "Block" line)
+bool coordinatesFacing = true;      // ...a second line with the way you face
+bool commandHotkeysEnabled = false; // Command Hotkeys: a key types a saved line in the chat ('/...' = a command)
+struct CommandHotkey { int key = 0; std::wstring text; };
+constexpr int kCommandHotkeyCount = 8;
+CommandHotkey commandHotkeys[kCommandHotkeyCount];
+int commandHotkeyEditing = -1;      // the line being typed on the page (-1 = none)
+int shortcutSlot = -1;              // the Command Hotkeys line whose key is being set (-1 = the module's own key)
+std::wstring commandHotkeyStatus;   // the last line sent and what became of it (the page's "Last sent")
+int commandHotkeyTone = 0;
+bool timerEnabled = false;          // Timer: a countdown or a stopwatch on the HUD (one module, two modes)
+int timerMode = 0;                  // ...0 Timer (counts down), 1 Stopwatch (counts up)
+int timerMinutes = 5;               // ...the countdown's length
+int timerSeconds = 0;
+bool timerFlash = true;             // ...when the countdown runs out: the time blinks red
+bool timerSound = true;             // ...and three beeps play
+int timerStartKey = 0;              // ...keys while playing: start / pause, reset (0 = none)
+int timerResetKey = 0;
+ClientTimer::Clock timerClock;
+ULONGLONG timerDoneAt = 0;          // the countdown ran out at (0 = it has not)
+bool cpsLimiterEnabled = false;     // CPS Limiter: presses over the limit never reach the game
+int cpsLimitLeft = 12;              // ...max presses a second (0 = no limit)
+int cpsLimitRight = 20;
+bool itemCounterEnabled = false;    // Item Counter: hold Alt over an item to count it (inventory, shulkers, container)
+bool itemCounterStacks = true;      // ...also say how many stacks the total is
+bool packDisplayEnabled = false;    // Pack Display: the texture packs you have on, listed on the HUD
+bool javaChatEnabled = false;
+bool packDisplayIcons = true;       // ...with each pack's picture (pack_icon.png)
+std::string WideToUtf8(const std::wstring& text);
+std::wstring Utf8ToWide(const std::string& text);
+// The Command Hotkeys lines in the config: UTF-8 bytes as hex digits (the config stream is not Unicode-safe).
+std::wstring HexOfUtf8(const std::string& bytes)
+{
+    static const wchar_t digits[] = L"0123456789abcdef";
+    std::wstring out;
+    for (unsigned char b : bytes) { out += digits[b >> 4]; out += digits[b & 15]; }
+    return out;
+}
+std::string Utf8OfHex(const std::wstring& hex)
+{
+    const auto nibble = [](wchar_t c) { return c >= L'0' && c <= L'9' ? c - L'0' : c >= L'a' && c <= L'f' ? c - L'a' + 10
+                                             : c >= L'A' && c <= L'F' ? c - L'A' + 10 : -1; };
+    std::string out;
+    for (size_t i = 0; i + 1 < hex.size(); i += 2)
+    {
+        const int hi = nibble(hex[i]), lo = nibble(hex[i + 1]);
+        if (hi < 0 || lo < 0) return {};
+        out += (char)(hi << 4 | lo);
+    }
+    return out;
+}
 bool debugMenuEnabled = true;       // Debug Menu: its key (F3) shows the Java-style debug screen in a world
 bool debugScreenShown = false;      // ...shown now (not saved, like Java's F3)
 int debugTextSize = 100;            // ...its text size in percent (100 = 24 px at GUI scale 1)
@@ -166,6 +222,11 @@ bool liteCullMobs = true, liteCullItems = true, liteCullMisc = true;   // ...whi
 bool litePlayerLimit = false;      // far-away players hidden too, at their own distance
 int litePlayerDistance = 64;       // (8..128, steps of 8)
 bool liteNoParticles = false, liteNoShadows = false, liteNoNameTags = false;
+// Optimization rows on the DLL's render hooks (2026-11-04): the sky itself, actors behind the camera, far block
+// entities (chests, signs...) and sub-chunk rows far above / below the camera.
+bool liteNoSkyFull = false, liteCullBehind = false, liteBlockEntityLimit = false, liteVerticalLimit = false;
+int liteBlockEntityDistance = 32;  // 8..128 blocks, steps of 8
+int liteVerticalRows = 4;          // sub-chunk rows (16 blocks) kept above and below the camera, 1..8
 // Optimization > System: done by the HUD on the game's process (Windows calls), undone when switched off.
 bool liteHighPriority = false, liteNoThrottle = false, liteGpuPriority = false;
 int liteSliderDrag = -1;           // the Optimization page's slider being dragged (LiteRowKind::...), -1 = none
@@ -250,6 +311,7 @@ bool menuOpen = false;
 bool hudEditMode = false;
 ULONGLONG editorNoticeUntil = 0;   // shows "positions reset" in the HUD editor toolbar for a moment
 bool gameActive = true; // Minecraft (or this overlay) is the foreground window
+bool menuParked = false; // the menu stays open, hidden, while another app is in front (no pause screen)
 
 
 // ------------------------- Detail Feature -------------------
@@ -290,7 +352,14 @@ enum class DetailFeature
     DayTimer,
     DebugMenu,
     BlockDetails,
-    HealthWarning    // keep new features last: presets store these values
+    HealthWarning,
+    Coordinates,
+    CommandHotkeys,
+    Timer,
+    CpsLimiter,
+    ItemCounter,
+    PackDisplay,
+    JavaChat   // keep new features last: presets store these values
 };
 
 DetailFeature detailFeature =
@@ -358,6 +427,12 @@ struct ShortcutSettings
     int debugMenu = VK_F3;   // Debug Menu: shows / hides the debug screen (0 = no key)
     int blockDetails = 0;
     int healthWarning = 0;
+    int coordinates = 0;
+    int commandHotkeys = 0;
+    int timer = 0;
+    int cpsLimiter = 0;
+    int itemCounter = 0;
+    int packDisplay = 0;
 };
 
 ShortcutSettings shortcuts;
@@ -499,6 +574,25 @@ HudElement dayTimerHud{
     1.0f
 };
 
+HudElement coordinatesHud{
+    190,
+    555,
+    1.0f
+};
+
+HudElement timerHud{
+    190,
+    655,
+    1.0f
+};
+
+HudElement packDisplayHud{
+    1640,
+    420,
+    1.0f
+};
+HudElement javaChatHud{12, -1, 1.0f}; // y=-1: initialize against the actual window's bottom edge.
+
 // Block Details: x / y is the top-left of a 300-wide area; the box is centred in it.
 HudElement blockDetailsHud{
     810,
@@ -518,9 +612,10 @@ HudElement shulkerHud{
     1.0f
 };
 
+// Tab List: centred near the top (190 wide on a 1920-wide screen), under the Block Details box.
 HudElement tabListHud{
-    1000,
-    120,
+    865,
+    110,
     1.0f
 };
 
@@ -546,7 +641,11 @@ enum class HudElementId
     TabList,
     HiveStats,
     DayTimer,
-    BlockDetails
+    BlockDetails,
+    Coordinates,
+    Timer,
+    PackDisplay,
+    JavaChat
 };
 
 
@@ -578,19 +677,25 @@ ModsTab modsTab = ModsTab::Visual;
 bool glassDark = false;
 bool glassContent = false;   // drawing a Settings / Presets / module page inside the glass frame (glass colours)
 
+// The menu's colours. border / panel / side / fill / chip are glass (translucent, found by colour: OverlayAlpha),
+// the others are solid ink: text, muted (notes), icon, track (an off switch / slider) and line (hairlines).
 struct GlassColors
 {
     COLORREF border, panel, fill, text, muted, icon, track;
     uint8_t borderA, panelA, fillA;
+    COLORREF side, chip, line;   // a switched-on tile, buttons / tracks on the panel, divider lines
+    uint8_t sideA, chipA;
+    COLORREF sel;                // the chosen part of a segmented control (the page switcher)
+    uint8_t selA;
 };
 // Look of the glass pages, chosen on the Settings page (saved as GLASS_LOOK): the accent colour, the tint of
 // the light and of the dark glass (index 0 = the original colours), the panel's drop shadow and how opaque
 // the glass is (percent).
-const COLORREF kGlassAccents[] = { RGB(44,106,221), RGB(124,77,214), RGB(206,72,150), RGB(206,64,64),
+const COLORREF kGlassAccents[] = { RGB(34,124,255), RGB(124,77,214), RGB(206,72,150), RGB(206,64,64),
                                    RGB(222,118,30), RGB(40,152,86), RGB(22,146,158) };
-const COLORREF kGlassLightTints[] = { RGB(222,227,236), RGB(236,227,220), RGB(236,222,230), RGB(218,229,240),
+const COLORREF kGlassLightTints[] = { RGB(233,237,245), RGB(236,227,220), RGB(236,222,230), RGB(218,229,240),
                                       RGB(221,236,227), RGB(229,224,240) };
-const COLORREF kGlassDarkTints[] = { RGB(17,19,27), RGB(24,28,72), RGB(9,9,11), RGB(10,34,38), RGB(32,20,48),
+const COLORREF kGlassDarkTints[] = { RGB(15,19,29), RGB(24,28,72), RGB(9,9,11), RGB(10,34,38), RGB(32,20,48),
                                      RGB(13,32,20), RGB(44,16,18) };
 constexpr int kGlassAccentCount = 7, kGlassLightCount = 6, kGlassDarkCount = 7;
 int glassAccentIndex = 0;
@@ -641,17 +746,38 @@ COLORREF GlassAccentLight() { return MixRgb(GlassAccent(), RGB(255,255,255), 55)
 constexpr uint8_t kGlassAccentAlpha = 235;
 GlassColors GlassTheme()
 {
+    // Each glass colour is used only for glass (OverlayAlpha finds it by colour), so they all differ a little.
     if (glassDark)
     {
         const COLORREF p = glassDarkIndex == kGlassDarkCount ? HsvToRgb(glassCustom[2])
                                                              : kGlassDarkTints[std::clamp(glassDarkIndex, 0, kGlassDarkCount - 1)];
-        return {AddRgb(p, 75, 79, 91), p, AddRgb(p, 29, 31, 39), RGB(236,238,245), RGB(150,156,172), RGB(210,214,226),
-                RGB(86,92,110), 120, 168, 190};
+        GlassColors c{AddRgb(p, 60, 66, 84), p, AddRgb(p, 15, 18, 25), RGB(238,242,250), RGB(140,150,172), RGB(196,204,222),
+                      RGB(62,70,92), 120, 200, 172, 0, 0, 0, 0, 0, 0, 0};
+        c.side = AddRgb(p, 34, 40, 56);   // switched-on tile: lighter
+        c.chip = AddRgb(p, 26, 30, 41);
+        c.line = AddRgb(p, 30, 35, 48);
+        c.sel = AddRgb(p, 44, 51, 68);
+        c.sideA = 236;
+        c.chipA = 200;
+        c.selA = 236;
+        return c;
     }
     const COLORREF p = glassLightIndex == kGlassLightCount ? HsvToRgb(glassCustom[1])
                                                            : kGlassLightTints[std::clamp(glassLightIndex, 0, kGlassLightCount - 1)];
-    return {AddRgb(p, 28, 24, 17), p, AddRgb(p, 21, 18, 13), RGB(34,38,52), RGB(104,110,126), RGB(70,76,92),
-            RGB(190,195,205), 150, 96, 172};
+    GlassColors c{AddRgb(p, 15, 13, 9), p, AddRgb(p, 19, 15, 9), RGB(20,26,42), RGB(88,98,118), RGB(58,69,96),
+                  RGB(198,204,216), 210, 236, 196, 0, 0, 0, 0, 0, 0, 0};
+    c.side = AddRgb(p, 21, 17, 10);   // switched-on tile: white
+    c.chip = AddRgb(p, -9, -8, -5);   // a neutral grey-blue track (not a washed blue)
+    c.line = AddRgb(p, -22, -19, -14);
+    c.sel = AddRgb(p, 20, 17, 10);
+    c.sideA = 246;
+    c.chipA = 236;
+    c.selA = 252;
+    // Keep the glass colours apart (a tint near white would make them equal).
+    if (c.side == c.fill) c.side = AddRgb(c.fill, 1, 1, 0);
+    if (c.sel == c.side || c.sel == c.fill) c.sel = AddRgb(c.side, 1, 0, 1);
+    if (c.border == c.side || c.border == c.sel) c.border = AddRgb(c.border, -2, -2, -1);
+    return c;
 }
 
 // HUD colours: each HUD module's text, box, border and (Keystrokes) pressed key, picked on its page
@@ -673,7 +799,7 @@ struct HudLook
     int box = -1;
     bool see = false;
 };
-constexpr int kHudLookCount = (int)HudElementId::BlockDetails + 1;
+constexpr int kHudLookCount = (int)HudElementId::JavaChat + 1;
 HudLook hudLooks[kHudLookCount];
 
 bool HudBoxOn(HudElementId id)
@@ -1086,10 +1212,36 @@ int* GetShortcutPtr(
         return &shortcuts.blockDetails;
     case DetailFeature::HealthWarning:
         return &shortcuts.healthWarning;
+    case DetailFeature::Coordinates:
+        return &shortcuts.coordinates;
+    case DetailFeature::CommandHotkeys:
+        return &shortcuts.commandHotkeys;
+    case DetailFeature::Timer:
+        return &shortcuts.timer;
+    case DetailFeature::CpsLimiter:
+        return &shortcuts.cpsLimiter;
+    case DetailFeature::ItemCounter:
+        return &shortcuts.itemCounter;
+
+    case DetailFeature::PackDisplay:
+        return &shortcuts.packDisplay;
 
     default:
         return nullptr;
     }
+}
+
+
+// The key a Key row sets: a module's own key, or (slot >= 0) one Command Hotkeys line's key.
+int* KeyTargetOf(DetailFeature f, int slot)
+{
+    if (f == DetailFeature::CommandHotkeys && slot >= 0 && slot < kCommandHotkeyCount)
+        return &commandHotkeys[slot].key;
+    if (f == DetailFeature::Timer && slot == 0)
+        return &timerStartKey;
+    if (f == DetailFeature::Timer && slot == 1)
+        return &timerResetKey;
+    return GetShortcutPtr(f);
 }
 
 
@@ -1168,7 +1320,13 @@ void SaveConfig()
          << shortcuts.dayTimer << L' '
          << shortcuts.debugMenu << L' '
          << shortcuts.blockDetails << L' '
-         << shortcuts.healthWarning
+         << shortcuts.healthWarning << L' '
+         << shortcuts.coordinates << L' '
+         << shortcuts.commandHotkeys << L' '
+         << shortcuts.timer << L' '
+         << shortcuts.cpsLimiter << L' '
+         << shortcuts.itemCounter << L' '
+         << shortcuts.packDisplay
          << L"\n";
 
     file << L"REPLAY "
@@ -1193,6 +1351,8 @@ void SaveConfig()
     file << L"LITE2 " << liteNoParticles << L' ' << liteNoShadows << L' ' << liteNoNameTags << L' ' << liteCullMobs
          << L' ' << liteCullItems << L' ' << liteCullMisc << L' ' << litePlayerLimit << L' ' << litePlayerDistance
          << L' ' << liteHighPriority << L' ' << liteNoThrottle << L' ' << liteGpuPriority << L"\n";
+    file << L"LITE3 " << liteNoSkyFull << L' ' << liteCullBehind << L' ' << liteBlockEntityLimit << L' ' << liteBlockEntityDistance
+         << L' ' << liteVerticalLimit << L' ' << liteVerticalRows << L"\n";
 
     file << L"NICK "
          << nickEnabled << L' '
@@ -1286,6 +1446,23 @@ void SaveConfig()
     file << L"HEALTHWARNING " << healthWarningEnabled << L' ' << healthWarningAt << L' ' << healthWarningStrength << L' '
          << healthWarningPulse << L' ' << healthWarningIndex << L' '
          << healthWarningHsv.h << L' ' << healthWarningHsv.s << L' ' << healthWarningHsv.v << L"\n";
+    file << L"COORDINATES " << coordinatesEnabled << L' ' << coordinatesHud.x << L' ' << coordinatesHud.y << L' '
+         << coordinatesHud.scale << L' ' << coordinatesDecimals << L' ' << coordinatesFacing << L"\n";
+    // The lines are UTF-8 in hex: the config stream is not Unicode-safe ("-" = empty).
+    file << L"COMMANDHOTKEYS " << commandHotkeysEnabled << L"\n";
+    for (int i = 0; i < kCommandHotkeyCount; i++)
+    {
+        const std::wstring hex = HexOfUtf8(WideToUtf8(commandHotkeys[i].text));
+        file << L"COMMANDKEY " << i << L' ' << commandHotkeys[i].key << L' ' << (hex.empty() ? L"-" : hex) << L"\n";
+    }
+    file << L"TIMER " << timerEnabled << L' ' << timerHud.x << L' ' << timerHud.y << L' ' << timerHud.scale << L' '
+         << timerMode << L' ' << timerMinutes << L' ' << timerSeconds << L' ' << timerFlash << L' ' << timerSound << L' '
+         << timerStartKey << L' ' << timerResetKey << L"\n";
+    file << L"CPSLIMITER " << cpsLimiterEnabled << L' ' << cpsLimitLeft << L' ' << cpsLimitRight << L"\n";
+    file << L"ITEMCOUNTER " << itemCounterEnabled << L' ' << itemCounterStacks << L"\n";
+    file << L"PACKDISPLAY " << packDisplayEnabled << L' ' << packDisplayHud.x << L' ' << packDisplayHud.y << L' '
+         << packDisplayHud.scale << L' ' << packDisplayIcons << L"\n";
+    file << L"JAVACHAT " << javaChatEnabled << L' ' << javaChatHud.x << L' ' << javaChatHud.y << L' ' << javaChatHud.scale << L"\n";
     file << L"DAYTIMER " << dayTimerEnabled << L' ' << dayTimerHud.x << L' ' << dayTimerHud.y << L' '
          << dayTimerHud.scale << L' ' << dayTimerBoth << L"\n";
 
@@ -1517,6 +1694,22 @@ void LoadConfig()
                 int healthWarningKey = shortcuts.healthWarning;
                 if (ss >> healthWarningKey)   // optional: absent in configs from before Health Warning
                     shortcuts.healthWarning = healthWarningKey;
+                int coordinatesKey = shortcuts.coordinates, commandHotkeysKey = shortcuts.commandHotkeys;
+                if (ss >> coordinatesKey)     // optional: absent in configs from before Coordinates
+                    shortcuts.coordinates = coordinatesKey;
+                if (ss >> commandHotkeysKey)  // optional: absent in configs from before Command Hotkeys
+                    shortcuts.commandHotkeys = commandHotkeysKey;
+                int timerKey = shortcuts.timer, cpsLimiterKey = shortcuts.cpsLimiter;
+                if (ss >> timerKey)           // optional: absent in configs from before Timer
+                    shortcuts.timer = timerKey;
+                if (ss >> cpsLimiterKey)      // optional: absent in configs from before CPS Limiter
+                    shortcuts.cpsLimiter = cpsLimiterKey;
+                int itemCounterKey = shortcuts.itemCounter;
+                if (ss >> itemCounterKey)     // optional: absent in configs from before Item Counter
+                    shortcuts.itemCounter = itemCounterKey;
+                int packDisplayKey = shortcuts.packDisplay;
+                if (ss >> packDisplayKey)     // optional: absent in configs from before Pack Display
+                    shortcuts.packDisplay = packDisplayKey;
                 shortcuts.shulker = read.shulker;
                 shortcuts.hive = read.hive;
                 shortcuts.resources = read.resources;
@@ -1553,6 +1746,7 @@ void LoadConfig()
             if (ss >> enabled)
             {
                 texturesEnabled = enabled;
+                // (a second value was written for a few days by the in-world apply switch; it is gone: always applied in the world)
             }
         }
         else if (key == L"NAMETAG")
@@ -1725,6 +1919,102 @@ void LoadConfig()
             int size = 100;
             if (ss >> size) debugTextSize = std::clamp(size, 50, 200);   // optional: absent before Text size
         }
+        else if (key == L"COORDINATES")
+        {
+            bool enabled = coordinatesEnabled, decimals = coordinatesDecimals, facing = coordinatesFacing;
+            HudElement element = coordinatesHud;
+            if (ss >> enabled >> element.x >> element.y >> element.scale)
+            {
+                coordinatesEnabled = enabled;
+                coordinatesHud = element;
+                if (ss >> decimals) coordinatesDecimals = decimals;
+                if (ss >> facing) coordinatesFacing = facing;
+            }
+        }
+        else if (key == L"TIMER")
+        {
+            bool enabled = timerEnabled, flash = timerFlash, sound = timerSound;
+            HudElement element = timerHud;
+            int mode = timerMode, minutes = timerMinutes, seconds = timerSeconds, startKey = timerStartKey, resetKey = timerResetKey;
+            if (ss >> enabled >> element.x >> element.y >> element.scale)
+            {
+                timerEnabled = enabled;
+                timerHud = element;
+                if (ss >> mode >> minutes >> seconds >> flash >> sound)
+                {
+                    timerMode = std::clamp(mode, 0, 1);
+                    timerMinutes = std::clamp(minutes, 0, 60);
+                    timerSeconds = std::clamp(seconds, 0, 59);
+                    timerFlash = flash;
+                    timerSound = sound;
+                }
+                const auto validKey = [](int vk) { return vk > 0 && vk < 256 && vk != VK_ESCAPE ? vk : 0; };
+                if (ss >> startKey >> resetKey)
+                {
+                    timerStartKey = validKey(startKey);
+                    timerResetKey = validKey(resetKey);
+                }
+            }
+        }
+        else if (key == L"JAVACHAT")
+        {
+            bool enabled = false;
+            HudElement element = javaChatHud;
+            if (ss >> enabled >> element.x >> element.y >> element.scale) {
+                javaChatEnabled = enabled;
+                element.scale = std::clamp(element.scale, 0.5f, 3.0f);
+                javaChatHud = element;
+            }
+        }
+        else if (key == L"PACKDISPLAY")
+        {
+            bool enabled = packDisplayEnabled, icons = packDisplayIcons;
+            HudElement element = packDisplayHud;
+            if (ss >> enabled >> element.x >> element.y >> element.scale)
+            {
+                packDisplayEnabled = enabled;
+                packDisplayHud = element;
+                if (ss >> icons) packDisplayIcons = icons;
+            }
+        }
+        else if (key == L"ITEMCOUNTER")
+        {
+            bool enabled = itemCounterEnabled, stacks = itemCounterStacks;
+            if (ss >> enabled)
+            {
+                itemCounterEnabled = enabled;
+                if (ss >> stacks) itemCounterStacks = stacks;
+            }
+        }
+        else if (key == L"CPSLIMITER")
+        {
+            bool enabled = cpsLimiterEnabled;
+            int left = cpsLimitLeft, right = cpsLimitRight;
+            if (ss >> enabled)
+            {
+                cpsLimiterEnabled = enabled;
+                if (ss >> left >> right)
+                {
+                    cpsLimitLeft = std::clamp(left, 0, 30);
+                    cpsLimitRight = std::clamp(right, 0, 30);
+                }
+            }
+        }
+        else if (key == L"COMMANDHOTKEYS")
+        {
+            bool enabled = commandHotkeysEnabled;
+            if (ss >> enabled) commandHotkeysEnabled = enabled;
+        }
+        else if (key == L"COMMANDKEY")
+        {
+            int slot = -1, vk = 0;
+            std::wstring hex;
+            if (ss >> slot >> vk >> hex && slot >= 0 && slot < kCommandHotkeyCount)
+            {
+                commandHotkeys[slot].key = vk > 0 && vk < 256 && vk != VK_ESCAPE ? vk : 0;
+                commandHotkeys[slot].text = hex == L"-" ? std::wstring() : Utf8ToWide(Utf8OfHex(hex)).substr(0, 200);
+            }
+        }
         else if (key == L"DAYTIMER")
         {
             bool enabled = dayTimerEnabled, both = dayTimerBoth;
@@ -1880,6 +2170,17 @@ void LoadConfig()
                 liteHighPriority = priority; liteNoThrottle = throttle; liteGpuPriority = gpu;
             }
         }
+        else if (key == L"LITE3")
+        {
+            bool sky = false, behind = false, blocks = false, vertical = false;
+            int blockDistance = 32, rows = 4;
+            if (ss >> sky >> behind >> blocks >> blockDistance >> vertical >> rows)
+            {
+                liteNoSkyFull = sky; liteCullBehind = behind; liteBlockEntityLimit = blocks; liteVerticalLimit = vertical;
+                liteBlockEntityDistance = std::clamp(blockDistance / 8 * 8, 8, 128);
+                liteVerticalRows = std::clamp(rows, 1, (int)MyClientFeatures::VerticalRowsMax);
+            }
+        }
         else if (key == L"REPLAY")
         {
             // Recording never starts by itself after a restart: the switch always begins OFF.
@@ -1936,7 +2237,9 @@ void LoadConfig()
             if (ss >> enabled >> element.x >> element.y >> element.scale)
             {
                 tabListEnabled = enabled;
-                tabListHud = element;
+                // The old default (top right) was saved as-is by every config: never moved, so take the new one.
+                if (!(element.x == 1000 && element.y == 120 && element.scale == 1.0f))
+                    tabListHud = element;
             }
         }
         else if (key == L"HIVESTATS")
@@ -2037,7 +2340,7 @@ void LoadConfig()
             pinnedFeatures.clear();
             int value = 0;
             while (ss >> value)
-                if (value > (int)DetailFeature::None && value <= (int)DetailFeature::HealthWarning &&
+                if (value > (int)DetailFeature::None && value <= (int)DetailFeature::JavaChat &&
                     std::find(pinnedFeatures.begin(), pinnedFeatures.end(), (DetailFeature)value) == pinnedFeatures.end())
                     pinnedFeatures.push_back((DetailFeature)value);
         }
@@ -2103,6 +2406,25 @@ void ResetHudLayout()
         1.0f
     };
 
+    coordinatesHud = {
+        190,
+        555,
+        1.0f
+    };
+
+    timerHud = {
+        190,
+        655,
+        1.0f
+    };
+
+    packDisplayHud = {
+        1640,
+        420,
+        1.0f
+    };
+    javaChatHud = {12, -1, 1.0f};
+
     blockDetailsHud = {
         810,
         12,
@@ -2122,8 +2444,8 @@ void ResetHudLayout()
     };
 
     tabListHud = {
-        1000,
-        120,
+        865,
+        110,
         1.0f
     };
 
@@ -2283,15 +2605,38 @@ int GetRightCPS()
 
 // Fonts used for drawing text, created once per (size, face) and kept for the life of the HUD
 // (creating and deleting a font for every string cost more than drawing the text itself).
+// The weight of the text drawn next (FW_BOLD unless a FontStyle below says otherwise).
+int uiFontWeight = FW_BOLD;
 HFONT UiFont(int size, const wchar_t* face = L"Segoe UI")
 {
-    static std::map<std::pair<int, std::wstring>, HFONT> fonts;
-    HFONT& font = fonts[{size, face}];
+    static std::map<std::tuple<int, int, std::wstring>, HFONT> fonts;
+    HFONT& font = fonts[{size, uiFontWeight, face}];
     if (!font)
-        font = CreateFontW(size, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+        font = CreateFontW(size, 0, 0, 0, uiFontWeight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                            CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
     return font;
 }
+
+// Text weight (and letter spacing on `hdc`, in pixels) for the text drawn and measured while it lives:
+// FontStyle style(FW_SEMIBOLD); or FontStyle caps(FW_BOLD, hdc, 2) for spaced-out small capitals.
+struct FontStyle
+{
+    int oldWeight;
+    HDC dc;
+    int oldExtra = 0;
+    explicit FontStyle(int weight, HDC hdc = nullptr, int tracking = 0) : oldWeight(uiFontWeight), dc(tracking ? hdc : nullptr)
+    {
+        uiFontWeight = weight;
+        if (dc) oldExtra = SetTextCharacterExtra(dc, tracking);
+    }
+    ~FontStyle()
+    {
+        uiFontWeight = oldWeight;
+        if (dc) SetTextCharacterExtra(dc, oldExtra);
+    }
+    FontStyle(const FontStyle&) = delete;
+    FontStyle& operator=(const FontStyle&) = delete;
+};
 
 // ------------------------- Drawing ---------------------------
 
@@ -2830,7 +3175,7 @@ void DrawLineSmooth(HDC hdc, float x0, float y0, float x1, float y1, float thick
 // Rounded box with smooth (anti-aliased) corners. The straight parts are plain GDI fills; each corner
 // pixel is blended by how much of it lies inside the arc. Over the transparent key colour (magenta)
 // there is nothing to blend with, so those pixels are either filled (half covered or more) or left.
-void GlassBox(HDC hdc, const RECT& r, int radius, COLORREF color, uint8_t alpha);   // with the glass pages
+void GlassBox(HDC hdc, const RECT& r, int radius, COLORREF color, uint8_t alpha, uint8_t corners = OverlayAlpha::AllRound);   // with the glass pages
 
 void DrawRoundBox(
     HDC hdc,
@@ -3445,7 +3790,7 @@ void DrawArmor(HDC hdc)
     const int textSize = std::max(9, (int)(13 * s));
 
     auto& icons = HudIcons();
-    const std::wstring gameDir = MinecraftDataProvider::GameDirectory();
+    const std::wstring gameDir = MinecraftDataProvider::GameTextureDirectory();
     const auto& activePacks = ActiveTexturePacks();
 
     {
@@ -3575,7 +3920,7 @@ bool OverlayAlphaWanted()
     if (!hudEditMode && !MinecraftDataProvider::IsInWorld())
         return false;   // no HUD outside a world
     return keystrokesEnabled || cpsEnabled || fpsEnabled || pingEnabled || armorHudEnabled || arrowCounterEnabled ||
-           resourceCounterEnabled || featureListEnabled || tabListEnabled || (hiveStatsEnabled && hiveEnabled) || dayTimerEnabled || blockDetailsEnabled ||
+           resourceCounterEnabled || featureListEnabled || (tabListEnabled && tabListShown) || (hiveStatsEnabled && hiveEnabled) || dayTimerEnabled || blockDetailsEnabled || coordinatesEnabled || timerEnabled || packDisplayEnabled || javaChatEnabled ||
            (debugMenuEnabled && debugScreenShown) || healthWarningEnabled || GetTickCount64() < healthWarningPreviewUntil;
 }
 
@@ -3617,7 +3962,7 @@ void DrawResources(HDC hdc)
     const int gap = std::max(1, (int)(kResourceGap * s));
     const int textSize = std::max(9, (int)(15 * s));
     auto& icons = HudIcons();
-    const std::wstring gameDir = MinecraftDataProvider::GameDirectory();
+    const std::wstring gameDir = MinecraftDataProvider::GameTextureDirectory();
     const auto& activePacks = ActiveTexturePacks();
 
     for (int i = 0; i < 4; i++)
@@ -3707,7 +4052,7 @@ void WriteIconScan(const SlotIcons::Cache& cache, const wchar_t* who, size_t& wr
     if (misses.size() == written) return;
     written = misses.size();
     static std::map<std::wstring, std::string> parts;
-    std::string text = "Looked in:\r\n";
+    std::string text = cache.Notes() + "Looked in:\r\n";
     for (const auto& root : cache.Roots()) text += "  " + WideToUtf8(root.wstring()) + "\r\n";
     text += "No picture (" + std::to_string(misses.size()) + "):\r\n";
     for (const auto& line : misses) text += "  " + line + "\r\n";
@@ -3727,6 +4072,122 @@ void WriteIconScan(const SlotIcons::Cache& cache, const wchar_t* who, size_t& wr
 // Shulker hover popup: while the mouse rests on a shulker box in an inventory / container screen,
 // the box is drawn next to the cursor the way the game shows it when opened: its 9x3 slots with the
 // item icons (the game's own textures, blocks as 3D cubes) and stack counts. Part of Shulker Preview.
+// Item Counter: while Alt is held over an item in an inventory / container screen, a tooltip like the game's:
+// the item's name, then "64 [inventory] + 64 [shulker boxes] + 512 [chest] = 640 (10 stacks)".
+void DrawItemCounterBox(HDC hdc, const MyClientItemCount::Shared& data, POINT cursor, int width, int height);
+void DrawItemCounter(HDC hdc, int width, int height)
+{
+    if (!itemCounterEnabled || menuOpen || hudEditMode || !overlayWindow)
+        return;
+    MyClientItemCount::Shared data{};
+    if (!MinecraftDataProvider::GetItemCount(data))
+        return;
+    POINT cursor{};
+    if (!GetCursorPos(&cursor) || !ScreenToClient(overlayWindow, &cursor))
+        return;
+    DrawItemCounterBox(hdc, data, cursor, width, height);
+}
+
+void DrawItemCounterBox(HDC hdc, const MyClientItemCount::Shared& data, POINT cursor, int width, int height)
+{
+    const int p = std::max(1, (int)std::lround(2 * shulkerHud.scale));   // one GUI pixel, like Shulker Preview
+    const int font = 10 * p, icon = 9 * p, pad = 4 * p;
+    const auto textWidth = [&](const std::wstring& str)
+    {
+        HFONT old = (HFONT)SelectObject(hdc, UiFont(font));
+        SIZE extent{};
+        GetTextExtentPoint32W(hdc, str.c_str(), (int)str.size(), &extent);
+        SelectObject(hdc, old);
+        return (int)extent.cx;
+    };
+    const auto text = [&](int x, int y, const std::wstring& str, COLORREF color)
+    {
+        HFONT old = (HFONT)SelectObject(hdc, UiFont(font));
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(40,40,40));
+        TextOutW(hdc, x + p / 2 + 1, y + p / 2 + 1, str.c_str(), (int)str.size());   // the game's text shadow
+        SetTextColor(hdc, color);
+        TextOutW(hdc, x, y, str.c_str(), (int)str.size());
+        SelectObject(hdc, old);
+    };
+
+    // The second line as pieces: a number / sign, or an icon (item id without "minecraft:").
+    struct Piece { std::wstring text; const char* icon; };
+    std::vector<Piece> pieces;
+    const auto number = [](uint64_t n) { return std::to_wstring(n); };
+    pieces.push_back({number(data.inventory), nullptr});
+    pieces.push_back({L"", "bundle"});
+    pieces.push_back({L" + " + number(data.shulkers), nullptr});
+    pieces.push_back({L"", "purple_shulker_box"});
+    if (data.hasContainer)
+    {
+        pieces.push_back({L" + " + number(data.container), nullptr});
+        pieces.push_back({L"", "chest"});
+    }
+    const uint64_t total = (uint64_t)data.inventory + data.shulkers + (data.hasContainer ? data.container : 0);
+    std::wstring tail = L" = " + number(total);
+    if (itemCounterStacks)
+    {
+        const uint32_t stacks = MyClientItemCount::Stacks(total, data.maxStack);
+        tail += L" (" + std::to_wstring(stacks) + (stacks == 1 ? L" stack)" : L" stacks)");
+    }
+    pieces.push_back({tail, nullptr});
+
+    const int gap = p;
+    int lineW = 0;
+    for (const auto& piece : pieces) lineW += piece.icon ? icon + 2 * gap : textWidth(piece.text);
+    const std::wstring title = Utf8ToWide(data.name);
+    const int w = std::max(lineW, textWidth(title)) + 2 * pad;
+    const int lineH = font + 2 * p;
+    const int h = 2 * lineH + 2 * pad;
+
+    int x = cursor.x + 18, y = cursor.y - h - 6;   // above-right of the pointer, like the game's tooltip
+    if (x + w > width) x = cursor.x - 18 - w;
+    if (y < 0) y = cursor.y + 22;
+    x = std::max(0, std::min(x, width - w));
+    y = std::max(0, std::min(y, height - h));
+
+    // The game's tooltip: near-black purple with a purple frame.
+    const auto fill = [&](int fx, int fy, int fw, int fh, COLORREF color)
+    {
+        const RECT r{fx, fy, fx + fw, fy + fh};
+        HBRUSH brush = CreateSolidBrush(color);
+        FillRect(hdc, &r, brush);
+        DeleteObject(brush);
+    };
+    fill(x, y, w, h, RGB(16,1,16));
+    fill(x + p, y + p, w - 2 * p, p, RGB(56,10,110));
+    fill(x + p, y + h - 2 * p, w - 2 * p, p, RGB(40,4,80));
+    fill(x + p, y + p, p, h - 2 * p, RGB(56,10,110));
+    fill(x + w - 2 * p, y + p, p, h - 2 * p, RGB(40,4,80));
+
+    text(x + pad, y + pad, title, RGB(255,255,255));
+
+    auto& icons = HudIcons();
+    static SlotIcons::Cache slotIcons;
+    const std::wstring gameDir = MinecraftDataProvider::GameTextureDirectory();
+    const auto& activePacks = ActiveTexturePacks();
+    int cx = x + pad;
+    const int ly = y + pad + lineH;
+    for (const auto& piece : pieces)
+    {
+        if (!piece.icon)
+        {
+            text(cx, ly, piece.text, RGB(255,255,255));
+            cx += textWidth(piece.text);
+            continue;
+        }
+        const int ix = cx + gap, iy = ly + (font - icon) / 2 + p;
+        if (const ItemIcons::Icon* found = slotIcons.Get(gameDir, activePacks, piece.icon, icon))
+            ItemIcons::Draw(hdc, *found, ix, iy, icon);
+        else if (const ItemIcons::Icon* other = icons.Get(gameDir, activePacks, piece.icon))
+            ItemIcons::Draw(hdc, *other, ix, iy, icon);
+        else
+            text(ix, ly, std::wstring(1, (wchar_t)std::toupper((unsigned char)piece.icon[0])), RGB(200,200,200));
+        cx += icon + 2 * gap;
+    }
+}
+
 void DrawShulkerHover(HDC hdc, int width, int height)
 {
     if (!shulkerEnabled || menuOpen || hudEditMode || !overlayWindow)
@@ -3816,7 +4277,7 @@ void DrawShulkerHover(HDC hdc, int width, int height)
 
     auto& icons = HudIcons();
     static SlotIcons::Cache slotIcons;
-    const std::wstring gameDir = MinecraftDataProvider::GameDirectory();
+    const std::wstring gameDir = MinecraftDataProvider::GameTextureDirectory();
     const auto& activePacks = ActiveTexturePacks();
     const int countSize = std::max(8, 8 * p);
 
@@ -3917,7 +4378,7 @@ std::vector<TabListLine> TabListLines()
 
 void DrawTabList(HDC hdc)
 {
-    if (!tabListEnabled)
+    if (!tabListEnabled || (!tabListShown && !hudEditMode))
         return;
 
     const auto lines = TabListLines();
@@ -4234,6 +4695,265 @@ void DrawDayTimer(HDC hdc)
 }
 
 
+// ------------------------- Coordinates --------------------
+// Your position (feet) and, optionally, the way you face. The camera is only sent while nothing covers the
+// world (chat, inventory): the last one is kept a few seconds so the box does not blink.
+int CoordinatesHudWidth() { return coordinatesDecimals ? 250 : 210; }
+
+bool CoordinatesNow(MinecraftDataProvider::Camera& out)
+{
+    static MinecraftDataProvider::Camera last{};
+    static ULONGLONG lastAt = 0;
+    MinecraftDataProvider::Camera cam{};
+    if (MinecraftDataProvider::GetCamera(cam)) { last = cam; lastAt = GetTickCount64(); }
+    out = last;
+    return lastAt && GetTickCount64() - lastAt < 10000;
+}
+
+void DrawCoordinates(HDC hdc)
+{
+    if (!coordinatesEnabled)
+        return;
+    MinecraftDataProvider::Camera cam{};
+    std::vector<std::wstring> lines;
+    if (CoordinatesNow(cam))
+        lines = DebugScreen::CoordinateLines(cam.x, cam.y, cam.z, cam.yaw, coordinatesDecimals, coordinatesFacing);
+    else if (hudEditMode)
+        lines = coordinatesFacing ? std::vector<std::wstring>{L"X: ---  Y: ---  Z: ---", L"Facing: ---"}
+                                  : std::vector<std::wstring>{L"X: ---  Y: ---  Z: ---"};
+    if (lines.empty())
+        return;
+
+    const float s = coordinatesHud.scale;
+    const int x = coordinatesHud.x;
+    const int y = coordinatesHud.y;
+    const int w = std::max(120, (int)(CoordinatesHudWidth() * s));
+    const int h = std::max(24, (int)(DayTimerHudHeight(lines.size()) * s));
+
+    DrawHudBox(hdc, HudElementId::Coordinates, x, y, w, h, HudRadius(s), RGB(20,20,20));
+    for (size_t i = 0; i < lines.size(); i++)
+        DrawHudText(hdc, HudElementId::Coordinates, x + (int)(12 * s), y + (int)((6 + 24 * i) * s), lines[i],
+                    HudColor(HudElementId::Coordinates, HudText, i == 0 ? RGB(255,255,255) : RGB(190,190,190)),
+                    std::max(10, (int)(18 * s)));
+
+    if (hudEditMode && selectedHud == HudElementId::Coordinates)
+        DrawOutline(hdc, x, y, w, h, RGB(80,180,255));
+}
+
+
+// ------------------------- Timer --------------------------
+// One clock, two modes: Timer counts down from Minutes:Seconds, Stopwatch counts up. Started, paused and
+// reset with its keys while playing or with the page's buttons; it keeps running with the menu open.
+int TimerHudWidth() { return 190; }
+uint64_t TimerLengthMs() { return std::max<uint64_t>(1, (uint64_t)timerMinutes * 60 + timerSeconds) * 1000; }
+
+void TimerStartPause()
+{
+    const ULONGLONG now = GetTickCount64();
+    if (timerMode == 0 && ClientTimer::Remaining(timerClock, TimerLengthMs(), now) == 0)
+        timerClock.Reset();   // ran out: start the countdown again
+    timerDoneAt = 0;
+    timerClock.Toggle(now);
+}
+
+void TimerReset()
+{
+    timerClock.Reset();
+    timerDoneAt = 0;
+}
+
+// The countdown running out: stops at 0:00, blinks and beeps (once).
+void TickTimer()
+{
+    if (timerMode != 0 || !timerClock.running)
+        return;
+    const ULONGLONG now = GetTickCount64();
+    if (ClientTimer::Remaining(timerClock, TimerLengthMs(), now) > 0)
+        return;
+    timerClock.Pause(now);
+    timerClock.banked = TimerLengthMs();
+    timerDoneAt = now;
+    if (timerSound)
+    {
+        static const std::vector<unsigned char> alarm = ClientTimer::AlarmWav();
+        PlaySoundW((LPCWSTR)alarm.data(), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+    }
+}
+
+std::wstring TimerText()
+{
+    const ULONGLONG now = GetTickCount64();
+    return timerMode == 0 ? ClientTimer::FormatCountdown(ClientTimer::Remaining(timerClock, TimerLengthMs(), now))
+                          : ClientTimer::FormatStopwatch(timerClock.Elapsed(now));
+}
+
+void DrawTimer(HDC hdc)
+{
+    if (!timerEnabled)
+        return;
+
+    const float s = timerHud.scale;
+    const int x = timerHud.x;
+    const int y = timerHud.y;
+    const int w = std::max(110, (int)(TimerHudWidth() * s));
+    const int h = std::max(24, (int)(DayTimerHudHeight(1) * s));
+    const ULONGLONG now = GetTickCount64();
+
+    COLORREF ink = HudColor(HudElementId::Timer, HudText, RGB(255,255,255));
+    if (!timerClock.running && !timerClock.Fresh() && !timerDoneAt)
+        ink = HudColor(HudElementId::Timer, HudText, RGB(190,190,190));   // paused
+    bool showTime = true;
+    if (timerDoneAt && timerMode == 0)
+    {
+        ink = RGB(255, 70, 70);
+        if (timerFlash && now - timerDoneAt < 10000)
+            showTime = (now - timerDoneAt) / 300 % 2 == 0;   // blinks for 10 s, then stays red
+    }
+
+    DrawHudBox(hdc, HudElementId::Timer, x, y, w, h, HudRadius(s), RGB(20,20,20));
+    const int size = std::max(10, (int)(18 * s));
+    DrawHudText(hdc, HudElementId::Timer, x + (int)(12 * s), y + (int)(6 * s), timerMode == 0 ? L"Timer" : L"Stopwatch",
+                HudColor(HudElementId::Timer, HudText, RGB(190,190,190)), size);
+    if (showTime)
+    {
+        const std::wstring text = TimerText();
+        DrawHudText(hdc, HudElementId::Timer, x + w - (int)(12 * s) - TextWidth(hdc, text, size), y + (int)(6 * s), text, ink, size);
+    }
+
+    if (hudEditMode && selectedHud == HudElementId::Timer)
+        DrawOutline(hdc, x, y, w, h, RGB(80,180,255));
+}
+
+
+// ------------------------- Pack Display -------------------
+// The texture packs you have on (the game's global list, highest priority first), each with its picture.
+// The list file is checked every 1.5 s, so switching in the game's own screen shows up too.
+struct PackDisplayRow { std::wstring name, subpack; std::filesystem::path icon; bool isDefault = false; };
+ItemIcons::FileCache& TexPackIcons();
+std::filesystem::path VanillaPackIcon();
+int packDisplayW = 0, packDisplayH = 0;   // the last box drawn, unscaled (for Edit HUD's hit test)
+
+const std::vector<PackDisplayRow>& PackDisplayRows()
+{
+    static std::vector<PackDisplayRow> rows;
+    static ULONGLONG checkedAt = 0;
+    static std::filesystem::file_time_type seen = std::filesystem::file_time_type::min();
+    static std::filesystem::path seenFile;
+    static size_t seenPacks = (size_t)-1;
+    const ULONGLONG now = GetTickCount64();
+    if (!rows.empty() && now - checkedAt < 1500)
+        return rows;
+    checkedAt = now;
+    if (!texScanned) RefreshTextures();
+    const auto time = TexturePacks::WriteTime(texState.globalFile);
+    if (!rows.empty() && time == seen && texState.globalFile == seenFile && texState.packs.size() == seenPacks)
+        return rows;
+    seen = time;
+    seenFile = texState.globalFile;
+    seenPacks = texState.packs.size();
+
+    rows.clear();
+    const std::vector<TexturePacks::Entry> entries = texState.found
+        ? TexturePacks::ParseEntries(TexturePacks::ReadFile(texState.globalFile)) : std::vector<TexturePacks::Entry>{};
+    for (const auto& e : entries)
+    {
+        if (e.uuid == LitePack::kPackUuid) continue;   // MyClient's own generated pack
+        for (const auto& pack : texState.packs)
+        {
+            if (pack.uuid != e.uuid) continue;
+            PackDisplayRow row;
+            row.name = Utf8ToWide(TexturePacks::StripFormatting(pack.name));
+            row.icon = pack.folder / L"pack_icon.png";
+            if (const std::string sub = TexturePacks::SubpackOf(e); !sub.empty())
+            {
+                row.subpack = Utf8ToWide(sub);
+                for (const auto& sp : pack.subpacks)
+                    if (sp.folder == sub && !sp.name.empty()) row.subpack = Utf8ToWide(TexturePacks::StripFormatting(sp.name));
+            }
+            rows.push_back(row);
+            break;
+        }
+        if (rows.size() >= 12) break;
+    }
+    if (rows.empty())
+    {
+        PackDisplayRow row;
+        row.name = L"Default textures";
+        row.icon = VanillaPackIcon();
+        row.isDefault = true;
+        rows.push_back(row);
+    }
+    return rows;
+}
+
+void DrawPackDisplay(HDC hdc)
+{
+    if (!packDisplayEnabled)
+        return;
+    const auto& rows = PackDisplayRows();
+    const float s = packDisplayHud.scale;
+    const int size = std::max(10, (int)(16 * s));
+    const int subSize = std::max(9, (int)(13 * s));
+    const int pitch = packDisplayIcons ? 30 : 22;
+    const int icon = std::max(8, (int)(24 * s));
+    const int pad = (int)(10 * s);
+    const int textOffset = pad + (packDisplayIcons ? icon + (int)(8 * s) : 0);
+
+    int textW = 0;
+    for (const auto& row : rows)
+    {
+        int rw = TextWidth(hdc, row.name, size);
+        if (!row.subpack.empty()) rw += (int)(6 * s) + TextWidth(hdc, row.subpack, subSize);
+        textW = std::max(textW, rw);
+    }
+    const int w = std::max((int)(120 * s), textOffset + textW + pad);
+    const int h = (int)((8 + pitch * (int)rows.size()) * s);
+    // The default place is at the right (x = 1640): on a narrower game window the whole box was outside the
+    // screen and nothing showed. Keep it inside the window (the saved place follows, so Edit HUD can grab it).
+    RECT client{};
+    if (overlayWindow && GetClientRect(overlayWindow, &client) && client.right > 0 && client.bottom > 0)
+    {
+        packDisplayHud.x = std::clamp(packDisplayHud.x, 0, std::max(0, (int)client.right - w));
+        packDisplayHud.y = std::clamp(packDisplayHud.y, 0, std::max(0, (int)client.bottom - h));
+    }
+    const int x = packDisplayHud.x;
+    const int y = packDisplayHud.y;
+    const int textX = x + textOffset;
+    packDisplayW = std::max(1, (int)(w / std::max(0.1f, s)));
+    packDisplayH = std::max(1, (int)(h / std::max(0.1f, s)));
+
+    DrawHudBox(hdc, HudElementId::PackDisplay, x, y, w, h, HudRadius(s), RGB(20,20,20));
+    const COLORREF ink = HudColor(HudElementId::PackDisplay, HudText, RGB(255,255,255));
+    const COLORREF grey = HudColor(HudElementId::PackDisplay, HudText, RGB(170,170,170));
+    for (size_t i = 0; i < rows.size(); i++)
+    {
+        const auto& row = rows[i];
+        const int rowY = y + (int)((4 + pitch * (int)i) * s);
+        const int rowH = (int)(pitch * s);
+        if (packDisplayIcons)
+        {
+            const int iy = rowY + (rowH - icon) / 2;
+            if (const ItemIcons::Icon* found = row.icon.empty() ? nullptr : TexPackIcons().Get(row.icon, std::max(16, icon)))
+                ItemIcons::Draw(hdc, *found, x + pad, iy, icon);
+            else
+            {
+                DrawRoundBox(hdc, x + pad, iy, icon, icon, std::max(2, icon / 5), RGB(60,60,66));
+                const std::wstring letter = row.name.empty() ? L"?" : std::wstring(1, (wchar_t)towupper(row.name[0]));
+                DrawTextCentered(hdc, x + pad, iy, icon, icon, letter, RGB(200,200,200), std::max(9, icon / 2));
+            }
+        }
+        const int ty = rowY + (rowH - (int)(size * 1.25f)) / 2;
+        DrawHudText(hdc, HudElementId::PackDisplay, textX, ty, row.name, row.isDefault ? grey : ink, size);
+        if (!row.subpack.empty())
+            DrawHudText(hdc, HudElementId::PackDisplay, textX + TextWidth(hdc, row.name, size) + (int)(6 * s),
+                        ty + (size - subSize) / 2 + 1, row.subpack, grey, subSize);
+    }
+
+    if (hudEditMode && selectedHud == HudElementId::PackDisplay)
+        DrawOutline(hdc, x, y, w, h, RGB(80,180,255));
+}
+
+
 // ------------------------- Block Details ------------------
 // The box at the top about the block under the crosshair: its picture and name, where it comes from, and the tool.
 std::wstring Utf8ToWide(const std::string& text);
@@ -4268,7 +4988,7 @@ void ScanBlockNames(bool unknownNamespace)
     if (names.busy.load() || (names.scannedAt && !(unknownNamespace && now - names.scannedAt > 60000))) return;
     names.scannedAt = now;
     names.busy.store(true);
-    const std::wstring gameDir = MinecraftDataProvider::GameDirectory();
+    const std::wstring gameDir = MinecraftDataProvider::GameTextureDirectory();
     std::thread([gameDir]()
     {
         const auto roots = SkinLibrary::MojangRoots();
@@ -4357,7 +5077,7 @@ void DrawBlockDetails(HDC hdc)
     DrawHudBox(hdc, HudElementId::BlockDetails, x, y, w, h, HudRadius(s), RGB(20,20,24));
 
     static SlotIcons::Cache icons;
-    const std::wstring gameDir = MinecraftDataProvider::GameDirectory();
+    const std::wstring gameDir = MinecraftDataProvider::GameTextureDirectory();
     const auto& packs = ActiveTexturePacks();
     const int iconY = y + (h - icon) / 2;
     const ItemIcons::Icon* found = icons.Get(gameDir, packs, BlockDetails::PathOf(info.id), icon);
@@ -4468,7 +5188,7 @@ void DrawArrows(HDC hdc)
     const int y = arrowHud.y;
     const int icon = std::max(8, (int)(kResourceIcon * s));
     const int textSize = std::max(9, (int)(15 * s));
-    const ItemIcons::Icon* found = HudIcons().Get(MinecraftDataProvider::GameDirectory(), ActiveTexturePacks(), "arrow");
+    const ItemIcons::Icon* found = HudIcons().Get(MinecraftDataProvider::GameTextureDirectory(), ActiveTexturePacks(), "arrow");
     const int textX = found ? x + icon + (int)(8 * s) : x;
     DrawCounterRowBackground(hdc, HudElementId::Arrows, x, y, textX - x + TextWidth(hdc, label, textSize), icon, s,
                                  arrowBackground, arrowTranslucent);
@@ -4486,6 +5206,10 @@ void DrawFPS(HDC hdc)
     float gameFps = 0;
     const bool knownFps = MinecraftDataProvider::GetFps(gameFps);
     if (!fpsEnabled)
+        return;
+    // Not over the game's screens (inventory, pause, chat...) or this client's menu: only over play.
+    // The HUD position editor still shows it.
+    if (!hudEditMode && (menuOpen || MinecraftDataProvider::IsGameMenuOpen()))
         return;
     // With Frame Generation running: the frames shown, then the game's own in brackets.
     float shownFps = 0; uint32_t frameGen = 0;
@@ -4624,7 +5348,8 @@ DebugScreen::Info DebugSystemInfo()
 // world) and the top right (the computer). Only in a world, while its key has switched it on.
 void DrawDebugScreen(HDC hdc, int width, int)
 {
-    if (!debugMenuEnabled || !debugScreenShown || hudEditMode || !MinecraftDataProvider::IsInWorld())
+    if (!debugMenuEnabled || !debugScreenShown || hudEditMode || menuOpen ||
+        MinecraftDataProvider::IsGameMenuOpen() || !MinecraftDataProvider::IsInWorld())
         return;
     DebugScreen::Info info = DebugSystemInfo();
     info.title = clientName + L" (Minecraft Bedrock)";
@@ -4678,10 +5403,74 @@ void DrawDebugScreen(HDC hdc, int width, int)
 }
 
 
+constexpr int JavaChatWidth = 420, JavaChatHeight = 200;
+void DrawJavaChat(HDC hdc)
+{
+    MyClientJavaChat::Snapshot snapshot{};
+    const bool connected = MinecraftDataProvider::JavaChatSnapshot(javaChatEnabled, snapshot);
+    if (!javaChatEnabled) return;
+    const float scale = javaChatHud.scale;
+    if (javaChatHud.y < 0) {
+        RECT client{};
+        const int height = overlayWindow && GetClientRect(overlayWindow, &client) ? client.bottom : 1080;
+        javaChatHud.y = std::max(8, height - int(JavaChatHeight * scale) - 60);
+    }
+    const int width = int(JavaChatWidth * scale), height = int(JavaChatHeight * scale);
+    const int fontSize = std::max(10, int(15 * scale)), lineHeight = std::max(14, int(20 * scale));
+    const bool ready = connected && snapshot.ready && MyClientJavaChat::Fresh(snapshot.at, GetTickCount64());
+    // No native-hide acknowledgment: show no replacement, so the two chats can never stack.
+    if (!ready && !hudEditMode) return;
+    static MyClientJavaChat::Snapshot previous{};
+    static int oldWidth = 0, oldFont = 0;
+    static std::vector<std::wstring> wrapped;
+    const uint32_t count = std::min(snapshot.count, MyClientJavaChat::MaxLines);
+    if (count != previous.count || oldWidth != width || oldFont != fontSize ||
+        std::memcmp(snapshot.lines, previous.lines, sizeof(snapshot.lines)) != 0) {
+        previous = snapshot; oldWidth = width; oldFont = fontSize;
+        wrapped.clear();
+        for (uint32_t i = 0; i < count; ++i) {
+            const char* begin = snapshot.lines[i];
+            const std::string bytes(begin, std::find(begin, begin + MyClientJavaChat::MaxBytes, '\0'));
+            const std::wstring text = Utf8ToWide(bytes);
+            std::wstring line;
+            for (size_t at = 0; at < text.size(); ++at) {
+                const wchar_t ch = text[at];
+                if (ch == 0xa7 && at + 1 < text.size()) { ++at; continue; }
+                if (ch == L'\n') { wrapped.push_back(line); line.clear(); continue; }
+                if (ch < 32) continue;
+                line += ch;
+                if (TextWidth(hdc, line, fontSize) <= width - int(16 * scale)) continue;
+                size_t split = line.find_last_of(L' ');
+                if (split == std::wstring::npos || split == 0) split = line.size() - 1;
+                if (split && line[split - 1] >= 0xd800 && line[split - 1] <= 0xdbff) --split;
+                if (!split) continue;
+                wrapped.push_back(line.substr(0, split));
+                line.erase(0, split);
+                if (!line.empty() && line.front() == L' ') line.erase(0, 1);
+            }
+            if (!line.empty()) wrapped.push_back(line);
+        }
+    }
+    std::vector<std::wstring> lines = ready ? wrapped : std::vector<std::wstring>{};
+    if (hudEditMode && lines.empty()) lines = {L"JAVAチャット", L"HUD調整でこの欄をドラッグして移動できます。", L"<Player> Hello, OriginX!"};
+    const size_t maxLines = std::max(1, (height - int(12 * scale)) / lineHeight);
+    if (lines.size() > maxLines) lines.erase(lines.begin(), lines.end() - maxLines);
+    if (!lines.empty()) {
+        const int shownHeight = int(lines.size()) * lineHeight + int(12 * scale);
+        const int y = javaChatHud.y + height - shownHeight;
+        DrawHudBox(hdc, HudElementId::JavaChat, javaChatHud.x, y, width, shownHeight, 0, RGB(14,14,18));
+        for (size_t i = 0; i < lines.size(); ++i)
+            DrawHudText(hdc, HudElementId::JavaChat, javaChatHud.x + int(8 * scale), y + int(6 * scale) + int(i) * lineHeight,
+                lines[i], HudColor(HudElementId::JavaChat, HudText, RGB(255,255,255)), fontSize);
+    }
+    if (hudEditMode) DrawOutline(hdc, javaChatHud.x, javaChatHud.y, width, height,
+        selectedHud == HudElementId::JavaChat ? RGB(80,180,255) : RGB(130,140,160));
+}
+
 void DrawHud(HDC hdc)
 {
     // Show the HUD only inside a world/server. The position editor still shows it.
-    if (!hudEditMode && !MinecraftDataProvider::IsInWorld()) return;
+    if (!hudEditMode && (menuOpen || MinecraftDataProvider::IsGameMenuOpen() || !MinecraftDataProvider::IsInWorld())) return;
     DrawBlockOutline(hdc);
     DrawKeystrokes(hdc);
     DrawCPS(hdc);
@@ -4691,6 +5480,10 @@ void DrawHud(HDC hdc)
     DrawResources(hdc);
     DrawPing(hdc);
     DrawDayTimer(hdc);
+    DrawCoordinates(hdc);
+    DrawTimer(hdc);
+    DrawPackDisplay(hdc);
+    DrawJavaChat(hdc);
     DrawBlockDetails(hdc);
     DrawFeatureList(hdc);
     DrawTabList(hdc);
@@ -4728,6 +5521,17 @@ HudElement* GetHudElement(
 
     case HudElementId::DayTimer:
         return &dayTimerHud;
+
+    case HudElementId::Coordinates:
+        return &coordinatesHud;
+
+    case HudElementId::Timer:
+        return &timerHud;
+
+    case HudElementId::PackDisplay:
+        return &packDisplayHud;
+    case HudElementId::JavaChat:
+        return &javaChatHud;
 
     case HudElementId::BlockDetails:
         return &blockDetailsHud;
@@ -4971,6 +5775,31 @@ HudElementId GetHudAt(
             return r;
     }
 
+    if (timerEnabled)
+    {
+        auto r = hit(HudElementId::Timer, timerHud, TimerHudWidth(), DayTimerHudHeight(1));
+        if (r != HudElementId::None)
+            return r;
+    }
+
+    if (javaChatEnabled) {
+        const auto r = hit(HudElementId::JavaChat, javaChatHud, JavaChatWidth, JavaChatHeight);
+        if (r != HudElementId::None) return r;
+    }
+    if (packDisplayEnabled && packDisplayW > 0)
+    {
+        auto r = hit(HudElementId::PackDisplay, packDisplayHud, packDisplayW, packDisplayH);
+        if (r != HudElementId::None)
+            return r;
+    }
+
+    if (coordinatesEnabled)
+    {
+        auto r = hit(HudElementId::Coordinates, coordinatesHud, CoordinatesHudWidth(), DayTimerHudHeight(coordinatesFacing ? 2 : 1));
+        if (r != HudElementId::None)
+            return r;
+    }
+
     if (resourceCounterEnabled)
     {
         auto r =
@@ -5098,6 +5927,26 @@ std::wstring FeatureTitle(
     case DetailFeature::HealthWarning:
         return L"Health Warning";
 
+    case DetailFeature::Coordinates:
+        return L"Coordinates";
+
+    case DetailFeature::CommandHotkeys:
+        return L"Command Hotkeys";
+
+    case DetailFeature::Timer:
+        return L"Timer";
+
+    case DetailFeature::CpsLimiter:
+        return L"CPS Limiter";
+
+    case DetailFeature::ItemCounter:
+        return L"Item Counter";
+
+    case DetailFeature::PackDisplay:
+        return L"Pack Display";
+    case DetailFeature::JavaChat:
+        return L"JAVAチャット";
+
     case DetailFeature::HiveStats:
         return L"Hive Statistic";
 
@@ -5198,6 +6047,24 @@ bool FeatureEnabled(
         return blockDetailsEnabled;
     case DetailFeature::HealthWarning:
         return healthWarningEnabled;
+    case DetailFeature::Coordinates:
+        return coordinatesEnabled;
+    case DetailFeature::CommandHotkeys:
+        return commandHotkeysEnabled;
+
+    case DetailFeature::Timer:
+        return timerEnabled;
+
+    case DetailFeature::CpsLimiter:
+        return cpsLimiterEnabled;
+
+    case DetailFeature::ItemCounter:
+        return itemCounterEnabled;
+
+    case DetailFeature::PackDisplay:
+        return packDisplayEnabled;
+    case DetailFeature::JavaChat:
+        return javaChatEnabled;
 
     case DetailFeature::HiveStats:
         return hiveStatsEnabled;
@@ -5586,6 +6453,7 @@ void ToggleFeature(
     case DetailFeature::TabList:
         tabListEnabled =
             !tabListEnabled;
+        if (!tabListEnabled) tabListShown = false;
         break;
 
     case DetailFeature::ChunkBorder:
@@ -5641,6 +6509,33 @@ void ToggleFeature(
 
     case DetailFeature::HealthWarning:
         healthWarningEnabled = !healthWarningEnabled;
+        break;
+
+    case DetailFeature::Coordinates:
+        coordinatesEnabled = !coordinatesEnabled;
+        break;
+
+    case DetailFeature::CommandHotkeys:
+        commandHotkeysEnabled = !commandHotkeysEnabled;
+        break;
+
+    case DetailFeature::Timer:
+        timerEnabled = !timerEnabled;
+        break;
+
+    case DetailFeature::CpsLimiter:
+        cpsLimiterEnabled = !cpsLimiterEnabled;
+        break;
+
+    case DetailFeature::ItemCounter:
+        itemCounterEnabled = !itemCounterEnabled;
+        break;
+
+    case DetailFeature::PackDisplay:
+        packDisplayEnabled = !packDisplayEnabled;
+        break;
+    case DetailFeature::JavaChat:
+        javaChatEnabled = !javaChatEnabled;
         break;
 
     case DetailFeature::DebugMenu:
@@ -5739,6 +6634,157 @@ void CheckShortcut(
     }
 
     previousState = down;
+}
+
+
+// Command Hotkeys: a line's key, pressed while playing (not in the chat or a menu), hands its text to the
+// DLL, which sends it on the next tick. At most one line every 400 ms (the server may kick for spam).
+void PollCommandHotkeys(bool gameActive)
+{
+    static bool previous[kCommandHotkeyCount] = {};
+    static ULONGLONG lastSentAt = 0;
+    static std::wstring waitingFor;
+    for (int i = 0; i < kCommandHotkeyCount; i++)
+    {
+        const int vk = commandHotkeys[i].key;
+        const bool down = commandHotkeysEnabled && vk != 0 && vk != shortcuts.menuKey && vk != VK_ESCAPE && IsKeyDown(vk);
+        if (down && !previous[i] && gameActive && !menuOpen && !waitingForShortcut && GameOwnsKeyboard() &&
+            MinecraftDataProvider::IsInWorld() && !commandHotkeys[i].text.empty() && GetTickCount64() - lastSentAt >= 400)
+        {
+            lastSentAt = GetTickCount64();
+            const auto state = MinecraftDataProvider::SendChatLine(WideToUtf8(commandHotkeys[i].text));
+            waitingFor = commandHotkeys[i].text;
+            if (state == MinecraftDataProvider::ChatRequestState::Waiting) { commandHotkeyStatus = L"Sending: " + waitingFor; commandHotkeyTone = 2; }
+            else
+            {
+                commandHotkeyStatus = state == MinecraftDataProvider::ChatRequestState::OldDll ? L"Needs the updated DLL"
+                    : state == MinecraftDataProvider::ChatRequestState::Busy ? L"Still sending the last line"
+                    : state == MinecraftDataProvider::ChatRequestState::NoGame ? L"The game is not connected" : L"Not sent";
+                commandHotkeyTone = 3;
+                waitingFor.clear();
+            }
+        }
+        previous[i] = down;
+    }
+    if (!waitingFor.empty())
+    {
+        switch (MinecraftDataProvider::ChatLineAnswer())
+        {
+        case MinecraftDataProvider::ChatRequestState::Sent: commandHotkeyStatus = L"Sent: " + waitingFor; commandHotkeyTone = 1; waitingFor.clear(); break;
+        case MinecraftDataProvider::ChatRequestState::NoPlayer: commandHotkeyStatus = L"Not in a world"; commandHotkeyTone = 3; waitingFor.clear(); break;
+        case MinecraftDataProvider::ChatRequestState::Failed: commandHotkeyStatus = L"The game could not send it"; commandHotkeyTone = 3; waitingFor.clear(); break;
+        case MinecraftDataProvider::ChatRequestState::Empty: commandHotkeyStatus = L"Empty line"; commandHotkeyTone = 3; waitingFor.clear(); break;
+        default: break;
+        }
+    }
+}
+
+// Ends typing a Command Hotkeys line (Enter, Esc, a click elsewhere, the menu closing) and saves it.
+void StopCommandHotkeyEditing()
+{
+    if (commandHotkeyEditing < 0) return;
+    commandHotkeyEditing = -1;
+    SaveConfig();
+}
+
+
+// Timer: its start / pause and reset keys, while playing (not in the chat or a menu).
+void PollTimerKeys(bool gameActive)
+{
+    static bool previous[2] = {};
+    const int keys[2] = { timerStartKey, timerResetKey };
+    for (int i = 0; i < 2; i++)
+    {
+        const int vk = keys[i];
+        const bool down = timerEnabled && vk != 0 && vk != shortcuts.menuKey && vk != VK_ESCAPE && IsKeyDown(vk);
+        if (down && !previous[i] && gameActive && !menuOpen && !waitingForShortcut && GameOwnsKeyboard())
+        {
+            if (i == 0) TimerStartPause();
+            else TimerReset();
+        }
+        previous[i] = down;
+    }
+    TickTimer();
+}
+
+
+// CPS Limiter: a low-level mouse hook on a thread of its own (so a busy HUD loop never makes the mouse lag)
+// throws away a press, and its release, when the last second already let through the limit. The hook is in
+// only while you play (Minecraft in front, no menu, chat or inventory); everywhere else clicks are untouched.
+std::atomic<bool> cpsLimiterWanted{false};
+std::atomic<int> cpsLimitLeftNow{12}, cpsLimitRightNow{20};
+std::atomic<int> cpsHeldBackLeft{0}, cpsHeldBackRight{0};   // presses held back since the HUD started
+std::atomic<bool> cpsLimiterHooked{false};
+
+LRESULT CALLBACK CpsLimiterHook(int code, WPARAM wParam, LPARAM lParam)
+{
+    static ClientTimer::ClickWindow left, right;
+    static bool dropLeftUp = false, dropRightUp = false;
+    if (code == HC_ACTION && cpsLimiterWanted.load())
+    {
+        const uint64_t now = GetTickCount64();
+        switch (wParam)
+        {
+        case WM_LBUTTONDOWN:
+            if (!left.Allow(now, cpsLimitLeftNow.load())) { dropLeftUp = true; cpsHeldBackLeft++; return 1; }
+            dropLeftUp = false;   // this press goes through: so must its release (even after a hook gap)
+            break;
+        case WM_LBUTTONUP:
+            if (dropLeftUp) { dropLeftUp = false; return 1; }
+            break;
+        case WM_RBUTTONDOWN:
+            if (!right.Allow(now, cpsLimitRightNow.load())) { dropRightUp = true; cpsHeldBackRight++; return 1; }
+            dropRightUp = false;   // this press goes through: so must its release (even after a hook gap)
+            break;
+        case WM_RBUTTONUP:
+            if (dropRightUp) { dropRightUp = false; return 1; }
+            break;
+        default:
+            break;
+        }
+    }
+    return CallNextHookEx(nullptr, code, wParam, lParam);
+}
+
+void CpsLimiterThread()
+{
+    HHOOK hook = nullptr;
+    for (;;)
+    {
+        const bool wanted = cpsLimiterWanted.load();
+        if (wanted && !hook)
+            hook = SetWindowsHookExW(WH_MOUSE_LL, CpsLimiterHook, GetModuleHandleW(nullptr), 0);
+        else if (!wanted && hook)
+        {
+            UnhookWindowsHookEx(hook);
+            hook = nullptr;
+        }
+        cpsLimiterHooked = hook != nullptr;
+        // The hook is called from this thread's message wait: it must keep pumping.
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, hook ? 20 : 100, QS_ALLINPUT);
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
+        {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+// Called every loop: says whether the hook should be in now, and starts its thread the first time.
+void UpdateCpsLimiter(bool minecraftActive)
+{
+    static bool started = false;
+    cpsLimitLeftNow = cpsLimitLeft;
+    cpsLimitRightNow = cpsLimitRight;
+    const bool wanted = cpsLimiterEnabled && (cpsLimitLeft > 0 || cpsLimitRight > 0) && minecraftActive && !menuOpen &&
+                        !waitingForShortcut && MinecraftDataProvider::IsInWorld() && GameOwnsKeyboard();
+    cpsLimiterWanted = wanted;
+    if (wanted && !started)
+    {
+        started = true;
+        std::thread(CpsLimiterThread).detach();
+    }
 }
 
 
@@ -5914,10 +6960,17 @@ const DetailFeature kFeatureList[] =
     DetailFeature::DayTimer,
     DetailFeature::DebugMenu,
     DetailFeature::BlockDetails,
-    DetailFeature::HealthWarning
+    DetailFeature::HealthWarning,
+    DetailFeature::Coordinates,
+    DetailFeature::CommandHotkeys,
+    DetailFeature::Timer,
+    DetailFeature::CpsLimiter,
+    DetailFeature::ItemCounter,
+    DetailFeature::PackDisplay,
+    DetailFeature::JavaChat
 };
 
-const int kFeatureCount = 31;
+const int kFeatureCount = sizeof(kFeatureList) / sizeof(kFeatureList[0]);
 
 // Modules that are only settings (no on / off): Menu Open. Their Mods row has no switch and opens the page.
 bool FeatureHasSwitch(DetailFeature f) { return f != DetailFeature::MenuOpen; }
@@ -5982,6 +7035,10 @@ bool FeatureIsHud(DetailFeature f)
     case DetailFeature::TabList:
     case DetailFeature::DayTimer:
     case DetailFeature::BlockDetails:
+    case DetailFeature::Coordinates:
+    case DetailFeature::Timer:
+    case DetailFeature::PackDisplay:
+    case DetailFeature::JavaChat:
         return true;
 
     default:
@@ -6228,6 +7285,13 @@ const wchar_t* FeatureGlyph(DetailFeature f)
     case DetailFeature::DebugMenu:       return L"\u2261";
     case DetailFeature::BlockDetails:    return L"\u25A7";
     case DetailFeature::HealthWarning:   return L"\u2665";
+    case DetailFeature::Coordinates:     return L"\u2316";
+    case DetailFeature::CommandHotkeys:  return L"/";
+    case DetailFeature::Timer:           return L"\u25F7";
+    case DetailFeature::CpsLimiter:      return L"\u2264";
+    case DetailFeature::ItemCounter:     return L"\u03A3";
+    case DetailFeature::PackDisplay:     return L"\u25A6";
+    case DetailFeature::JavaChat:        return L"\u25A4";
     default:                             return L"\u25CF";
     }
 }
@@ -6271,6 +7335,13 @@ const wchar_t* FeatureDescription(DetailFeature f)
     case DetailFeature::DebugMenu:       return L"Java-style F3 screen:|position, FPS, memory";
     case DetailFeature::BlockDetails:    return L"The block you look at:|name, add-on and tool";
     case DetailFeature::HealthWarning:   return L"Screen edges turn red|when your health is low";
+    case DetailFeature::Coordinates:     return L"Your X / Y / Z|and the way you face";
+    case DetailFeature::CommandHotkeys:  return L"A key types a saved|chat line or command";
+    case DetailFeature::Timer:           return L"A countdown timer or|a stopwatch on the HUD";
+    case DetailFeature::CpsLimiter:      return L"Clicks over your CPS limit|never reach the game";
+    case DetailFeature::ItemCounter:     return L"Hold Alt over an item to|count all of it you have";
+    case DetailFeature::PackDisplay:     return L"The texture packs you|have on, on the HUD";
+    case DetailFeature::JavaChat:        return L"チャットを左下に表示|HUD調整で位置を変更";
     default:                             return L"|";
     }
 }
@@ -7129,6 +8200,7 @@ void CloseReplays()
 
 void DrawReplayControls(HDC hdc);   // defined below
 RECT HomeReplaysButtonRect();
+bool OnHomeScreen();
 
 void DrawReplaysPanel(HDC hdc)
 {
@@ -7223,23 +8295,96 @@ std::wstring ReplayClock(uint64_t ms)
     return text;
 }
 
-// Plays a recording in the game: a local server on 127.0.0.1 that the game joins (ReplayPlayer.h).
-void StartReplayPlayback(const ReplayLibrary::Entry& e, const ReplayFile& f)
+// A line in the replay bar at the top left of the game for a few seconds (why a playback did not start / ended).
+std::wstring replayBarMessage;
+uint64_t replayBarMessageAt = 0;
+void SetReplayBarMessage(const std::wstring& text)
 {
-    if (MinecraftDataProvider::IsInWorld())
+    replayBarMessage = text;
+    replayBarMessageAt = GetTickCount64();
+}
+
+// The DLL takes the game to the replay server (MinecraftDataProvider::RequestReplayJoin): answered in
+// PollReplayJoin. With an older DLL (or when it cannot) the minecraft:// link is opened instead.
+bool replayJoinWaiting = false;
+uint64_t replayJoinAskedAt = 0;
+
+void ReplayStartFailed(const std::wstring& text)
+{
+    SetReplayNotice(text);
+    SetReplayBarMessage(text);
+}
+
+void OpenReplayLinkInstead(bool inWorld)
+{
+    replayJoinWaiting = false;
+    if (inWorld)
     {
-        SetReplayNotice(L"Leave the world first (home screen), then press play.");
+        // The DLL could not leave the world by itself (older DLL, or the game function was not found).
+        ReplayPlayer::Fail(L"Leave the world first (home screen), then press play.");
+        ReplayStartFailed(L"Leave the world first (home screen), then press play.");
         return;
     }
     std::wstring error;
+    if (!ReplayPlayer::OpenJoinLink(error)) ReplayStartFailed(L"Cannot play: " + error);
+}
+
+// Plays a recording in the game: a local server on 127.0.0.1 that the game joins (ReplayPlayer.h).
+// From a world too: the DLL leaves it first.
+void StartReplayPlayback(const ReplayLibrary::Entry& e, const ReplayFile& f)
+{
+    std::wstring error;
     if (!ReplayPlayer::Start(f.path, error))
     {
-        SetReplayNotice(L"Cannot play: " + error);
+        ReplayStartFailed(L"Cannot play: " + error);
         return;
     }
-    SetReplayNotice(L"Joining the replay: " + Utf8ToWide(ReplayLibrary::Title(e)));
+    const bool inWorld = MinecraftDataProvider::IsInWorld();
+    switch (MinecraftDataProvider::RequestReplayJoin(ReplayPlayer::Port()))
+    {
+    case MinecraftDataProvider::ReplayJoinState::Waiting:
+        replayJoinWaiting = true;
+        replayJoinAskedAt = GetTickCount64();
+        break;
+    case MinecraftDataProvider::ReplayJoinState::NoGame:
+        ReplayPlayer::Fail(L"Minecraft is not running.");
+        ReplayStartFailed(L"Cannot play: Minecraft is not running.");
+        return;
+    default:
+        OpenReplayLinkInstead(inWorld);
+        if (!ReplayPlayer::Active()) return;
+        break;
+    }
+    SetReplayNotice((inWorld ? L"Leaving the world, then joining the replay: " : L"Joining the replay: ") + Utf8ToWide(ReplayLibrary::Title(e)));
     CloseReplays();
     if (menuOpen) CloseMenu();
+}
+
+// Once per HUD tick: the DLL's answer to the join request, and why a playback ended early.
+void PollReplayJoin()
+{
+    static bool wasActive = false;
+    const bool activeNow = ReplayPlayer::Active();
+    if (replayJoinWaiting)
+    {
+        if (!activeNow) replayJoinWaiting = false;
+        else switch (MinecraftDataProvider::ReplayJoinAnswer())
+        {
+        case MinecraftDataProvider::ReplayJoinState::Joining: replayJoinWaiting = false; break;
+        case MinecraftDataProvider::ReplayJoinState::Failed:  OpenReplayLinkInstead(MinecraftDataProvider::IsInWorld()); break;
+        case MinecraftDataProvider::ReplayJoinState::Waiting:
+            // The DLL answers within 25 s (it waits while the world is left); no answer at all = an old or stuck DLL.
+            if (GetTickCount64() - replayJoinAskedAt > 30000) OpenReplayLinkInstead(MinecraftDataProvider::IsInWorld());
+            break;
+        default: OpenReplayLinkInstead(MinecraftDataProvider::IsInWorld()); break;
+        }
+    }
+    if (wasActive && !ReplayPlayer::Active())
+    {
+        const std::wstring error = ReplayPlayer::Get().error;
+        if (!error.empty()) ReplayStartFailed(L"Replay: " + error);
+    }
+    wasActive = ReplayPlayer::Active();
 }
 
 const float kReplaySpeeds[] = {0.25f, 0.5f, 1.f, 2.f, 4.f};
@@ -7286,10 +8431,142 @@ bool HandleReplayControlsClick(int mx, int my)
     return false;
 }
 
+// ---- The replay bar at the bottom of the game while a recording plays (2026-11-11) ----
+// Like a video player: progress (click to jump), pause, 15 s / 5 s back and on, the time, the speed, the camera and
+// Exit. The keys work at any time (K pause, Left/Right 5 s, with Shift 15 s, Up/Down speed); the mouse while the
+// HUD menu is open (G), which is when the game lets go of the cursor.
+struct ReplayBarLayout { RECT bar, track, pause, back15, back5, time, fwd5, fwd15, speed, camera, exit; };
+ReplayBarLayout ReplayBarRects(int w, int h)
+{
+    ReplayBarLayout l{};
+    const int bw = std::min(820, std::max(560, w - 40)), bh = 70;
+    const int x = (w - bw) / 2, y = h - bh - 26;
+    l.bar = {x, y, x + bw, y + bh};
+    l.track = {x + 16, y + 10, x + bw - 16, y + 18};
+    int cx = x + 12;
+    const int top = y + 26, bottom = y + 62;
+    auto next = [&](int width) { RECT r{cx, top, cx + width, bottom}; cx += width + 8; return r; };
+    l.pause = next(48); l.back15 = next(48); l.back5 = next(48);
+    l.time = next(std::max(140, bw - 12 - 8 * 10 - 48 * 5 - 64 - 92 - 76));
+    l.fwd5 = next(48); l.fwd15 = next(48); l.speed = next(64); l.camera = next(92); l.exit = next(76);
+    return l;
+}
+
+std::wstring ReplaySpeedText(float speed);
+
+void StepReplaySpeed(int direction)
+{
+    const ReplayPlayer::Status st = ReplayPlayer::Get();
+    int at = 2;
+    for (int i = 0; i < (int)std::size(kReplaySpeeds); ++i)
+        if (std::fabs(kReplaySpeeds[i] - st.speed) < 0.01f) at = i;
+    at = std::clamp(at + direction, 0, (int)std::size(kReplaySpeeds) - 1);
+    ReplayPlayer::SetSpeed(kReplaySpeeds[at]);
+}
+
+void JumpReplay(int64_t deltaMs)
+{
+    const ReplayPlayer::Status st = ReplayPlayer::Get();
+    const int64_t to = std::clamp<int64_t>((int64_t)st.positionMs + deltaMs, 0, (int64_t)st.lengthMs);
+    ReplayPlayer::SeekTo((uint64_t)to);
+}
+
+void DrawReplayTimeline(HDC hdc, int w, int h)
+{
+    if (!ReplayPlayer::Active()) return;
+    const ReplayPlayer::Status st = ReplayPlayer::Get();
+    const ReplayBarLayout l = ReplayBarRects(w, h);
+    DrawRoundBox(hdc, l.bar.left, l.bar.top, l.bar.right - l.bar.left, l.bar.bottom - l.bar.top, 14, RGB(28,26,32));
+    // progress
+    const int tw = l.track.right - l.track.left;
+    DrawRoundBox(hdc, l.track.left, l.track.top, tw, l.track.bottom - l.track.top, 4, RGB(70,70,80));
+    const double f = st.lengthMs ? std::min(1.0, (double)st.positionMs / (double)st.lengthMs) : 0.0;
+    if (f > 0) DrawRoundBox(hdc, l.track.left, l.track.top, std::max(8, (int)(tw * f)), l.track.bottom - l.track.top, 4, RGB(230,64,72));
+    const auto button = [&](const RECT& r, const std::wstring& text, bool accent) {
+        DrawRoundBox(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top, 10, accent ? RGB(230,64,72) : RGB(52,50,58));
+        DrawTextCentered(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top, text, RGB(240,240,240), 13);
+    };
+    button(l.pause, st.paused ? L"\u25B6" : L"II", true);
+    button(l.back15, L"-15", false); button(l.back5, L"-5", false);
+    std::wstring clock = st.phase == ReplayPlayer::Phase::Playing || st.phase == ReplayPlayer::Phase::Finished
+        ? ReplayClock(st.positionMs) + L" - " + ReplayClock(st.lengthMs) : std::wstring(L"Joining...");
+    if (st.rewinding) clock = L"Rewinding...";
+    else if (st.phase == ReplayPlayer::Phase::Finished) clock += L"  end";
+    button(l.time, clock, false);
+    button(l.fwd5, L"+5", false); button(l.fwd15, L"+15", false);
+    button(l.speed, ReplaySpeedText(st.speed), false);
+    button(l.camera, st.freeCamera ? L"Free cam" : L"Eyes view", false);
+    button(l.exit, L"Exit", true);
+    DrawTextSimple(hdc, l.bar.left + 16, l.bar.bottom + 4,
+                   menuOpen ? L"Click the bar. Fly with the game's keys (spectator). G closes the menu."
+                            : L"K pause   Left/Right 5 s (Shift 15 s)   Up/Down speed   G: use the mouse",
+                   RGB(200,200,210), 11);
+}
+
+// A click on the bar (overlay coordinates, the menu open); true when it was on it.
+bool HandleReplayTimelineClick(int mx, int my)
+{
+    if (!ReplayPlayer::Active() || !overlayWindow) return false;
+    RECT client{};
+    if (!GetClientRect(overlayWindow, &client)) return false;
+    const ReplayBarLayout l = ReplayBarRects(client.right, client.bottom);
+    const POINT p{mx, my};
+    if (!PtInRect(&l.bar, p)) return false;
+    const ReplayPlayer::Status st = ReplayPlayer::Get();
+    RECT track = l.track; InflateRect(&track, 0, 6);
+    if (PtInRect(&track, p) && st.lengthMs)
+        ReplayPlayer::SeekTo((uint64_t)((double)std::clamp<int>(mx - l.track.left, 0, l.track.right - l.track.left) /
+                                        (double)std::max<LONG>(1, l.track.right - l.track.left) * (double)st.lengthMs));
+    else if (PtInRect(&l.pause, p)) ReplayPlayer::SetPaused(!st.paused);
+    else if (PtInRect(&l.back15, p)) JumpReplay(-15000);
+    else if (PtInRect(&l.back5, p)) JumpReplay(-5000);
+    else if (PtInRect(&l.fwd5, p)) JumpReplay(5000);
+    else if (PtInRect(&l.fwd15, p)) JumpReplay(15000);
+    else if (PtInRect(&l.speed, p)) StepReplaySpeed(st.speed >= 4.f ? -4 : +1);
+    else if (PtInRect(&l.camera, p)) ReplayPlayer::SetFreeCamera(!st.freeCamera);
+    else if (PtInRect(&l.exit, p)) { ReplayPlayer::Stop(); SetReplayNotice(L"Playback stopped."); }
+    return true;
+}
+
+// The bar's keys, once per HUD tick while a recording plays and the game has the focus.
+void PollReplayKeys(bool usable)
+{
+    static bool prev[5] = {};
+    const int keys[5] = {'K', VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN};
+    for (int i = 0; i < 5; ++i)
+    {
+        const bool down = usable && ReplayPlayer::Active() && IsKeyDown(keys[i]);
+        if (down && !prev[i])
+        {
+            const bool shift = IsKeyDown(VK_SHIFT);
+            switch (i)
+            {
+            case 0: ReplayPlayer::SetPaused(!ReplayPlayer::Get().paused); break;
+            case 1: JumpReplay(shift ? -15000 : -5000); break;
+            case 2: JumpReplay(shift ? 15000 : 5000); break;
+            case 3: StepReplaySpeed(+1); break;
+            case 4: StepReplaySpeed(-1); break;
+            }
+        }
+        prev[i] = down;
+    }
+}
+
 // While playing, top left of the game: position, speed, and where the controls are.
 void DrawReplayPlaybackBar(HDC hdc)
 {
-    if (menuOpen || !ReplayPlayer::Active()) return;
+    if (menuOpen) return;
+    if (!ReplayPlayer::Active())
+    {
+        // Why the last playback did not start or ended early, for 10 s.
+        if (replayBarMessage.empty() || GetTickCount64() - replayBarMessageAt > 10000) return;
+        RECT r = HomeReplaysButtonRect();
+        if (OnHomeScreen()) OffsetRect(&r, 0, 36);   // under the Replays button
+        DrawRoundBox(hdc, r.left, r.top, 560, 28, 7, RGB(28,24,28));
+        DrawTextSimple(hdc, r.left + 10, r.top + 6, replayBarMessage, RGB(255,150,150), 13);
+        return;
+    }
+    return;   // while playing: the bar at the bottom (DrawReplayTimeline)
     const ReplayPlayer::Status st = ReplayPlayer::Get();
     std::wstring text = L"REPLAY  ";
     if (st.phase == ReplayPlayer::Phase::Playing)
@@ -7463,6 +8740,7 @@ enum LiteKey
     LiteEntities, LiteEntityDistance, LiteMobs, LiteItems, LiteMisc, LitePlayers, LitePlayerDistance, LiteNameTags,
     LiteRender, LiteRenderDistance,
     LitePriority, LiteThrottle, LiteGpu,
+    LiteNoSkyFull, LiteBehind, LiteBlockEntities, LiteBlockEntityDistance, LiteVertical, LiteVerticalRows,
     LiteNone
 };
 struct LiteRow { LiteRowKind kind; int key; const wchar_t* label; };
@@ -7475,6 +8753,7 @@ const std::vector<LiteRow>& LiteRows()
         {LiteRowKind::Header, LiteNone, L"World"},
         {LiteRowKind::Switch, LiteClouds, L"No clouds"},
         {LiteRowKind::Switch, LiteSun, L"No sun & moon"},
+        {LiteRowKind::Switch, LiteNoSkyFull, L"No sky (colours too)"},
         {LiteRowKind::Switch, LiteFog, L"No fog"},
         {LiteRowKind::Switch, LiteWeather, L"No rain & snow"},
         {LiteRowKind::Switch, LiteShadows, L"No shadows"},
@@ -7491,9 +8770,14 @@ const std::vector<LiteRow>& LiteRows()
         {LiteRowKind::Switch, LitePlayers, L"Cull distant players"},
         {LiteRowKind::Slider, LitePlayerDistance, L"Player distance"},
         {LiteRowKind::Switch, LiteNameTags, L"No name tags"},
+        {LiteRowKind::Switch, LiteBehind, L"Skip entities behind you"},
+        {LiteRowKind::Switch, LiteBlockEntities, L"No far block entities"},
+        {LiteRowKind::Slider, LiteBlockEntityDistance, L"Block entity distance"},
         {LiteRowKind::Header, LiteNone, L"Render distance"},
         {LiteRowKind::Switch, LiteRender, L"Render Distance"},
         {LiteRowKind::Slider, LiteRenderDistance, L"Chunks"},
+        {LiteRowKind::Switch, LiteVertical, L"Vertical render distance"},
+        {LiteRowKind::Slider, LiteVerticalRows, L"Sub-chunks above & below"},
         {LiteRowKind::Header, LiteNone, L"System"},
         {LiteRowKind::Switch, LitePriority, L"High process priority"},
         {LiteRowKind::Switch, LiteThrottle, L"Disable CPU power throttling"},
@@ -7525,6 +8809,10 @@ bool* LiteSwitchPtr(int key)
     case LitePriority: return &liteHighPriority;
     case LiteThrottle: return &liteNoThrottle;
     case LiteGpu: return &liteGpuPriority;
+    case LiteNoSkyFull: return &liteNoSkyFull;
+    case LiteBehind: return &liteCullBehind;
+    case LiteBlockEntities: return &liteBlockEntityLimit;
+    case LiteVertical: return &liteVerticalLimit;
     default: return nullptr;
     }
 }
@@ -7532,7 +8820,7 @@ bool* LiteSwitchPtr(int key)
 // Switches that change the generated client pack (the rest work through the DLL or Windows at once).
 bool LiteKeyUsesPack(int key)
 {
-    return key == LiteClouds || key == LiteSun || key == LiteFog || key == LiteWeather || key == LiteShadows ||
+    return key == LiteSun || key == LiteFog || key == LiteWeather || key == LiteShadows ||
            key == LiteParticles || key == LiteCrit || key == LitePotion;
 }
 
@@ -7544,6 +8832,8 @@ bool LiteRowActive(int key)
     case LiteEntityDistance: case LiteMobs: case LiteItems: case LiteMisc: return liteEntityLimit;
     case LitePlayerDistance: return litePlayerLimit;
     case LiteRenderDistance: return liteRenderEnabled;
+    case LiteBlockEntityDistance: return liteBlockEntityLimit;
+    case LiteVerticalRows: return liteVerticalLimit;
     default: return true;
     }
 }
@@ -7556,6 +8846,8 @@ LiteSliderInfo LiteSlider(int key)
     {
     case LiteEntityDistance: return {&liteEntityDistance, 8, 128, 8, L" blocks"};
     case LitePlayerDistance: return {&litePlayerDistance, 8, 128, 8, L" blocks"};
+    case LiteBlockEntityDistance: return {&liteBlockEntityDistance, 8, 128, 8, L" blocks"};
+    case LiteVerticalRows: return {&liteVerticalRows, 1, (int)MyClientFeatures::VerticalRowsMax, 1, L" x16 blocks"};
     default:                 return {&liteRenderDistance, 4, 48, 2, L" chunks"};
     }
 }
@@ -8539,7 +9831,7 @@ void DrawFeatureDetails(HDC hdc)
 
         DrawTextSimple(
             hdc, x, y + 106,
-            L"Nothing is shown until you hover one. Needs the updated MyClientData DLL.",
+            L"Nothing is shown until you hover one. Needs the updated OriginX DLL.",
             RGB(170,170,170), 13
         );
     }
@@ -8555,7 +9847,7 @@ void DrawFeatureDetails(HDC hdc)
 
         DrawTextSimple(
             hdc, x, y + 106,
-            L"Nothing is shown until you hover one. Needs the updated MyClientData DLL.",
+            L"Nothing is shown until you hover one. Needs the updated OriginX DLL.",
             RGB(170,170,170), 13
         );
     }
@@ -9781,6 +11073,8 @@ void RefreshTextures()
                             (packs ? L"  resource_packs" : L""));
         }
         lines.push_back(L"list: " + texState.globalFile.wstring() + L" (" + std::to_wstring(texState.stack.size()) + L" entries)");
+        const auto generated = LitePack::GeneratedPackRoot(TexturePacks::EnvPath("LOCALAPPDATA", L"LOCALAPPDATA"));
+        if (!generated.empty()) lines.push_back(L"Generated pack source: " + generated.wstring());
         for (const auto& root : TexturePacks::PackRoots(texState))
             lines.push_back(L"OriginX Lite goes to: " + (root / L"resource_packs" / L"OriginX_Lite").wstring());
         lines.push_back(std::to_wstring(texState.packs.size()) + L" packs found");
@@ -9794,27 +11088,32 @@ void RefreshTextures()
     texStatus = Utf8ToWide(texState.note);
 }
 
-// Every OriginX_Lite folder the pack is written to (TexturePacks::PackRoots), the active list's folder first.
+// The explicitly registered generated-pack source first, followed by the Minecraft data-folder copies.
 std::vector<std::filesystem::path> LitePackFolders()
 {
     std::vector<std::filesystem::path> folders;
+    const auto generated = LitePack::GeneratedPackRoot(TexturePacks::EnvPath("LOCALAPPDATA", L"LOCALAPPDATA"));
+    if (!generated.empty()) folders.push_back(generated / L"OriginX_Lite");
     for (const auto& root : TexturePacks::PackRoots(texState))
         folders.push_back(root / L"resource_packs" / L"OriginX_Lite");
     return folders;
 }
 
-TexturePacks::Pack LitePackRef()
+bool LitePackRef(TexturePacks::Pack& ref)
 {
-    TexturePacks::Pack ref;
-    ref.name = "OriginX Lite";
-    ref.uuid = LitePack::kPackUuid;
-    ref.folder = texState.root / L"resource_packs" / L"OriginX_Lite";
     // The list entry must name the version the folder's manifest has now (it follows the content).
-    TexturePacks::Pack onDisk;
-    if (TexturePacks::ParseManifest(TexturePacks::ReadFile(ref.folder / L"manifest.json"), onDisk) &&
-        onDisk.uuid == ref.uuid)
-        std::copy(onDisk.version, onDisk.version + 3, ref.version);
-    return ref;
+    // The active list may be per-user while the writable pack is in Shared. Never silently request 1.0.0
+    // when the manifest next to the active list is missing: that version does not exist in the repository.
+    for (const auto& folder : LitePackFolders()) {
+        TexturePacks::Pack onDisk;
+        if (TexturePacks::ParseManifest(TexturePacks::ReadFile(folder / L"manifest.json"), onDisk) &&
+            onDisk.uuid == LitePack::kPackUuid) {
+            onDisk.folder = folder;
+            ref = std::move(onDisk);
+            return true;
+        }
+    }
+    return false;
 }
 
 // Particle identifiers the two particle switches silence, read from the game's own vanilla pack
@@ -9889,7 +11188,8 @@ void ApplyLite()
     if (packWanted)
     {
         LitePack::Options o;
-        o.clouds = liteEnabled && liteClouds; o.sky = liteEnabled && liteSky;
+        o.clouds = false;   // live game option; a transparent pack image would keep clouds hidden after OFF
+        o.sky = liteEnabled && liteSky;
         o.fog = liteEnabled && liteFog; o.weather = liteEnabled && liteWeather;
         o.fastUi = fastInventoryEnabled;
         o.leftHand = false;   // see ClientPackWanted
@@ -9902,8 +11202,10 @@ void ApplyLite()
         if (hitEffectEnabled && hitEffectMagic)
             o.enchantedHit = LitePack::EnchantedHitParticle(VanillaCritParticle());
         bool written = false;
-        for (const auto& folder : folders)
-            written = LitePack::Write(folder, o) || written;
+        for (size_t i = 0; i < folders.size(); ++i) {
+            const bool copyWritten = LitePack::Write(folders[i], o);
+            if (i == 0) written = copyWritten;   // the canonical source must succeed, even if a mirror can be written
+        }
         if (!written)
         {
             liteStatus = L"Could not write the Lite pack.";
@@ -9918,7 +11220,11 @@ void ApplyLite()
             if (std::filesystem::exists(folder, ec))
                 LitePack::Write(folder, LitePack::NothingOn());
     }
-    const TexturePacks::Pack ref = LitePackRef();   // after writing: the version follows the content
+    TexturePacks::Pack ref;
+    if (packWanted && !LitePackRef(ref)) {
+        liteStatus = L"Could not read the Lite pack's version.";
+        return;
+    }
 
     // The player's own packs stay exactly as they are (all of them, same order); Lite goes on top.
     std::string error;
@@ -9933,7 +11239,8 @@ void ApplyLite()
 
     texturesSeq++;
     clientPackReloadUntil = GetTickCount64() + 5000;
-    liteStatus = packWanted ? L"Applied  (reload requested)" : L"Off  (reload requested)";
+    liteStatus = MinecraftDataProvider::IsInWorld() && !MinecraftDataProvider::IsLiveTexturesAvailable() ? L"Saved - leave the world to apply."
+               : packWanted ? L"Applied  (reload requested)" : L"Off  (reload requested)";
 }
 
 // Makes `stack` the active pack list (first = highest priority), with the Lite pack on top while it is needed.
@@ -9941,9 +11248,21 @@ bool WriteTextureStack(const std::vector<TexturePacks::Entry>& stack, std::strin
 {
     TexturePacks::Pack liteRef;
     const bool packWanted = ClientPackWanted();
-    if (packWanted) liteRef = LitePackRef();
+    if (packWanted && !LitePackRef(liteRef)) {
+        error = "Could not read the Lite pack's version.";
+        return false;
+    }
     if (!TexturePacks::WriteStack(texState, stack, error, packWanted ? &liteRef : nullptr))
         return false;
+    // Keep the exact Done request and the file read back immediately after writing. A later copy of the
+    // game's list may already have been overwritten by its settings screen, hiding a subpack-only change.
+    if (FILE* f = _wfopen((GetExecutableDirectory() + L"\\textures_apply.txt").c_str(), L"wb")) {
+        const std::string note = "list: " + WideToUtf8(texState.globalFile.wstring()) +
+            "\r\nrequested:\r\n" + TexturePacks::BuildStack(stack, packWanted ? &liteRef : nullptr) +
+            "\r\nread back:\r\n" + TexturePacks::ReadFile(texState.globalFile);
+        fwrite(note.data(), 1, note.size(), f);
+        fclose(f);
+    }
     StripLitePack(texState);
     texFileTime = TexturePacks::WriteTime(texState.globalFile);
     texturesSeq++;   // asks the DLL to make the game re-read the list
@@ -10061,7 +11380,8 @@ void ApplyPendingTextures()
     }
     texEditing = false;
     texPendingStack.clear();
-    texStatus = stack.empty() ? L"Switched to: Default textures  (reload requested)"
+    texStatus = MinecraftDataProvider::IsInWorld() && !MinecraftDataProvider::IsLiveTexturesAvailable() ? L"Saved - leave the world to apply."
+              : stack.empty() ? L"Switched to: Default textures  (reload requested)"
                               : L"Applied " + std::to_wstring(stack.size()) + (stack.size() == 1 ? L" pack" : L" packs") + L"  (reload requested)";
 }
 
@@ -10306,10 +11626,10 @@ void DrawTexturesDetails(HDC hdc, int x, int y)
 
         const int icon = kTexRowHeight - 6;
         const std::filesystem::path iconFile = isDefault
-            ? std::filesystem::path(MinecraftDataProvider::GameDirectory()) / L"data" / L"resource_packs" / L"vanilla" / L"pack_icon.png"
+            ? std::filesystem::path(MinecraftDataProvider::GameTextureDirectory()) / L"data" / L"resource_packs" / L"vanilla" / L"pack_icon.png"
             : pack->folder / L"pack_icon.png";
         static ItemIcons::FileCache packIcons;
-        if (const ItemIcons::Icon* found = (isDefault && MinecraftDataProvider::GameDirectory().empty()) ? nullptr : packIcons.Get(iconFile, icon))
+        if (const ItemIcons::Icon* found = (isDefault && MinecraftDataProvider::GameTextureDirectory().empty()) ? nullptr : packIcons.Get(iconFile, icon))
             ItemIcons::Draw(hdc, *found, x + 6, rowY + 3, icon);
         else
             DrawRoundBox(hdc, x + 6, rowY + 3, icon, icon, 5, t.button);
@@ -10441,14 +11761,22 @@ void MenuOffset(
 enum class HomeItem { None = -1, Mods = 0, Closet = 1, Settings = 2, Hud = 3 };   // clockwise from the top
 HomeItem homeHover = HomeItem::None;
 
-constexpr COLORREF kHomeDim = RGB(6,6,9);             // whole screen, light
-constexpr uint8_t kHomeDimAlpha = 60;
-constexpr COLORREF kHomeFill = RGB(14,14,20);         // ring segments: dark glass
+constexpr COLORREF kHomeDim = RGB(4,7,14);             // whole screen: a light navy shade
+constexpr uint8_t kHomeDimAlpha = 64;
+constexpr COLORREF kHomeCard = RGB(16,21,32);          // the card: dark glass
+constexpr uint8_t kHomeCardAlpha = 176;
+constexpr COLORREF kHomeRim = RGB(58,68,92);           // ...its rim
+constexpr uint8_t kHomeRimAlpha = 70;
+constexpr COLORREF kHomeFill = RGB(38,45,60);          // the four buttons
 constexpr uint8_t kHomeFillAlpha = 150;
-constexpr COLORREF kHomeHoverFill = RGB(196,198,214); // the segment under the mouse: light glass
-constexpr uint8_t kHomeHoverAlpha = 70;
-constexpr COLORREF kHomeChipFill = RGB(16,24,46);   // module chips: dark blue glass
+constexpr COLORREF kHomeHoverFill = RGB(30,52,96);     // the button under the mouse: blue glass
+constexpr uint8_t kHomeHoverAlpha = 200;
+constexpr COLORREF kHomeIconFill = RGB(28,56,108);     // a button's icon square
+constexpr uint8_t kHomeIconAlpha = 220;
+constexpr COLORREF kHomeChipFill = RGB(52,60,80);      // module chips
 constexpr uint8_t kHomeChipAlpha = 170;
+constexpr COLORREF kHomeAccent = RGB(34,124,255);      // OriginX blue (the tiles' outline, the orbit)
+constexpr COLORREF kHomeCyan = RGB(64,200,255);
 
 struct HomeLayout { float cx, cy, inner, outer, s; };
 HomeLayout GetHomeLayout()
@@ -10460,16 +11788,39 @@ HomeLayout GetHomeLayout()
     return {w / 2, h / 2, 74 * s, 196 * s, s};
 }
 
-// Which segment (if any) is at window point (mx, my).
+// The home screen (units of HomeLayout.s around the window's centre): the head with its orbit above the
+// middle, the four tiles in a row under it, the switched-on modules as chips under the tiles.
+// One dark glass card in the middle (units of HomeLayout.s): the head, a greeting, four buttons in two rows and
+// the switched-on modules.
+constexpr float kHomeCardW = 404, kHomeCardH = 430, kHomeHeadY = 74, kHomeHead = 60;
+constexpr float kHomeBtnTop = 196, kHomeBtnW = 172, kHomeBtnH = 64, kHomeBtnGap = 12, kHomeChipsTop = 354;
+constexpr float kHomeRowW = kHomeCardW - 48;
+constexpr HomeItem kHomeTileItems[4] = { HomeItem::Mods, HomeItem::Closet, HomeItem::Hud, HomeItem::Settings };
+
+RECT HomeCardRect(const HomeLayout& l)
+{
+    const float x = l.cx - kHomeCardW / 2 * l.s, y = l.cy - kHomeCardH / 2 * l.s;
+    return RECT{(LONG)std::lround(x), (LONG)std::lround(y), (LONG)std::lround(x + kHomeCardW * l.s), (LONG)std::lround(y + kHomeCardH * l.s)};
+}
+
+RECT HomeTileRect(const HomeLayout& l, int slot)
+{
+    const RECT card = HomeCardRect(l);
+    const float x = card.left + (24 + (slot % 2) * (kHomeBtnW + kHomeBtnGap)) * l.s;
+    const float y = card.top + (kHomeBtnTop + (slot / 2) * (kHomeBtnH + kHomeBtnGap)) * l.s;
+    return RECT{(LONG)std::lround(x), (LONG)std::lround(y), (LONG)std::lround(x + kHomeBtnW * l.s), (LONG)std::lround(y + kHomeBtnH * l.s)};
+}
+
+// Which tile (if any) is at window point (mx, my).
 HomeItem HomeItemAt(int mx, int my)
 {
     const HomeLayout l = GetHomeLayout();
-    const float dx = mx - l.cx, dy = my - l.cy, d = std::sqrt(dx * dx + dy * dy);
-    if (d < l.inner || d > l.outer + 10 * l.s) return HomeItem::None;
-    // Angle clockwise from straight up, 0..360; each segment spans 90 degrees around its direction.
-    float a = std::atan2(dx, -dy) * 180.0f / 3.14159265f;
-    if (a < 0) a += 360;
-    return (HomeItem)(((int)std::floor((a + 45) / 90)) % 4);
+    for (int i = 0; i < 4; i++)
+    {
+        const RECT r = HomeTileRect(l, i);
+        if (mx >= r.left && mx < r.right && my >= r.top && my < r.bottom) return kHomeTileItems[i];
+    }
+    return HomeItem::None;
 }
 
 // One ring segment as a polygon: 90 degrees around `centerDeg` (clockwise from up), with a constant
@@ -10810,33 +12161,44 @@ void DrawHead3D(HDC hdc, float cx, float cy, float size, float yawDeg, float pit
             if (hits * 2 < kSub * kSub) continue;   // less than half covered: leave the background
             COLORREF c = RGB(r / hits, g / hits, b / hits);
             // Never one of the translucent key colours (those pixels would turn see-through).
-            if (c == kHomeDim || c == kHomeFill || c == kHomeHoverFill || c == RGB(255,0,255) || c == kHomeChipFill)
+            if (c == kHomeDim || c == kHomeFill || c == kHomeHoverFill || c == RGB(255,0,255) || c == kHomeChipFill ||
+                c == kHomeCard || c == kHomeRim || c == kHomeIconFill)
                 c = RGB(GetRValue(c), GetGValue(c) ^ 1, GetBValue(c));
             px[(size_t)py * width + pxl] = ((uint32_t)GetRValue(c) << 16) | ((uint32_t)GetGValue(c) << 8) | GetBValue(c);
         }
 }
 
 // The head's turn follows the mouse, eased so it glides; a slow idle sway keeps it alive when the mouse rests.
-void HeadAngles(const HomeLayout& l, float& yaw, float& pitch)
+// The head looks at the mouse: the angles to the cursor seen from the head's centre (hx, hy) at a depth of a few
+// head sizes, eased so it glides (snapped on the first frame after a pause, so it already faces the mouse when the
+// menu opens). A tiny idle sway keeps it alive.
+void HeadAngles(const HomeLayout& l, float hx, float hy, float& yaw, float& pitch)
 {
     static float curYaw = 0, curPitch = 0;
     static ULONGLONG last = 0;
     const ULONGLONG now = GetTickCount64();
-    const float dt = last ? std::min(0.1f, (now - last) / 1000.0f) : 0.0f;
+    const bool fresh = !last || now - last > 500;
+    const float dt = fresh ? 0.0f : std::min(0.1f, (now - last) / 1000.0f);
     last = now;
 
     float targetYaw = 0, targetPitch = 0;
     POINT cursor;
     if (overlayWindow && GetCursorPos(&cursor) && ScreenToClient(overlayWindow, &cursor))
     {
-        const float dx = (cursor.x - l.cx) / std::max(1.0f, l.cx), dy = (cursor.y - l.cy) / std::max(1.0f, l.cy);
-        targetYaw = std::clamp(dx * 55.0f, -42.0f, 42.0f);
-        targetPitch = std::clamp(dy * 38.0f, -26.0f, 26.0f);
+        const float depth = 260 * l.s, toDeg = 180.0f / 3.14159265f;
+        // Limited so the face always stays readable (past that the head only shows its side).
+        targetYaw = std::clamp(std::atan2(cursor.x - hx, depth) * toDeg, -32.0f, 32.0f);
+        targetPitch = std::clamp(std::atan2(cursor.y - hy, depth) * toDeg, -20.0f, 20.0f);
     }
     const float t = now / 1000.0f;
-    targetYaw += 4.0f * std::sin(t * 0.9f);
-    targetPitch += 2.0f * std::sin(t * 0.7f + 1.0f);
-    const float k = 1.0f - std::exp(-dt * 9.0f);
+    targetYaw += 1.5f * std::sin(t * 0.9f);
+    targetPitch += 1.0f * std::sin(t * 0.7f + 1.0f);
+    if (fresh)
+    {
+        curYaw = targetYaw;
+        curPitch = targetPitch;
+    }
+    const float k = 1.0f - std::exp(-dt * 12.0f);
     curYaw += (targetYaw - curYaw) * k;
     curPitch += (targetPitch - curPitch) * k;
     yaw = curYaw; pitch = curPitch;
@@ -10863,42 +12225,52 @@ ChipGroup FeatureChipGroup(DetailFeature f)
 
 struct HomeChip { DetailFeature feature; ChipGroup group; RECT rect; int more; };   // more > 0: "+N more"
 
+// In a row (two at most) under the tiles, left-aligned with them; what does not fit becomes "+N more".
 std::vector<HomeChip> HomeChips(HDC hdc)
 {
     const HomeLayout l = GetHomeLayout();
-    std::vector<DetailFeature> groups[4];
-    for (int i = 0; i < kFeatureCount; i++)
-        if (FeatureEnabled(kFeatureList[i]))
-            groups[(int)FeatureChipGroup(kFeatureList[i])].push_back(kFeatureList[i]);
+    std::vector<DetailFeature> on;
+    for (int g = 0; g < 4; g++)   // grouped: HUD, game, visual, system
+        for (int i = 0; i < kFeatureCount; i++)
+            if (FeatureEnabled(kFeatureList[i]) && (int)FeatureChipGroup(kFeatureList[i]) == g)
+                on.push_back(kFeatureList[i]);
 
-    const int chipH = (int)std::lround(34 * l.s), pitch = (int)std::lround(42 * l.s);
-    const int textSize = std::max(11, (int)std::lround(15 * l.s));
-    const int padL = (int)std::lround(44 * l.s), padR = (int)std::lround(18 * l.s);
-    const int gapToRing = (int)std::lround(110 * l.s);
-    // Upper groups start level with the top of the ring; lower groups just under the middle.
-    const int upperTop = (int)std::lround(l.cy - l.outer), lowerTop = (int)std::lround(l.cy + 40 * l.s);
-    const int upperRows = std::max(1, (lowerTop - upperTop - pitch / 2) / pitch);
-    const int lowerRows = std::max(1, (int)((l.cy + l.outer + 20 * l.s - lowerTop) / pitch));
+    const RECT card = HomeCardRect(l);
+    const int chipH = (int)std::lround(24 * l.s), gap = (int)std::lround(6 * l.s);
+    const int textSize = std::max(12, (int)std::lround(10 * l.s)), pad = (int)std::lround(10 * l.s);
+    const int left = card.left + (int)std::lround(24 * l.s), right = card.right - (int)std::lround(24 * l.s);
+    const int top = card.top + (int)std::lround(kHomeChipsTop * l.s);
+    FontStyle semi(FW_SEMIBOLD);
+    const auto width = [&](const std::wstring& text) { return TextWidth(hdc, text, textSize) + 2 * pad + (text[0] == L'+' ? 0 : (int)std::lround(10 * l.s)); };
 
+    // Fill up to two lines left to right (the last one keeps room for "+N more"), then centre each line.
     std::vector<HomeChip> chips;
-    for (int g = 0; g < 4; g++)
+    int x = left, line = 0;
+    for (size_t i = 0; i < on.size(); i++)
     {
-        const bool leftSide = g < 2, upper = g == 0 || g == 2;
-        const int rows = upper ? upperRows : lowerRows;
-        const int top = upper ? upperTop : lowerTop;
-        const int count = (int)groups[g].size();
-        const int shown = count > rows ? rows - 1 : count;
-        for (int i = 0; i <= shown && i < rows; i++)
+        const int w = width(FeatureTitle(on[i]));
+        const int moreW = width(L"+" + std::to_wstring(on.size() - i)) + gap;
+        const bool fits = x + w <= right && (line == 1 ? (i + 1 == on.size() || x + w + gap + moreW <= right) : true);
+        if (!fits)
         {
-            const bool moreChip = i == shown;
-            if (moreChip && count <= rows) break;
-            const std::wstring text = moreChip ? L"+" + std::to_wstring(count - shown) + L" more" : FeatureTitle(groups[g][i]);
-            const int w = TextWidth(hdc, text, textSize) + (moreChip ? padR * 2 : padL + padR);
-            const int y = top + i * pitch;
-            const int x = leftSide ? (int)std::lround(l.cx - l.outer) - gapToRing - w : (int)std::lround(l.cx + l.outer) + gapToRing;
-            chips.push_back({moreChip ? DetailFeature::None : groups[g][i], (ChipGroup)g, RECT{x, y, x + w, y + chipH},
-                             moreChip ? count - shown : 0});
+            if (line == 0) { line = 1; x = left; i--; continue; }
+            const int n = (int)(on.size() - i);
+            const std::wstring text = L"+" + std::to_wstring(n);
+            const int y = top + line * (chipH + gap);
+            chips.push_back({DetailFeature::None, ChipGroup::Hud, RECT{x, y, x + width(text), y + chipH}, n});
+            break;
         }
+        const int y = top + line * (chipH + gap);
+        chips.push_back({on[i], FeatureChipGroup(on[i]), RECT{x, y, x + w, y + chipH}, 0});
+        x += w + gap;
+    }
+    for (int ln = 0; ln < 2; ln++)
+    {
+        int lo = INT_MAX, hi = INT_MIN;
+        for (const HomeChip& c : chips) if ((c.rect.top - top) / std::max(1, chipH) == ln) { lo = std::min(lo, (int)c.rect.left); hi = std::max(hi, (int)c.rect.right); }
+        if (lo > hi) continue;
+        const int shift = (left + right) / 2 - (lo + hi) / 2;
+        for (HomeChip& c : chips) if ((c.rect.top - top) / std::max(1, chipH) == ln) OffsetRect(&c.rect, shift, 0);
     }
     return chips;
 }
@@ -10958,29 +12330,6 @@ void DrawChipIcon(HDC hdc, ChipGroup group, float cx, float cy, float u, COLORRE
     }
 }
 
-void DrawHomeChips(HDC hdc)
-{
-    const HomeLayout l = GetHomeLayout();
-    const std::vector<HomeChip> chips = HomeChips(hdc);
-    const int textSize = std::max(11, (int)std::lround(15 * l.s));
-    for (size_t i = 0; i < chips.size(); i++)
-    {
-        const HomeChip& c = chips[i];
-        const RECT& r = c.rect;
-        const int w = r.right - r.left, h = r.bottom - r.top;
-        const bool hover = (int)i == homeChipHover;
-        DrawRoundBox(hdc, r.left, r.top, w, h, h / 2, hover ? kHomeHoverFill : kHomeChipFill);
-        if (c.more)
-        {
-            DrawTextCentered(hdc, r.left, r.top, w, h, L"+" + std::to_wstring(c.more) + L" more", RGB(220,222,232), textSize);
-            continue;
-        }
-        DrawChipIcon(hdc, c.group, r.left + 24 * l.s, r.top + h / 2.0f, 18 * l.s, RGB(255,255,255));
-        DrawTextSimple(hdc, r.left + (int)std::lround(44 * l.s), r.top + h / 2 - TextMiddle(hdc, textSize), FeatureTitle(c.feature),
-                       RGB(255,255,255), textSize);
-    }
-}
-
 // ---- Mods page: a glass panel over the blurred game (light or dark glass) ----
 // Left: icon buttons (Mods, Settings, Closet, Presets, light/dark, Edit HUD). Top: back, the tabs (Quick Access =
 // the pinned modules, Visual, HUD, Input, Misc) and the search box. Below: the modules in two columns, each row
@@ -11012,10 +12361,11 @@ bool GlassPageShown() { return GlassModsShown() || GlassClosetShown() || GlassCo
 
 ModsTab ModsTabOf(DetailFeature f)
 {
-    if (FeatureIsHud(f)) return ModsTab::Hud;
+    if (FeatureIsHud(f) || f == DetailFeature::ItemCounter) return ModsTab::Hud;
     switch (f)
     {
-    case DetailFeature::FastInventory: case DetailFeature::MenuOpen:
+    case DetailFeature::FastInventory: case DetailFeature::MenuOpen: case DetailFeature::CommandHotkeys:
+    case DetailFeature::CpsLimiter:
         return ModsTab::Input;
     case DetailFeature::HiveUtils: case DetailFeature::Replay: case DetailFeature::Nick: case DetailFeature::Lite:
     case DetailFeature::FrameGen: case DetailFeature::MenuSounds: case DetailFeature::DebugMenu:
@@ -11061,9 +12411,17 @@ std::vector<DetailFeature> GlassFeatures()
     return list;
 }
 
-// Layout in panel units (1100 x 600), scaled by s and placed in the middle of the window.
-constexpr float kGlassW = 1100, kGlassH = 600;
-constexpr int kGlassRows = 6;   // visible rows of two modules
+// Layout in panel units (880 x 560), scaled by s and placed in the middle of the window: one rounded glass panel.
+// Top bar: the OriginX mark, the page switcher (Modules, Closet, Presets, Settings), search, light / dark, close.
+// The Modules page: category chips under it, then the modules as tiles in four columns.
+constexpr float kGlassW = 880, kGlassH = 560;
+constexpr float kMainX = 24;              // where a page's content starts
+constexpr float kMainR = kGlassW - 24;    // ...and ends
+constexpr float kPanelRadius = 20;
+constexpr float kBarY = 18, kBarH = 38;   // the top bar
+constexpr float kChipY = 74, kChipH = 30; // the category chips (Modules) / a module page's title row
+constexpr int kGlassCols = 4, kGlassRows = 4;   // module tiles shown at a time
+constexpr float kCardTop = 120, kModCardH = 96, kCardPitch = 106, kModCardGap = 10;
 struct GlassLayout
 {
     float s; int x, y, w, h;
@@ -11077,69 +12435,107 @@ struct GlassLayout
 GlassLayout GetGlassLayout()
 {
     const HomeLayout l = GetHomeLayout();
-    const float s = std::min({l.s, l.cx * 2 * 0.96f / kGlassW, l.cy * 2 * 0.94f / kGlassH});
+    const float s = std::min({l.s, l.cx * 2 * 0.94f / kGlassW, l.cy * 2 * 0.92f / kGlassH});
     GlassLayout g{s, 0, 0, (int)std::lround(kGlassW * s), (int)std::lround(kGlassH * s)};
     g.x = (int)std::lround(l.cx - g.w / 2.0f);
     g.y = (int)std::lround(l.cy - g.h / 2.0f);
     return g;
 }
 
-// Where the old layout's (0, 0) goes so its content sits right of the back button, centred in the panel.
+// Where the old layout's (0, 0) goes so its content sits under the top bar, centred in the panel.
 void GlassContentOrigin(int& ox, int& oy)
 {
     const GlassLayout g = GetGlassLayout();
-    ox = g.x + g.L(186) + std::max(0, (g.L(874) - 730) / 2) - 190;
-    oy = g.y + g.L(62) - 62;
+    ox = g.x + g.L(kMainX) + std::max(0, (g.L(kMainR - kMainX) - 730) / 2) - 190;
+    oy = g.y + g.L(kChipY) - 62;
 }
 
+// The page switcher's parts and the bar's buttons. GlassRail is the order the click code knows them by.
 enum class GlassRail { Mods = 0, Settings = 1, Closet = 2, Presets = 3, Theme = 4, EditHud = 5 };
 constexpr int kGlassRailCount = 6;
+const wchar_t* const kRailNames[4] = { L"Modules", L"Closet", L"Presets", L"Settings" };
+constexpr GlassRail kRailOrder[4] = { GlassRail::Mods, GlassRail::Closet, GlassRail::Presets, GlassRail::Settings };
+constexpr float kRailX = 150, kRailItemW[4] = {108, 94, 98, 104};
 RECT GlassRailRect(const GlassLayout& g, int i)
 {
-    const float y = i < 4 ? 62 + i * 82.0f : (i == 4 ? kGlassH - 96 - 82 : kGlassH - 96);
-    return g.R(30, y, 66, 66);
+    if ((GlassRail)i == GlassRail::Theme) return g.R(kMainR - 38 - 8 - 38, kBarY, 38, kBarH);
+    if ((GlassRail)i == GlassRail::EditHud) return RECT{0, 0, 0, 0};   // on the home screen and the Settings page
+    float x = kRailX + 4;
+    for (int k = 0; k < 4; k++)
+    {
+        if ((int)kRailOrder[k] == i) return g.R(x, kBarY + 4, kRailItemW[k], kBarH - 8);
+        x += kRailItemW[k];
+    }
+    return RECT{0, 0, 0, 0};
 }
-RECT GlassCloseRect(const GlassLayout& g) { return g.R(kGlassW - 56, 16, 36, 36); }
-RECT GlassBackRect(const GlassLayout& g) { return g.R(126, 62, 48, 40); }
-RECT GlassSearchRect(const GlassLayout& g) { return g.R(kGlassW - 40 - 210, 62, 210, 40); }
+RECT GlassRailTrack(const GlassLayout& g)
+{
+    float w = 8;
+    for (float k : kRailItemW) w += k;
+    return g.R(kRailX, kBarY, w, kBarH);
+}
+RECT GlassCloseRect(const GlassLayout& g) { return g.R(kMainR - 38, kBarY, 38, kBarH); }
+// The back button: only on a page under another one (a module's page, under Modules), left of its title.
+bool GlassHasBack() { return selectedCategory == MenuCategory::Feature && detailFeature != DetailFeature::None; }
+RECT GlassBackRect(const GlassLayout& g) { return GlassHasBack() ? g.R(kMainX, kChipY - 2, 34, 34) : RECT{0, 0, 0, 0}; }
+RECT GlassSearchRect(const GlassLayout& g) { return g.R(kMainR - 38 - 8 - 38 - 10 - 186, kBarY, 186, kBarH); }
 
-const wchar_t* const kModsTabNames[kModsTabCount] = { L"QUICK ACCESS", L"VISUAL", L"HUD", L"INPUT", L"MISC" };
+// The category chips: Visual, HUD, Input, Misc, then the pinned ones.
+const wchar_t* const kModsTabNames[kModsTabCount] = { L"Pinned", L"Visual", L"HUD", L"Input", L"Misc" };
+constexpr int kChipOrder[kModsTabCount] = { 1, 2, 3, 4, 0 };   // chip position -> ModsTab
+int ModsTabCount(ModsTab tab);
+// A chip is as wide as its name and count (measured in the fonts DrawGlassMods uses).
 RECT GlassTabRect(const GlassLayout& g, int i)
 {
-    static const float widths[kModsTabCount] = {160, 108, 86, 100, 92};
-    float x = 186;
-    for (int k = 0; k < i; k++) x += widths[k] + 10;
-    return g.R(x, 62, widths[i], 40);
+    HDC dc = CreateCompatibleDC(nullptr);
+    int x = g.x + g.L(kMainX), w = 0;
+    const int nameSize = std::max(12, g.L(11)), countSize = std::max(12, g.L(11));
+    for (int k = 0; k < kModsTabCount && dc; k++)
+    {
+        const int tab = kChipOrder[k];
+        int width = g.L(14) * 2 + (tab == 0 ? g.L(16) : 0);   // Pinned has a pin before its name
+        {
+            FontStyle semi(FW_SEMIBOLD);
+            width += TextWidth(dc, kModsTabNames[tab], nameSize) + g.L(6) + TextWidth(dc, std::to_wstring(ModsTabCount((ModsTab)tab)), countSize);
+        }
+        if (tab == i) { w = width; break; }
+        x += width + g.L(8);
+    }
+    if (dc) DeleteDC(dc);
+    return RECT{x, g.y + g.L(kChipY), x + w, g.y + g.L(kChipY + kChipH)};
 }
 
-// Row `pos` of the list (two columns), or an empty rect when it is scrolled out of view.
+// Tile `pos` of the module grid (four columns), or an empty rect when it is scrolled out of view.
 RECT GlassRowRect(const GlassLayout& g, int pos)
 {
-    const int row = pos / 2 - featureScrollRow;
+    const int row = pos / kGlassCols - featureScrollRow;
     if (row < 0 || row >= kGlassRows) return RECT{0, 0, 0, 0};
-    return g.R(126 + (pos % 2) * 474.0f, 118 + row * 68.0f, 460, 56);
+    const float w = (kMainR - kMainX - (kGlassCols - 1) * kModCardGap) / kGlassCols;
+    return g.R(kMainX + (pos % kGlassCols) * (w + kModCardGap), kCardTop + row * kCardPitch, w, kModCardH);
 }
+// The gear at a tile's lower right (2026-11-03 user: without it the settings were not found). It and the rest of the
+// tile (anywhere but its switch) open the module's settings.
 RECT GlassGearRect(const GlassLayout& g, const RECT& row)
 {
-    const int size = g.L(34), cy = (row.top + row.bottom) / 2;
-    return RECT{row.right - g.L(116), cy - size / 2, row.right - g.L(116) + size, cy + size / 2};
+    const int s = g.L(26);
+    return RECT{row.right - g.L(10) - s, row.bottom - g.L(10) - s, row.right - g.L(10), row.bottom - g.L(10)};
 }
 RECT GlassSwitchRect(const GlassLayout& g, const RECT& row)
 {
-    const int h = g.L(28), cy = (row.top + row.bottom) / 2;
-    return RECT{row.right - g.L(68), cy - h / 2, row.right - g.L(18), cy - h / 2 + h};
+    const int w = g.L(32), h = g.L(18);
+    return RECT{row.right - g.L(12) - w, row.top + g.L(14), row.right - g.L(12), row.top + g.L(14) + h};
 }
 
 void ClampGlassScroll()
 {
-    const int rows = ((int)GlassFeatures().size() + 1) / 2;
+    const int rows = ((int)GlassFeatures().size() + kGlassCols - 1) / kGlassCols;
     featureScrollRow = std::clamp(featureScrollRow, 0, std::max(0, rows - kGlassRows));
 }
 
 bool ContainsPoint(const RECT& r, int x, int y) { return x >= r.left && x < r.right && y >= r.top && y < r.bottom; }
 
 // A glass box: drawn hard-edged in its colour (see OverlayAlpha::Glass), made translucent and smoothed later.
-void GlassBox(HDC hdc, const RECT& r, int radius, COLORREF color, uint8_t alpha)
+void GlassBox(HDC hdc, const RECT& r, int radius, COLORREF color, uint8_t alpha, uint8_t corners)
 {
     const int w = r.right - r.left, h = r.bottom - r.top;
     if (w <= 0 || h <= 0) return;
@@ -11153,7 +12549,7 @@ void GlassBox(HDC hdc, const RECT& r, int radius, COLORREF color, uint8_t alpha)
     }
     radius = std::clamp(radius, 0, std::min(w, h) / 2);
     const uint32_t rgb = ((uint32_t)GetRValue(color) << 16) | ((uint32_t)GetGValue(color) << 8) | GetBValue(color);
-    const OverlayAlpha::Glass glass{r.left, r.top, r.right, r.bottom, radius, rgb, alpha};
+    const OverlayAlpha::Glass glass{r.left, r.top, r.right, r.bottom, radius, rgb, alpha, corners};
     HardRoundBox(hdc, px, width, height, glass, color);
     translucentRects.push_back({r.left, r.top, r.right, r.bottom, rgb, alpha});
     glassShapes.push_back(glass);
@@ -11234,149 +12630,543 @@ void DrawTabIcon(HDC hdc, int tab, float cx, float cy, float u, COLORREF color)
     }
 }
 
-// `onAccentRow`: the switch sits on a switched-on (accent) row, so it is lit with a lighter accent.
+// Card corners: the top right one cut like the panel's, the others round.
+// Cards and tiles: square corners, the top right and bottom left cut off (the panel's shape, smaller).
+constexpr uint8_t kCardCorners = OverlayAlpha::AllRound;
+constexpr float kCardCut = 14;   // the corner radius of cards and tiles (panel units)
+
+// A line along a cut corner of a box (corner 1 top right, 2 bottom left), `cut` pixels along each edge.
+void DrawCutEdge(HDC hdc, const RECT& r, int cut, int corner, float thick, COLORREF color)
+{
+    // Just inside the cut: from where it meets one edge to where it meets the other.
+    const float in = thick * 0.7f;
+    if (corner == 1) DrawLineSmooth(hdc, r.right - cut + in * 0.4f, r.top + in, r.right - in, r.top + cut - in * 0.4f, thick, color);
+    else DrawLineSmooth(hdc, r.left + in, r.bottom - cut + in * 0.4f, r.left + cut - in * 0.4f, r.bottom - in, thick, color);
+}
+
+// A glass box with an accent outline (`ring` pixels): the accent box, the fill inside it.
+void GlassRingBox(HDC hdc, const RECT& r, int radius, COLORREF fill, uint8_t fillA, COLORREF ring, uint8_t ringA, int width,
+                  uint8_t corners = kCardCorners)
+{
+    GlassBox(hdc, r, radius, ring, ringA, corners);
+    // A cut corner's inner line is `width` further in along the diagonal: sqrt(2) - 1 more along the edges.
+    GlassBox(hdc, RECT{r.left + width, r.top + width, r.right - width, r.bottom - width},
+             std::max(0, radius - (int)std::lround(width * 0.414f)), fill, fillA, corners);
+}
+
+// The four-pointed star of the OriginX mark (filled), centre (cx, cy), `u` from tip to tip.
+void DrawBrandStar(HDC hdc, float cx, float cy, float u, COLORREF color)
+{
+    float xs[8], ys[8];
+    for (int i = 0; i < 8; i++)
+    {
+        const float a = i * 3.14159265f / 4 - 3.14159265f / 2, r = (i % 2 ? 0.17f : 0.5f) * u;
+        xs[i] = cx + r * std::cos(a);
+        ys[i] = cy + r * std::sin(a);
+    }
+    FillPolygonSmooth(hdc, xs, ys, 8, color);
+}
+
+// Magnifying glass (search box).
+void DrawSearchIcon(HDC hdc, float cx, float cy, float u, COLORREF color)
+{
+    std::vector<float> xs, ys;
+    for (int i = 0; i <= 28; i++)
+    {
+        const float a = 2 * 3.14159265f * i / 28;
+        xs.push_back(cx - 0.08f * u + 0.3f * u * std::cos(a));
+        ys.push_back(cy - 0.08f * u + 0.3f * u * std::sin(a));
+    }
+    HomeStroke(hdc, xs, ys, false, std::max(1.5f, u * 0.09f), color);
+    DrawLineSmooth(hdc, cx + 0.15f * u, cy + 0.15f * u, cx + 0.42f * u, cy + 0.42f * u, std::max(1.6f, u * 0.1f), color);
+}
+
+// Each module's own line icon (centre cx, cy; about u across), so the cards tell the modules apart.
+void DrawModuleGlyph(HDC hdc, DetailFeature f, float cx, float cy, float u, COLORREF color)
+{
+    const float t = std::max(1.5f, u * 0.085f), pi = 3.14159265f;
+    std::vector<float> xs, ys;
+    const auto P = [&](float x, float y) { xs.push_back(cx + x * u); ys.push_back(cy + y * u); };
+    const auto line = [&](bool closed) { HomeStroke(hdc, xs, ys, closed, t, color); xs.clear(); ys.clear(); };
+    const auto fill = [&]() { if (xs.size() > 2) FillPolygonSmooth(hdc, xs.data(), ys.data(), (int)xs.size(), color); xs.clear(); ys.clear(); };
+    const auto rect = [&](float x0, float y0, float x1, float y1) { P(x0, y0); P(x1, y0); P(x1, y1); P(x0, y1); line(true); };
+    const auto box = [&](float x0, float y0, float x1, float y1) { P(x0, y0); P(x1, y0); P(x1, y1); P(x0, y1); fill(); };
+    const auto arc = [&](float ox, float oy, float r, float a0, float a1, int n) { for (int i = 0; i <= n; i++) { const float a = a0 + (a1 - a0) * i / n; P(ox + r * std::cos(a), oy + r * std::sin(a)); } };
+    const auto seg = [&](float x0, float y0, float x1, float y1) { P(x0, y0); P(x1, y1); line(false); };
+    const auto text = [&](const wchar_t* s, float size)
+    {
+        FontStyle bold(FW_BOLD);
+        const int px = std::max(8, (int)std::lround(u * size));
+        DrawTextCentered(hdc, (int)(cx - u), (int)(cy - u / 2), (int)(2 * u), (int)u, s, color, px);
+    };
+    switch (f)
+    {
+    case DetailFeature::Keystrokes:   // W over A S D
+        rect(-0.13f, -0.42f, 0.13f, -0.16f);
+        rect(-0.44f, -0.08f, -0.18f, 0.18f); rect(-0.13f, -0.08f, 0.13f, 0.18f); rect(0.18f, -0.08f, 0.44f, 0.18f);
+        break;
+    case DetailFeature::CPS:          // mouse
+        arc(0, -0.12f, 0.27f, pi, 2 * pi, 12); arc(0, 0.14f, 0.27f, 0, pi, 12); line(true);
+        seg(0, -0.39f, 0, -0.12f); seg(-0.27f, -0.12f, 0.27f, -0.12f);
+        break;
+    case DetailFeature::Armor:        // chestplate
+        P(-0.18f, -0.42f); P(-0.06f, -0.3f); P(0.06f, -0.3f); P(0.18f, -0.42f); P(0.44f, -0.3f); P(0.36f, -0.06f);
+        P(0.26f, -0.1f); P(0.26f, 0.42f); P(-0.26f, 0.42f); P(-0.26f, -0.1f); P(-0.36f, -0.06f); P(-0.44f, -0.3f); line(true);
+        break;
+    case DetailFeature::Arrows:       // arrow
+        seg(-0.38f, 0.38f, 0.38f, -0.38f);
+        P(0.38f, -0.38f); P(0.08f, -0.34f); P(0.34f, -0.08f); fill();
+        seg(-0.38f, 0.38f, -0.38f, 0.16f); seg(-0.38f, 0.38f, -0.16f, 0.38f);
+        seg(-0.27f, 0.27f, -0.27f, 0.07f); seg(-0.27f, 0.27f, -0.07f, 0.27f);
+        break;
+    case DetailFeature::FPS:          // gauge
+        arc(0, 0.12f, 0.42f, pi * 1.0f, pi * 2.0f, 18); line(false);
+        seg(0, 0.12f, 0.22f, -0.12f);
+        P(0, 0.12f); arc(0, 0.12f, 0.06f, 0, 2 * pi, 10); fill();
+        seg(-0.42f, 0.12f, -0.3f, 0.12f); seg(0.3f, 0.12f, 0.42f, 0.12f);
+        break;
+    case DetailFeature::PartyAutoAccept:   // two people
+        arc(-0.14f, -0.18f, 0.13f, 0, 2 * pi, 14); line(true);
+        arc(-0.14f, 0.36f, 0.27f, pi, 2 * pi, 12); line(false);
+        arc(0.2f, -0.24f, 0.11f, -pi * 0.6f, pi * 0.9f, 10); line(false);
+        arc(0.2f, 0.3f, 0.24f, pi * 1.4f, 2 * pi, 8); line(false);
+        break;
+    case DetailFeature::BlockOutline: case DetailFeature::BlockDetails:   // cube
+        P(0, -0.44f); P(0.4f, -0.22f); P(0.4f, 0.24f); P(0, 0.46f); P(-0.4f, 0.24f); P(-0.4f, -0.22f); line(true);
+        P(-0.4f, -0.22f); P(0, 0); P(0.4f, -0.22f); line(false); seg(0, 0, 0, 0.46f);
+        if (f == DetailFeature::BlockDetails) { P(0.2f, 0.06f); arc(0.2f, 0.18f, 0.05f, 0, 2 * pi, 8); fill(); }
+        break;
+    case DetailFeature::Zoom:         // magnifier with plus
+        arc(-0.08f, -0.08f, 0.3f, 0, 2 * pi, 24); line(true);
+        seg(0.14f, 0.14f, 0.42f, 0.42f); seg(-0.2f, -0.08f, 0.04f, -0.08f); seg(-0.08f, -0.2f, -0.08f, 0.04f);
+        break;
+    case DetailFeature::Resources:    // stacked ingots
+        P(-0.36f, 0.42f); P(0.36f, 0.42f); P(0.28f, 0.2f); P(-0.28f, 0.2f); line(true);
+        P(-0.3f, 0.1f); P(0.06f, 0.1f); P(0.0f, -0.1f); P(-0.24f, -0.1f); line(true);
+        P(-0.02f, -0.2f); P(0.34f, -0.2f); P(0.28f, -0.4f); P(0.04f, -0.4f); line(true);
+        break;
+    case DetailFeature::Fullbright: DrawGlassIcon(hdc, GlassIcon::Sun, cx, cy, u * 1.05f, color); break;
+    case DetailFeature::Nametag:      // tag
+        P(-0.44f, -0.22f); P(0.2f, -0.22f); P(0.44f, 0); P(0.2f, 0.22f); P(-0.44f, 0.22f); line(true);
+        arc(0.18f, 0, 0.05f, 0, 2 * pi, 8); fill(); seg(-0.3f, -0.04f, 0.0f, -0.04f); seg(-0.3f, 0.08f, -0.08f, 0.08f);
+        break;
+    case DetailFeature::Ping:         // signal bars
+        for (int i = 0; i < 4; i++) box(-0.4f + i * 0.22f, 0.4f - 0.2f * (i + 1), -0.26f + i * 0.22f, 0.4f);
+        break;
+    case DetailFeature::Textures:     // two by two tiles, two filled
+        box(-0.4f, -0.4f, -0.02f, -0.02f); rect(0.02f, -0.4f, 0.4f, -0.02f); rect(-0.4f, 0.02f, -0.02f, 0.4f); box(0.02f, 0.02f, 0.4f, 0.4f);
+        break;
+    case DetailFeature::AutoRq:       // circular arrow
+        arc(0, 0, 0.34f, -pi * 0.35f, pi * 1.35f, 22); line(false);
+        { const float a = -pi * 0.35f, x = 0.34f * std::cos(a), y = 0.34f * std::sin(a); P(x + 0.02f, y - 0.2f); P(x + 0.16f, y + 0.06f); P(x - 0.12f, y + 0.08f); fill(); }
+        break;
+    case DetailFeature::FeatureList:  // list
+        for (int i = 0; i < 3; i++) { P(-0.36f, -0.3f + i * 0.3f); arc(-0.36f, -0.3f + i * 0.3f, 0.06f, 0, 2 * pi, 8); fill(); seg(-0.18f, -0.3f + i * 0.3f, 0.4f, -0.3f + i * 0.3f); }
+        break;
+    case DetailFeature::ShulkerPreview:   // box with a lid
+        rect(-0.4f, -0.3f, 0.4f, 0.38f); seg(-0.4f, -0.06f, 0.4f, -0.06f); rect(-0.08f, -0.14f, 0.08f, 0.04f);
+        break;
+    case DetailFeature::HiveUtils:    // hexagon
+        for (int i = 0; i < 6; i++) P(0.42f * std::cos(pi / 3 * i + pi / 6), 0.42f * std::sin(pi / 3 * i + pi / 6));
+        line(true);
+        for (int i = 0; i < 6; i++) P(0.18f * std::cos(pi / 3 * i + pi / 6), 0.18f * std::sin(pi / 3 * i + pi / 6));
+        fill();
+        break;
+    case DetailFeature::HiveStats:    // bar chart
+        box(-0.36f, 0.0f, -0.18f, 0.38f); box(-0.09f, -0.36f, 0.09f, 0.38f); box(0.18f, -0.16f, 0.36f, 0.38f);
+        break;
+    case DetailFeature::TabList:      // table
+        rect(-0.42f, -0.34f, 0.42f, 0.34f); seg(-0.42f, -0.11f, 0.42f, -0.11f); seg(-0.42f, 0.12f, 0.42f, 0.12f); seg(-0.06f, -0.34f, -0.06f, 0.34f);
+        break;
+    case DetailFeature::ChunkBorder:  // grid
+        rect(-0.4f, -0.4f, 0.4f, 0.4f); seg(-0.13f, -0.4f, -0.13f, 0.4f); seg(0.13f, -0.4f, 0.13f, 0.4f);
+        seg(-0.4f, -0.13f, 0.4f, -0.13f); seg(-0.4f, 0.13f, 0.4f, 0.13f);
+        break;
+    case DetailFeature::Hitbox:       // corner brackets around a dot
+        for (int k = 0; k < 4; k++)
+        {
+            const float sx = k % 2 ? 1.0f : -1.0f, sy = k / 2 ? 1.0f : -1.0f;
+            P(sx * 0.4f, sy * 0.14f); P(sx * 0.4f, sy * 0.4f); P(sx * 0.14f, sy * 0.4f); line(false);
+        }
+        arc(0, 0, 0.09f, 0, 2 * pi, 10); fill();
+        break;
+    case DetailFeature::Nick: text(L"Aa", 0.62f); break;
+    case DetailFeature::Replay:       // play in a circle
+        arc(0, 0, 0.42f, 0, 2 * pi, 26); line(true);
+        P(-0.1f, -0.2f); P(0.22f, 0); P(-0.1f, 0.2f); fill();
+        break;
+    case DetailFeature::MenuSounds:   // speaker
+        P(-0.42f, -0.12f); P(-0.24f, -0.12f); P(-0.02f, -0.34f); P(-0.02f, 0.34f); P(-0.24f, 0.12f); P(-0.42f, 0.12f); line(true);
+        arc(0.02f, 0, 0.18f, -pi / 3, pi / 3, 8); line(false); arc(0.02f, 0, 0.36f, -pi / 3, pi / 3, 10); line(false);
+        break;
+    case DetailFeature::Lite: case DetailFeature::FrameGen:   // lightning bolt
+        P(0.08f, -0.46f); P(-0.3f, 0.06f); P(-0.02f, 0.06f); P(-0.1f, 0.46f); P(0.3f, -0.08f); P(0.02f, -0.08f); fill();
+        break;
+    case DetailFeature::FastInventory:   // slots
+        for (int k = 0; k < 6; k++) rect(-0.42f + (k % 3) * 0.3f, -0.26f + (k / 3) * 0.3f, -0.18f + (k % 3) * 0.3f, -0.02f + (k / 3) * 0.3f);
+        break;
+    case DetailFeature::LeftHand:     // swap arrows
+        seg(-0.38f, -0.14f, 0.38f, -0.14f); P(-0.38f, -0.14f); P(-0.2f, -0.28f); P(-0.2f, 0.0f); fill();
+        seg(-0.38f, 0.18f, 0.38f, 0.18f); P(0.38f, 0.18f); P(0.2f, 0.04f); P(0.2f, 0.32f); fill();
+        break;
+    case DetailFeature::HitEffect:    // burst
+        for (int k = 0; k < 8; k++) { const float a = pi / 4 * k; seg(0.16f * std::cos(a), 0.16f * std::sin(a), (k % 2 ? 0.32f : 0.44f) * std::cos(a), (k % 2 ? 0.32f : 0.44f) * std::sin(a)); }
+        break;
+    case DetailFeature::MenuOpen: text(L"G", 0.7f); break;
+    case DetailFeature::DayTimer:     // clock
+        arc(0, 0, 0.42f, 0, 2 * pi, 26); line(true); seg(0, 0, 0, -0.26f); seg(0, 0, 0.18f, 0.1f);
+        break;
+    case DetailFeature::DebugMenu:    // prompt
+        rect(-0.44f, -0.34f, 0.44f, 0.34f); P(-0.28f, -0.14f); P(-0.1f, 0.0f); P(-0.28f, 0.14f); line(false); seg(0.0f, 0.16f, 0.24f, 0.16f);
+        break;
+    case DetailFeature::HealthWarning:   // heart
+        arc(-0.19f, -0.12f, 0.21f, pi * 0.75f, pi * 2.0f, 12);
+        arc(0.19f, -0.12f, 0.21f, pi, pi * 2.25f, 12);
+        P(0, 0.42f); line(true);
+        break;
+    case DetailFeature::Coordinates:     // crosshair in a ring
+        arc(0, 0, 0.3f, 0, 2 * pi, 24); line(true);
+        seg(0, -0.46f, 0, -0.14f); seg(0, 0.14f, 0, 0.46f); seg(-0.46f, 0, -0.14f, 0); seg(0.14f, 0, 0.46f, 0);
+        break;
+    case DetailFeature::CommandHotkeys:  // a key with a slash
+        rect(-0.42f, -0.34f, 0.42f, 0.34f); seg(0.1f, -0.2f, -0.1f, 0.2f);
+        break;
+    case DetailFeature::Timer:           // a stopwatch: a dial, its hand and the button on top
+        arc(0, 0.06f, 0.36f, 0, 2 * pi, 24); line(true);
+        seg(0, 0.06f, 0, -0.16f); seg(0, 0.06f, 0.14f, 0.16f); seg(0, -0.3f, 0, -0.44f); seg(-0.1f, -0.44f, 0.1f, -0.44f);
+        break;
+    case DetailFeature::CpsLimiter:      // a mouse with a bar across its top
+        rect(-0.26f, -0.4f, 0.26f, 0.4f); seg(0, -0.4f, 0, -0.08f); seg(-0.26f, -0.08f, 0.26f, -0.08f);
+        seg(-0.44f, -0.5f, 0.44f, -0.5f);
+        break;
+    case DetailFeature::ItemCounter:     // three stacked boxes and a plus
+        rect(-0.44f, 0.06f, -0.04f, 0.44f); rect(0.04f, 0.06f, 0.44f, 0.44f); rect(-0.2f, -0.38f, 0.2f, 0);
+        seg(0.32f, -0.36f, 0.32f, -0.12f); seg(0.2f, -0.24f, 0.44f, -0.24f);
+        break;
+    case DetailFeature::PackDisplay:     // two stacked pictures (a pack icon with a mountain)
+        rect(-0.26f, -0.44f, 0.44f, 0.18f);
+        rect(-0.44f, -0.22f, 0.26f, 0.44f); P(-0.34f, 0.34f); P(-0.12f, 0.06f); P(0.04f, 0.24f); P(0.16f, 0.12f); line(false);
+        break;
+    default:
+        DrawTabIcon(hdc, (int)ModsTabOf(f), cx, cy, u, color);
+        break;
+    }
+}
+
+// Small spaced-out capitals (section labels: MENU, TOOLS, a page's kicker).
+void DrawCaps(HDC hdc, int x, int y, const std::wstring& text, COLORREF color, int size, int tracking)
+{
+    FontStyle caps(FW_BOLD, hdc, std::max(1, tracking));
+    DrawTextSimple(hdc, x, y, text, color, size);
+}
+int CapsWidth(HDC hdc, const std::wstring& text, int size, int tracking)
+{
+    FontStyle caps(FW_BOLD, hdc, std::max(1, tracking));
+    return TextWidth(hdc, text, size);
+}
+
+// A switch: a fully round pill track with a round knob (the knob slides right and the track lights up when on).
+// Both are glass boxes, so OverlayAlpha smooths their edges (no stair steps).
+// `onAccentRow` is kept for callers that draw it on an accent surface: the track is then the lighter accent.
+// The switches slide (2026-11-03 user report: they jumped): each one, known by where it is drawn, eases its knob and
+// colour toward the new state over ~120 ms; while any is moving the menu repaints every frame (switchAnimUntil).
+struct SwitchMotion { float p = 0; ULONGLONG at = 0; };
+std::map<std::pair<int, int>, SwitchMotion> switchMotions;
+ULONGLONG switchAnimUntil = 0;
+
+float SwitchProgress(const RECT& r, bool on)
+{
+    const ULONGLONG now = GetTickCount64();
+    const float target = on ? 1.0f : 0.0f;
+    if (switchMotions.size() > 512) switchMotions.clear();
+    auto [it, fresh] = switchMotions.try_emplace({r.left, r.top});
+    SwitchMotion& m = it->second;
+    // A switch not drawn for a while (another page, scrolled) shows its state at once.
+    if (fresh || now - m.at > 250) m.p = target;
+    else {
+        const float dt = (now - m.at) / 1000.0f;
+        m.p += (target - m.p) * (1.0f - std::exp(-dt * 28.0f));
+        if (std::fabs(target - m.p) < 0.01f) m.p = target;
+    }
+    m.at = now;
+    if (m.p != target) switchAnimUntil = now + 40;
+    return m.p;
+}
+
 void DrawGlassSwitch(HDC hdc, const RECT& r, bool on, const GlassColors& c, bool onAccentRow)
 {
     const int w = r.right - r.left, h = r.bottom - r.top;
-    DrawRoundBox(hdc, r.left, r.top, w - 1, h - 1, h / 2, on ? (onAccentRow ? GlassAccentLight() : GlassAccent()) : c.track);
+    if (w <= 0 || h <= 0) return;
+    const float p = SwitchProgress(r, on);
+    const COLORREF onTrack = onAccentRow ? GlassAccentLight() : GlassAccent();
+    const COLORREF track = MixRgb(c.track, onTrack, (int)std::lround(p * 100));
+    GlassBox(hdc, r, h / 2, track, 255);
     const int pad = std::max(2, h / 8), knob = h - 2 * pad;
-    DrawRoundBox(hdc, on ? r.right - pad - knob : r.left + pad, r.top + pad, knob - 1, knob - 1, knob / 2, RGB(255,255,255));
+    if (knob <= 0) return;
+    const int left = r.left + pad, right = r.right - pad - knob;
+    const int kx = left + (int)std::lround((right - left) * p), ky = r.top + pad;
+    const COLORREF offKnob = glassDark ? RGB(170,178,198) : RGB(255,255,255);
+    const COLORREF knobColor = MixRgb(offKnob, RGB(255,255,255), (int)std::lround(p * 100));
+    GlassBox(hdc, RECT{kx, ky, kx + knob, ky + knob}, knob / 2, knobColor, 255);
 }
 
-// The parts every glass page shares: the panel, the close button and the left column of icon buttons
-// (`current` is lit), plus the back button at the top left.
+// The parts every page shares: the panel (a soft shadow, a light rim, the glass) and the top bar: the OriginX mark,
+// the page switcher (`current` chosen), light / dark and close. The search box belongs to the Modules page.
 void DrawGlassFrame(HDC hdc, const GlassLayout& g, const GlassColors& c, GlassRail current)
 {
     const RECT panel{g.x, g.y, g.x + g.w, g.y + g.h};
+    const int radius = g.L(kPanelRadius);
 
-    // Drop shadow (Settings: its strength): rings of dark glass around and a little below the panel, fainter
-    // outwards. Each ring has its own colour so OverlayAlpha tells them apart; the panel covers their middle.
+    // Drop shadow (Settings: its strength): thin rings of dark glass, fading out, mostly under the panel.
     if (glassShadow > 0)
     {
-        constexpr int kRings = 6;
+        constexpr int kRings = 12;
         for (int k = 0; k < kRings; k++)
         {
-            const int grow = g.L(3.0f * (kRings - k)), drop = g.L(6);
-            const int alpha = glassShadow * 150 / 100 * (k + 1) / kRings;
-            GlassBox(hdc, RECT{panel.left - grow, panel.top - grow + drop, panel.right + grow, panel.bottom + grow + drop},
-                     g.L(28) + grow, RGB(0,0,1 + k), (uint8_t)std::clamp(alpha, 1, 255));
+            const float f = (k + 1) / (float)kRings;
+            const int grow = g.L(1.6f * (kRings - k)), drop = g.L(12);
+            const int alpha = (int)(glassShadow * 0.9f * f * f);
+            GlassBox(hdc, RECT{panel.left - grow, panel.top - grow / 2 + drop, panel.right + grow, panel.bottom + grow + drop},
+                     radius + grow, RGB(0,0,1 + k), (uint8_t)std::clamp(alpha, 1, 255));
+        }
+    }
+    const int rim = std::max(1, g.L(1));
+    GlassBox(hdc, panel, radius, c.border, c.borderA);
+    GlassBox(hdc, RECT{panel.left + rim, panel.top + rim, panel.right - rim, panel.bottom - rim}, radius - rim, c.panel, c.panelA);
+
+    // The mark and the name.
+    {
+        const int logo = g.L(26), mid = g.y + g.L(kBarY + kBarH / 2);
+        if (!DrawLogo(hdc, g.x + g.L(kMainX), mid - logo / 2, logo))
+            DrawBrandStar(hdc, g.x + g.L(kMainX) + logo / 2.0f, (float)mid, (float)logo, GlassAccent());
+        FontStyle bold(FW_BOLD);
+        const int size = std::max(13, g.L(16));
+        DrawTextSimple(hdc, g.x + g.L(kMainX + 33), mid - TextMiddle(hdc, size), L"OriginX", c.text, size);
+    }
+
+    // The page switcher: a track with the chosen page on a lighter pill.
+    {
+        const RECT track = GlassRailTrack(g);
+        GlassBox(hdc, track, g.L(12), c.chip, c.chipA);
+        const int size = std::max(12, g.L(12));
+        for (int k = 0; k < 4; k++)
+        {
+            const int i = (int)kRailOrder[k];
+            const RECT r = GlassRailRect(g, i);
+            const bool chosen = i == (int)current;
+            if (chosen) GlassRingBox(hdc, r, g.L(9), c.sel, c.selA, c.line, 255, std::max(1, g.L(0.8f)), OverlayAlpha::AllRound);
+            const COLORREF ink = chosen ? c.text : c.icon;
+            const int mid = (r.top + r.bottom) / 2;
+            const float ix = r.left + g.L(18), u = (float)g.L(14);
+            switch (kRailOrder[k])
+            {
+            case GlassRail::Mods:     DrawGlassIcon(hdc, GlassIcon::Puzzle, ix, (float)mid, u, ink); break;
+            case GlassRail::Closet:   DrawHomeIcon(hdc, HomeItem::Closet, ix, mid - u * 0.1f, u, ink); break;
+            case GlassRail::Presets:  DrawGlassIcon(hdc, GlassIcon::Save, ix, (float)mid, u * 0.95f, ink); break;
+            default:                  DrawHomeIcon(hdc, HomeItem::Settings, ix, (float)mid, u * 1.1f, ink); break;
+            }
+            FontStyle weight(chosen ? FW_BOLD : FW_SEMIBOLD);
+            DrawTextSimple(hdc, r.left + g.L(31), mid - TextMiddle(hdc, size), kRailNames[k], ink, size);
         }
     }
 
-    // Panel: a light rim, then the glass.
-    const int rim = std::max(1, g.L(1.5f));
-    GlassBox(hdc, panel, g.L(28), c.border, c.borderA);
-    GlassBox(hdc, RECT{panel.left + rim, panel.top + rim, panel.right - rim, panel.bottom - rim}, g.L(28) - rim, c.panel, c.panelA);
-
+    // Light / dark and close.
+    {
+        const RECT r = GlassRailRect(g, (int)GlassRail::Theme);
+        GlassBox(hdc, r, g.L(11), c.chip, c.chipA);
+        DrawGlassIcon(hdc, glassDark ? GlassIcon::Sun : GlassIcon::Moon, (r.left + r.right) / 2.0f, (r.top + r.bottom) / 2.0f, (float)g.L(15), c.icon);
+    }
     {
         const RECT r = GlassCloseRect(g);
-        DrawGlassIcon(hdc, GlassIcon::Close, (r.left + r.right) / 2.0f, (r.top + r.bottom) / 2.0f, (float)g.L(26), c.icon);
+        GlassBox(hdc, r, g.L(11), c.chip, c.chipA);
+        DrawGlassIcon(hdc, GlassIcon::Close, (r.left + r.right) / 2.0f, (r.top + r.bottom) / 2.0f, (float)g.L(13), c.icon);
     }
-
-    // Left column of icon buttons.
-    for (int i = 0; i < kGlassRailCount; i++)
-    {
-        const RECT r = GlassRailRect(g, i);
-        const bool active = i == (int)current;
-        GlassBox(hdc, r, g.L(16), active ? GlassAccent() : c.fill, active ? kGlassAccentAlpha : c.fillA);
-        const float cx = (r.left + r.right) / 2.0f, cy = (r.top + r.bottom) / 2.0f, u = (float)g.L(30);
-        const COLORREF ic = active ? RGB(255,255,255) : c.icon;
-        switch ((GlassRail)i)
-        {
-        case GlassRail::Mods:     DrawHomeIcon(hdc, HomeItem::Mods, cx, cy, u, ic); break;
-        case GlassRail::Settings: DrawHomeIcon(hdc, HomeItem::Settings, cx, cy, u * 1.1f, ic); break;
-        case GlassRail::Closet:   DrawHomeIcon(hdc, HomeItem::Closet, cx, cy - u * 0.1f, u, ic); break;
-        case GlassRail::Presets:  DrawGlassIcon(hdc, GlassIcon::Save, cx, cy, u * 0.95f, ic); break;
-        case GlassRail::Theme:    DrawGlassIcon(hdc, glassDark ? GlassIcon::Sun : GlassIcon::Moon, cx, cy, u, ic); break;
-        case GlassRail::EditHud:  DrawHomeIcon(hdc, HomeItem::Hud, cx, cy, u, ic); break;
-        }
-    }
-
+    if (GlassHasBack())
     {
         const RECT r = GlassBackRect(g);
-        GlassBox(hdc, r, g.L(12), c.fill, c.fillA);
-        DrawGlassIcon(hdc, GlassIcon::Back, (r.left + r.right) / 2.0f, (r.top + r.bottom) / 2.0f, (float)g.L(24), c.icon);
+        GlassBox(hdc, r, g.L(10), c.chip, c.chipA);
+        DrawGlassIcon(hdc, GlassIcon::Back, (r.left + r.right) / 2.0f, (r.top + r.bottom) / 2.0f, (float)g.L(15), c.icon);
     }
+}
+
+// A page's title under the top bar (right of the back button on a module's page), with a grey caption after it.
+void DrawGlassTitle(HDC hdc, const GlassLayout& g, const GlassColors& c, const std::wstring& title, const std::wstring& caption)
+{
+    const int x = g.x + g.L(GlassHasBack() ? kMainX + 46 : kMainX + 2);
+    const int mid = g.y + g.L(kChipY + 15);
+    const int size = std::max(14, g.L(19));
+    int end = x;
+    {
+        FontStyle bold(FW_BOLD);
+        DrawTextSimple(hdc, x, mid - TextMiddle(hdc, size), title, c.text, size);
+        end += TextWidth(hdc, title, size);
+    }
+    if (!caption.empty())
+    {
+        FontStyle semi(FW_SEMIBOLD);
+        const int small = std::max(12, g.L(11));
+        DrawTextSimple(hdc, end + g.L(12), mid - TextMiddle(hdc, small), caption, c.muted, small);
+    }
+}
+
+// A scrollbar at the panel's right edge: `first` of `count` positions shown, `shown` at a time (a thumb only).
+void DrawGlassScrollbar(HDC hdc, const GlassLayout& g, const GlassColors& c, float top, float height, int first, int count, int shown)
+{
+    if (count <= shown || count <= 0) return;
+    const RECT track = g.R(kGlassW - 12, top, 3, height);
+    const int th = track.bottom - track.top, thumb = std::max(g.L(24), th * shown / count);
+    const int y = track.top + (th - thumb) * first / std::max(1, count - shown);
+    const int w = track.right - track.left;
+    DrawRoundBox(hdc, track.left, y, w - 1, thumb - 1, w / 2, MixRgb(c.panel, c.text, 28));
+}
+
+int ModsTabCount(ModsTab tab)
+{
+    int n = 0;
+    for (int i = 0; i < kFeatureCount; i++)
+    {
+        const DetailFeature f = kFeatureList[i];
+        if (f == DetailFeature::MenuOpen || f == DetailFeature::FrameGen) continue;
+        n += tab == ModsTab::Quick ? FeaturePinned(f) : ModsTabOf(f) == tab;
+    }
+    return n;
+}
+
+// A module's name on its tile: the long ones shortened (the page keeps the full name).
+std::wstring CardTitle(DetailFeature f)
+{
+    switch (f)
+    {
+    case DetailFeature::Nametag:         return L"Nametag";
+    case DetailFeature::Resources:       return L"Resources";
+    case DetailFeature::PartyAutoAccept: return L"Party Accept";
+    default:                             return FeatureTitle(f);
+    }
+}
+
+// The line under a module's name: on / off and its key.
+std::wstring ModuleStatus(DetailFeature f)
+{
+    std::wstring status = !FeatureHasSwitch(f) ? L"Settings" : FeatureEnabled(f) ? L"On" : L"Off";
+    if (const int* key = GetShortcutPtr(f))
+        if (*key)
+            status += L" · " + KeyName(*key);
+    return status;
 }
 
 void DrawGlassMods(HDC hdc)
 {
     const GlassLayout g = GetGlassLayout();
     const GlassColors c = GlassTheme();
-    const int rim = std::max(1, g.L(1.5f));
     DrawGlassFrame(hdc, g, c, GlassRail::Mods);
 
-    // Top row: tabs, search (back is part of the frame).
-    const int tabText = std::max(10, g.L(14));
-    for (int i = 0; i < kModsTabCount; i++)
-    {
-        const RECT r = GlassTabRect(g, i);
-        const bool active = (int)modsTab == i && searchQuery.empty();
-        GlassBox(hdc, r, g.L(12), active ? GlassAccent() : c.fill, active ? kGlassAccentAlpha : c.fillA);
-        const COLORREF fg = active ? RGB(255,255,255) : c.text;
-        const int mid = (r.top + r.bottom) / 2;
-        DrawTabIcon(hdc, i, r.left + g.L(24), (float)mid, (float)g.L(18), fg);
-        DrawTextSimple(hdc, r.left + g.L(40), mid - TextMiddle(hdc, tabText), kModsTabNames[i], fg, tabText);
-    }
+    // Search box (top bar).
     {
         const RECT r = GlassSearchRect(g);
         if (searchActive)
-        {
-            GlassBox(hdc, r, g.L(12), GlassAccent(), kGlassAccentAlpha);
-            GlassBox(hdc, RECT{r.left + rim + 1, r.top + rim + 1, r.right - rim - 1, r.bottom - rim - 1}, g.L(12) - rim - 1, c.fill, c.fillA);
-        }
+            GlassRingBox(hdc, r, g.L(11), c.sel, c.selA, GlassAccent(), kGlassAccentAlpha, std::max(1, g.L(1.2f)), OverlayAlpha::AllRound);
         else
-            GlassBox(hdc, r, g.L(12), c.fill, c.fillA);
-        const int size = std::max(10, g.L(15)), y = (r.top + r.bottom) / 2 - TextMiddle(hdc, size);
+            GlassBox(hdc, r, g.L(11), c.chip, c.chipA);
+        const int mid = (r.top + r.bottom) / 2;
+        DrawSearchIcon(hdc, r.left + g.L(17), (float)mid, (float)g.L(14), searchActive ? GlassAccent() : c.muted);
+        const int size = std::max(12, g.L(12));
+        FontStyle semi(FW_SEMIBOLD);
         if (searchQuery.empty() && !searchActive)
-            DrawTextSimple(hdc, r.left + g.L(16), y, L"search...", c.muted, size);
+            DrawTextSimple(hdc, r.left + g.L(30), mid - TextMiddle(hdc, size), L"Search", c.muted, size);
         else
-            DrawTextSimple(hdc, r.left + g.L(16), y, searchQuery + (searchActive ? L"|" : L""), c.text, size);
+            DrawTextSimple(hdc, r.left + g.L(30), mid - TextMiddle(hdc, size), searchQuery + (searchActive ? L"|" : L""), c.text, size);
     }
 
-    // The modules.
+    // Category chips: outlined, the chosen one filled.
+    const int nameSize = std::max(12, g.L(11));
+    for (int i = 0; i < kModsTabCount; i++)
+    {
+        const RECT r = GlassTabRect(g, i);
+        const bool chosen = (int)modsTab == i && searchQuery.empty();
+        const int h = r.bottom - r.top, mid = (r.top + r.bottom) / 2;
+        const COLORREF fillInk = glassDark ? RGB(238,242,250) : RGB(20,26,42);
+        if (chosen)
+            DrawRoundBox(hdc, r.left, r.top, r.right - r.left - 1, h - 1, h / 2, fillInk);
+        else
+            GlassRingBox(hdc, r, h / 2, c.panel, c.panelA, c.line, 255, std::max(1, g.L(0.8f)), OverlayAlpha::AllRound);
+        const COLORREF ink = chosen ? (glassDark ? RGB(20,26,42) : RGB(250,251,253)) : c.icon;
+        const std::wstring count = std::to_wstring(ModsTabCount((ModsTab)i));
+        FontStyle semi(FW_SEMIBOLD);
+        int x = r.left + g.L(14);
+        if (i == (int)ModsTab::Quick)
+        {
+            DrawGlassIcon(hdc, GlassIcon::Pin, x + g.L(6), (float)mid, (float)g.L(11), ink);
+            x += g.L(16);
+        }
+        DrawTextSimple(hdc, x, mid - TextMiddle(hdc, nameSize), kModsTabNames[i], ink, nameSize);
+        x += TextWidth(hdc, kModsTabNames[i], nameSize) + g.L(6);
+        DrawTextSimple(hdc, x, mid - TextMiddle(hdc, nameSize), count, MixRgb(chosen ? fillInk : c.panel, ink, 60), nameSize);
+    }
+
+    // The modules: tiles in four columns. Switched on, a tile is brighter and its icon square is the accent colour.
     ClampGlassScroll();
     const std::vector<DetailFeature> list = GlassFeatures();
-    const int nameSize = std::max(11, g.L(19));
     if (list.empty())
     {
-        const std::wstring text = !searchQuery.empty() ? L"No matching modules."
+        const std::wstring text = !searchQuery.empty() ? L"No module matches “" + searchQuery + L"”."
                                   : modsTab == ModsTab::Quick ? L"Nothing pinned yet. Right-click a module to pin it here."
                                                               : L"No modules here yet.";
-        DrawTextSimple(hdc, g.x + g.L(130), g.y + g.L(130), text, c.muted, std::max(10, g.L(17)));
+        FontStyle semi(FW_SEMIBOLD);
+        DrawTextSimple(hdc, g.x + g.L(kMainX + 2), g.y + g.L(kCardTop + 6), text, c.muted, std::max(12, g.L(13)));
     }
+    const int titleSize = std::max(12, g.L(13)), statusSize = std::max(12, g.L(10));
     for (int pos = 0; pos < (int)list.size(); pos++)
     {
         const RECT row = GlassRowRect(g, pos);
         if (row.right <= row.left) continue;
         const DetailFeature f = list[pos];
-        const bool on = FeatureEnabled(f) && FeatureHasSwitch(f);
-        GlassBox(hdc, row, g.L(16), on ? GlassAccent() : c.fill, on ? kGlassAccentAlpha : c.fillA);
-        const int mid = (row.top + row.bottom) / 2;
-        int textX = row.left + g.L(20);
-        if (FeaturePinned(f))
+        const bool hasSwitch = FeatureHasSwitch(f);
+        const bool lit = FeatureEnabled(f) && hasSwitch;
+        if (lit)
+            GlassRingBox(hdc, row, g.L(kCardCut), c.side, c.sideA, GlassAccent(), kGlassAccentAlpha, std::max(1, g.L(1.4f)), OverlayAlpha::AllRound);
+        else
+            GlassRingBox(hdc, row, g.L(kCardCut), c.fill, c.fillA, c.line, 255, std::max(1, g.L(0.8f)), OverlayAlpha::AllRound);
+
+        // Icon square, top left.
+        const RECT tile = RECT{row.left + g.L(12), row.top + g.L(12), row.left + g.L(42), row.top + g.L(42)};
+        if (lit) DrawRoundBox(hdc, tile.left, tile.top, tile.right - tile.left - 1, tile.bottom - tile.top - 1, g.L(9), GlassAccent());
+        else GlassBox(hdc, tile, g.L(9), c.chip, c.chipA);
+        DrawModuleGlyph(hdc, f, (tile.left + tile.right) / 2.0f, (tile.top + tile.bottom) / 2.0f, (float)g.L(17), lit ? RGB(255,255,255) : c.icon);
+        if (hasSwitch)
+            DrawGlassSwitch(hdc, GlassSwitchRect(g, row), lit, c, false);
         {
-            DrawGlassIcon(hdc, GlassIcon::Pin, (float)row.left + g.L(32), (float)mid, (float)g.L(22), on ? RGB(255,255,255) : GlassAccent());
-            textX = row.left + g.L(58);
+            const RECT gear = GlassGearRect(g, row);
+            GlassBox(hdc, gear, g.L(8), c.chip, c.chipA);
+            DrawHomeIcon(hdc, HomeItem::Settings, (gear.left + gear.right) / 2.0f, (gear.top + gear.bottom) / 2.0f, (float)g.L(17), c.icon);
         }
-        DrawTextSimple(hdc, textX, mid - TextMiddle(hdc, nameSize), FeatureTitle(f), on ? RGB(255,255,255) : c.text, nameSize);
-        const RECT gear = GlassGearRect(g, row);
-        DrawHomeIcon(hdc, HomeItem::Settings, (gear.left + gear.right) / 2.0f, (gear.top + gear.bottom) / 2.0f, (float)g.L(26),
-                     on ? RGB(255,255,255) : c.muted);
-        if (FeatureHasSwitch(f))
-            DrawGlassSwitch(hdc, GlassSwitchRect(g, row), on, c);
+
+        // Name and status, bottom left (clear of the gear).
+        const int textX = row.left + g.L(13), maxW = GlassGearRect(g, row).left - g.L(4) - textX + g.L(12);
+        std::wstring name = CardTitle(f);
+        {
+            FontStyle bold(FW_BOLD);
+            while (name.size() > 2 && TextWidth(hdc, name, titleSize) > maxW - g.L(16)) name.pop_back();
+            if (name.size() < CardTitle(f).size()) { name.pop_back(); name += L"…"; }
+            DrawTextSimple(hdc, textX, row.bottom - g.L(40), name, c.text, titleSize);
+            if (FeaturePinned(f))
+                DrawGlassIcon(hdc, GlassIcon::Pin, textX + TextWidth(hdc, name, titleSize) + g.L(10), (float)row.bottom - g.L(32), (float)g.L(11),
+                              GlassAccent());
+        }
+        {
+            // Switched on: the OriginX star before "On".
+            FontStyle semi(FW_SEMIBOLD);
+            int sx = textX;
+            if (lit)
+            {
+                DrawBrandStar(hdc, sx + g.L(5), (float)row.bottom - g.L(21) + TextMiddle(hdc, statusSize), (float)g.L(11), GlassAccent());
+                sx += g.L(13);
+            }
+            DrawTextSimple(hdc, sx, row.bottom - g.L(21), ModuleStatus(f), lit ? GlassAccent() : c.muted, statusSize);
+        }
     }
 
-    // Scrollbar, when some rows are out of view.
-    const int rows = ((int)list.size() + 1) / 2;
-    if (rows > kGlassRows)
-    {
-        const RECT track = g.R(kGlassW - 30, 118, 6, kGlassRows * 68.0f - 12);
-        const int th = track.bottom - track.top, thumb = std::max(g.L(30), th * kGlassRows / rows);
-        const int top = track.top + (th - thumb) * featureScrollRow / (rows - kGlassRows);
-        DrawRoundBox(hdc, track.left, track.top, track.right - track.left - 1, th - 1, g.L(3), c.track);
-        DrawRoundBox(hdc, track.left, top, track.right - track.left - 1, thumb - 1, g.L(3), GlassAccent());
-    }
+    const int rows = ((int)list.size() + kGlassCols - 1) / kGlassCols;
+    DrawGlassScrollbar(hdc, g, c, kCardTop, kGlassRows * kCardPitch - (kCardPitch - kModCardH), featureScrollRow, rows, kGlassRows);
 }
 
 // Close, back and the left icon column of any glass page. True = handled.
@@ -11436,11 +13226,13 @@ void HandleGlassClick(int mx, int my, bool right)
         partyAddingPlayer = false;
         if (right)
             TogglePin(list[pos]);
-        else if (ContainsPoint(GlassGearRect(g, row), mx, my) || !FeatureHasSwitch(list[pos]))
-            detailFeature = list[pos];
-        else
+        else if (FeatureHasSwitch(list[pos]) && [&]() { RECT sw = GlassSwitchRect(g, row); InflateRect(&sw, g.L(10), g.L(10));
+                                                         return ContainsPoint(sw, mx, my) != 0; }())
             ToggleFeature(list[pos]);
-        return;
+        else if ([&]() { RECT gear = GlassGearRect(g, row); InflateRect(&gear, g.L(6), g.L(6));
+                         return ContainsPoint(gear, mx, my) != 0; }())
+            detailFeature = list[pos];   // only the gear opens the module's settings (2026-11-03 user request)
+        return;                          // the rest of the tile does nothing
     }
     if (right)
         return;
@@ -11482,6 +13274,7 @@ struct GlassSetting
     std::function<int()> chosen;              // Colors / Choice
     std::function<void(int)> choose;          // Colors / Choice; Text: its button
     DetailFeature keyOf = DetailFeature::None;   // Key: whose shortcut
+    int keySlot = -1;                         // Key: a Command Hotkeys line (-1 = the module's own key)
     bool dim = false;                         // only matters while another switch is on
     bool indent = false;                      // belongs to the row above
     std::function<bool()> lit;                // the row is drawn in the accent colour (in use)
@@ -11489,6 +13282,7 @@ struct GlassSetting
     std::function<void()> toggleExpand;       // ...and the button opens / closes them
     std::function<void(HDC, const GlassRowCtx&)> draw;                 // Custom: the right-hand part
     std::function<bool(HWND, const GlassRowCtx&, int, int, bool)> click; // Custom: true = handled
+    float pitch = 0;                          // the row's height in layout units (0 = the usual)
 };
 struct GlassLayout;
 struct GlassRowCtx { const GlassLayout& g; const RECT& row; const GlassColors& c; bool lit; };
@@ -11497,9 +13291,9 @@ int glassRowScroll = 0;        // first visible row
 bool glassToFrameGen = false;  // the next Optimization page shown starts at its Frame Generation part
 int hiveOpen = 0;              // Hive Utils: whose settings are open under its switch (bits: 1 party, 2 auto RQ, 4 stats)
 int glassSliderDrag = -1;      // row whose slider is being dragged (-1 = none)
-constexpr float kGlassRowTop = 118, kGlassRowBottom = kGlassH - 22, kGlassRowPitch = 66, kGlassRowGap = 8;
+constexpr float kGlassRowTop = 116, kGlassRowBottom = kGlassH - 18, kGlassRowPitch = 50, kGlassRowGap = 0;
 
-float GlassRowPitch(const GlassSetting& s) { return s.kind == GlassRowKind::Header ? 38.0f : kGlassRowPitch; }
+float GlassRowPitch(const GlassSetting& s) { return s.pitch > 0 ? s.pitch : s.kind == GlassRowKind::Header ? 34.0f : kGlassRowPitch; }
 
 GlassSetting SwitchSetting(const std::wstring& label, const std::wstring& note, bool& flag)
 {
@@ -11729,9 +13523,10 @@ void DrawGlassTrash(HDC hdc, const RECT& r, bool armed, const GlassColors& c)
 // A small boxed button inside a custom row.
 void DrawGlassSmallButton(HDC hdc, const GlassLayout& g, const RECT& r, const std::wstring& text, bool accent, const GlassColors& c)
 {
-    GlassBox(hdc, r, g.L(10), accent ? GlassAccent() : c.panel, accent ? kGlassAccentAlpha : c.panelA);
+    GlassBox(hdc, r, g.L(5), accent ? GlassAccent() : c.chip, accent ? kGlassAccentAlpha : c.chipA);
+    FontStyle semi(FW_SEMIBOLD);
     DrawTextCentered(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top, text, accent ? RGB(255,255,255) : c.text,
-                     std::max(10, g.L(15)));
+                     std::max(12, g.L(11)));
 }
 
 // "Background" of a HUD module: Black (a solid dark box), Translucent (the game shows through it), Frame only
@@ -11853,13 +13648,16 @@ std::vector<GlassSetting> GlassSettings()
     std::vector<GlassSetting> rows;
     if (selectedCategory == MenuCategory::Settings)
     {
+        rows.push_back(HeaderSetting(L"General"));
         rows.push_back(KeySetting(DetailFeature::MenuOpen));   // the menu key lives here, not in Mods
-        rows.push_back(SwitchSetting(L"Dark mode", L"Dark glass instead of light (also the moon / sun button)", glassDark));
+        rows.push_back(HeaderSetting(L"Appearance"));
+        rows.push_back(SwitchSetting(L"Dark mode", L"Also the moon / sun button at the top", glassDark));
         PaletteWithPicker(rows, L"Accent color", kGlassAccents, kGlassAccentCount, glassAccentIndex, 0);
         PaletteWithPicker(rows, L"Light mode color", kGlassLightTints, kGlassLightCount, glassLightIndex, 1);
         PaletteWithPicker(rows, L"Dark mode color", kGlassDarkTints, kGlassDarkCount, glassDarkIndex, 2);
         rows.push_back(PercentSlider(L"Drop shadow strength", L"The shadow around the menu panel", glassShadow, 0, 100));
         rows.push_back(PercentSlider(L"UI opacity", L"How solid the glass is", glassOpacity, 20, 100));
+        rows.push_back(HeaderSetting(L"HUD"));
         rows.push_back(ButtonSetting(L"Edit HUD", L"Move and resize the in-game HUD", L"Open", []() { OpenHudEditor(); }));
         rows.push_back(ButtonSetting(L"Reset HUD layout", L"Every HUD element back to its first place", L"Reset", []() { ResetHudLayout(); }));
         return rows;
@@ -11997,7 +13795,34 @@ std::vector<GlassSetting> GlassSettings()
         CounterSettings(rows, HudElementId::Resources, resourceBackground, resourceTranslucent, resourceCounterEnabled);
         break;
     case DetailFeature::Keystrokes:
-        rows.push_back(InfoSetting(L"Keys", L"W / A / S / D"));
+        {
+            // The keys it shows, as key caps.
+            GlassSetting keys;
+            keys.kind = GlassRowKind::Custom;
+            keys.label = L"Keys";
+            keys.note = L"Movement, jump and mouse buttons";
+            keys.draw = [](HDC hdc, const GlassRowCtx& x)
+            {
+                static const wchar_t* const caps[4] = {L"W", L"A", L"S", L"D"};
+                const int d = x.g.L(26), gap = x.g.L(6), cy = (x.row.top + x.row.bottom) / 2;
+                FontStyle bold(FW_BOLD);
+                for (int i = 0; i < 4; i++)
+                {
+                    const int left = x.row.right - x.g.L(20) - (4 - i) * d - (3 - i) * gap;
+                    const RECT r{left, cy - d / 2, left + d, cy - d / 2 + d};
+                    // A key cap: a darker bottom edge under a light top.
+                    const int edge = std::max(2, x.g.L(2)), rad = x.g.L(5);
+                    DrawRoundBox(hdc, r.left, r.top, d - 1, d - 1, rad, glassDark ? RGB(24,28,40) : RGB(196,204,220));
+                    DrawRoundBox(hdc, r.left + 1, r.top + 1, d - 3, d - 3 - edge, rad, glassDark ? RGB(58,66,88) : RGB(253,254,255));
+                    // On a solid cap: not noted as text on glass (its light pixels would be made see-through).
+                    const bool tracking = inkTracking;
+                    inkTracking = false;
+                    DrawTextCentered(hdc, r.left, r.top, d, d - std::max(2, x.g.L(2)), caps[i], x.c.text, std::max(12, x.g.L(11)));
+                    inkTracking = tracking;
+                }
+            };
+            rows.push_back(keys);
+        }
         break;
     case DetailFeature::CPS:
         rows.push_back(InfoSetting(L"Counting", L"Left and right clicks are counted separately"));
@@ -12054,6 +13879,134 @@ std::vector<GlassSetting> GlassSettings()
             return !dayTimerEnabled ? 0 : MinecraftDataProvider::GetWorldClock(time, moving) && moving ? 1 : 2;
         }));
         rows.push_back(SwitchSetting(L"Show both", L"Time until night and until morning (off: only the next one)", dayTimerBoth));
+        break;
+    case DetailFeature::Coordinates:
+        rows.push_back(SwitchSetting(L"Decimals", L"One decimal (off: the block you stand in)", coordinatesDecimals));
+        rows.push_back(SwitchSetting(L"Facing", L"A second line with the way you face", coordinatesFacing));
+        break;
+    case DetailFeature::Timer:
+    {
+        const auto numberSlider = [](const wchar_t* label, const wchar_t* note, int& value, int low, int high,
+                                     std::function<std::wstring(int)> show)
+        {
+            GlassSetting r;
+            r.kind = GlassRowKind::Slider;
+            r.label = label;
+            r.note = note;
+            r.value = [&value, low, high]() { return (value - low) / (float)(high - low); };
+            r.setValue = [&value, low, high](float t) { value = low + (int)std::lround(t * (high - low)); };
+            r.text = [&value, show]() { return show(value); };
+            return r;
+        };
+        rows.push_back(InfoSetting(L"Now", L"Runs on while the menu is open", []()
+        {
+            if (!timerEnabled) return std::wstring(L"Off");
+            const std::wstring t = TimerText();
+            if (timerDoneAt && timerMode == 0) return L"Time is up (" + t + L")";
+            return timerClock.running ? L"Running: " + t : timerClock.Fresh() ? L"Ready: " + t : L"Paused: " + t;
+        }, []() { return !timerEnabled ? 0 : timerDoneAt && timerMode == 0 ? 3 : timerClock.running ? 1 : 2; }));
+        GlassSetting startPause = ButtonSetting(L"Start / Pause", L"Starts the clock, or pauses it where it is", L"Start", []() { TimerStartPause(); });
+        startPause.text = []() { return timerClock.running ? std::wstring(L"Pause") : std::wstring(L"Start"); };
+        rows.push_back(startPause);
+        rows.push_back(ButtonSetting(L"Reset", L"Back to the start (the countdown's full length, the stopwatch's 0:00.0)", L"Reset", []() { TimerReset(); }));
+        rows.push_back(ChoiceSetting(L"Mode", L"Timer counts down, Stopwatch counts up", {L"Timer", L"Stopwatch"},
+                                     []() { return timerMode; }, [](int i) { if (i != timerMode) { timerMode = i; TimerReset(); } SaveConfig(); }));
+        if (timerMode == 0)
+        {
+            rows.push_back(numberSlider(L"Minutes", L"The countdown's length", timerMinutes, 0, 60,
+                                        [](int v) { return std::to_wstring(v) + L" min"; }));
+            rows.push_back(numberSlider(L"Seconds", L"...and seconds (at least 1 second in all)", timerSeconds, 0, 59,
+                                        [](int v) { return std::to_wstring(v) + L" s"; }));
+            rows.push_back(SwitchSetting(L"Blink", L"The time blinks red when it runs out", timerFlash));
+            rows.push_back(SwitchSetting(L"Sound", L"Three beeps when it runs out", timerSound));
+        }
+        rows.push_back(HeaderSetting(L"Keys"));
+        for (int i = 0; i < 2; i++)
+        {
+            GlassSetting key;
+            key.kind = GlassRowKind::Key;
+            key.label = i == 0 ? L"Start / Pause key" : L"Reset key";
+            key.note = L"Works while playing (not in the chat or a menu). Right-click to clear";
+            key.keyOf = DetailFeature::Timer;
+            key.keySlot = i;
+            rows.push_back(key);
+        }
+        break;
+    }
+    case DetailFeature::CpsLimiter:
+    {
+        const auto cpsSlider = [](const wchar_t* label, const wchar_t* note, int& value)
+        {
+            GlassSetting r;
+            r.kind = GlassRowKind::Slider;
+            r.label = label;
+            r.note = note;
+            r.value = [&value]() { return value / 30.0f; };
+            r.setValue = [&value](float t) { value = (int)std::lround(t * 30); };
+            r.text = [&value]() { return value == 0 ? std::wstring(L"No limit") : std::to_wstring(value) + L" CPS"; };
+            return r;
+        };
+        rows.push_back(cpsSlider(L"Left max", L"Left-click presses let through in any second (0: no limit)", cpsLimitLeft));
+        rows.push_back(cpsSlider(L"Right max", L"Right-click presses let through in any second (0: no limit)", cpsLimitRight));
+        rows.push_back(InfoSetting(L"Now", L"Only while you play in a world; menus, chat and inventory are never limited", []()
+        {
+            if (!cpsLimiterEnabled) return std::wstring(L"Off");
+            const std::wstring held = L"held back: left " + std::to_wstring(cpsHeldBackLeft.load()) + L", right " +
+                                      std::to_wstring(cpsHeldBackRight.load());
+            return (cpsLimiterHooked.load() ? L"Limiting, " : L"Waiting (play in a world), ") + held;
+        }, []() { return !cpsLimiterEnabled ? 0 : cpsLimiterHooked.load() ? 1 : 2; }));
+        break;
+    }
+    case DetailFeature::PackDisplay:
+        rows.push_back(SwitchSetting(L"Show icons", L"Each pack's picture next to its name", packDisplayIcons));
+        rows.push_back(InfoSetting(L"Packs", L"The global packs from the Textures page (a server's own pack is not listed)", []()
+        {
+            const size_t n = PackDisplayRows().size();
+            if (n == 1 && PackDisplayRows()[0].isDefault) return std::wstring(L"Default textures");
+            return std::to_wstring(n) + (n == 1 ? L" pack on" : L" packs on");
+        }, []() { return 1; }));
+        break;
+    case DetailFeature::ItemCounter:
+        rows.push_back(SwitchSetting(L"Show stacks", L"Also say how many stacks the total is", itemCounterStacks));
+        rows.push_back(InfoSetting(L"How", L"Open your inventory or a chest, point at an item and hold Alt", []()
+        {
+            if (!itemCounterEnabled) return std::wstring(L"Off");
+            return MinecraftDataProvider::ItemCounterReady() ? std::wstring(L"Ready") : std::wstring(L"Waiting (needs the updated DLL)");
+        }, []() { return !itemCounterEnabled ? 0 : MinecraftDataProvider::ItemCounterReady() ? 1 : 2; }));
+        break;
+    case DetailFeature::CommandHotkeys:
+        rows.push_back(InfoSetting(L"Last sent", L"Lines starting with / are sent as commands. Keys work while playing, not in the chat",
+                                   []() { return !commandHotkeysEnabled ? std::wstring(L"Off")
+                                                 : commandHotkeyStatus.empty() ? std::wstring(L"Nothing yet") : commandHotkeyStatus; },
+                                   []() { return !commandHotkeysEnabled ? 0 : commandHotkeyStatus.empty() ? 0 : commandHotkeyTone; }));
+        for (int i = 0; i < kCommandHotkeyCount; i++)
+        {
+            GlassSetting line;
+            line.kind = GlassRowKind::Text;
+            line.label = L"Line " + std::to_wstring(i + 1);
+            line.note = commandHotkeyEditing == i ? L"Type the line, Enter to save (Ctrl+V pastes)" : L"e.g. /hub or gg";
+            line.text = [i]()
+            {
+                const std::wstring& t = commandHotkeys[i].text;
+                return t.size() > 34 ? L"\u2026" + t.substr(t.size() - 33) : t;
+            };
+            line.on = [i]() { return commandHotkeyEditing == i; };
+            line.press = [i]() { commandHotkeyEditing = i; };
+            if (!commandHotkeys[i].text.empty())
+            {
+                line.options = {L"Clear"};
+                line.choose = [i](int) { commandHotkeys[i].text.clear(); commandHotkeyEditing = -1; SaveConfig(); };
+            }
+            rows.push_back(line);
+            GlassSetting key;
+            key.kind = GlassRowKind::Key;
+            key.label = L"Key";
+            key.note = L"Types line " + std::to_wstring(i + 1) + L". Right-click to clear";
+            key.keyOf = DetailFeature::CommandHotkeys;
+            key.keySlot = i;
+            key.indent = true;
+            rows.push_back(key);
+        }
         break;
     case DetailFeature::BlockDetails:
         rows.push_back(InfoSetting(L"Now", L"The block your crosshair is on, in a world or server", []()
@@ -12152,8 +14105,8 @@ std::vector<GlassSetting> GlassSettings()
         }
         break;
     case DetailFeature::Lite:
+        FrameGenRows(rows);   // first, right under Optimization's own switch (2026-11-03 user request)
         LiteSettings(rows);
-        FrameGenRows(rows);
         break;
     case DetailFeature::FastInventory:
         rows.push_back(InfoSetting(L"Screen animation", L"Takes effect after the game reloads packs. A server's UI pack can override it",
@@ -12196,6 +14149,26 @@ std::vector<GlassSetting> GlassSettings()
         HudBoxSettings(rows, HudElementId::DayTimer, dayTimerEnabled);
         HudColorRows(rows, HudElementId::DayTimer, L"Default: white (the second line grey)", HudBoxOn(HudElementId::DayTimer));
         break;
+    case DetailFeature::JavaChat:
+        rows.push_back(InfoSetting(L"JAVAチャット", L"HUD調整で移動できます。標準の入力画面はそのまま使えます。", []() {
+            return !javaChatEnabled ? std::wstring(L"Off") : MinecraftDataProvider::JavaChatReady() ?
+                std::wstring(L"標準欄を置換") : std::wstring(L"準備待ち・標準表示を維持");
+        }));
+        HudBoxSettings(rows, HudElementId::JavaChat, javaChatEnabled);
+        HudColorRows(rows, HudElementId::JavaChat, L"Default: white", HudBoxOn(HudElementId::JavaChat));
+        break;
+    case DetailFeature::PackDisplay:
+        HudBoxSettings(rows, HudElementId::PackDisplay, packDisplayEnabled);
+        HudColorRows(rows, HudElementId::PackDisplay, L"Default: white (the subpack grey)", HudBoxOn(HudElementId::PackDisplay));
+        break;
+    case DetailFeature::Timer:
+        HudBoxSettings(rows, HudElementId::Timer, timerEnabled);
+        HudColorRows(rows, HudElementId::Timer, L"Default: white (grey while paused, red when time is up)", HudBoxOn(HudElementId::Timer));
+        break;
+    case DetailFeature::Coordinates:
+        HudBoxSettings(rows, HudElementId::Coordinates, coordinatesEnabled);
+        HudColorRows(rows, HudElementId::Coordinates, L"Default: white (the facing line grey)", HudBoxOn(HudElementId::Coordinates));
+        break;
     case DetailFeature::BlockDetails:
         HudBoxSettings(rows, HudElementId::BlockDetails, blockDetailsEnabled);
         HudColorRows(rows, HudElementId::BlockDetails, L"Default: white name, blue source", HudBoxOn(HudElementId::BlockDetails));
@@ -12219,6 +14192,12 @@ std::vector<GlassSetting> GlassSettings()
         HudColorRows(rows, HudElementId::FeatureList, L"Default: the menu's text color", HudBoxOn(HudElementId::FeatureList));
         break;
     case DetailFeature::TabList:
+        rows.push_back(InfoSetting(L"Now", L"Hold the Tab List key while playing to show the list", []()
+        {
+            if (!tabListEnabled) return std::wstring(L"Off");
+            if (!shortcuts.tabList) return std::wstring(L"No key set");
+            return L"Hold " + KeyName(shortcuts.tabList) + L" to show it";
+        }, []() { return !tabListEnabled || !shortcuts.tabList ? 0 : 1; }));
         HudBoxSettings(rows, HudElementId::TabList, tabListEnabled);
         HudColorRows(rows, HudElementId::TabList, L"Default: headers in the accent color", HudBoxOn(HudElementId::TabList));
         break;
@@ -12231,7 +14210,7 @@ std::vector<GlassSetting> GlassSettings()
 }
 
 // Optimization: the same rows as before (LiteRows), as glass rows.
-// Frame Generation, at the end of the Optimization page (2026-10-28: "no need to keep it apart"). It keeps its own
+// Frame Generation, at the top of the Optimization page (2026-10-28: "no need to keep it apart"; moved up 2026-11-03). It keeps its own
 // switch, key and settings, and runs only while Optimization is on too (FrameGenActive).
 bool FrameGenActive() { return liteEnabled && frameGenEnabled; }
 
@@ -12253,8 +14232,13 @@ void FrameGenRows(std::vector<GlassSetting>& rows)
         if (!liteEnabled) return std::wstring(L"Off (switch Optimization on)");
         if (!MinecraftDataProvider::GetFrameGen(shown, state)) return std::wstring(L"Waiting (needs the updated DLL)");
         if (state == MyClientFeatures::FrameGenRunning)
+        {
+            uint32_t now = 0, fits = 0;
+            const bool reach = MinecraftDataProvider::GetFrameGenReach(now, fits);
             return std::to_wstring(std::lround(shown)) + L" FPS shown" +
-                   (MinecraftDataProvider::GetFps(game) ? L" (game " + std::to_wstring(std::lround(game)) + L")" : std::wstring());
+                   (MinecraftDataProvider::GetFps(game) ? L" (game " + std::to_wstring(std::lround(game)) + L")" : std::wstring()) +
+                   (reach ? L", really x" + std::to_wstring(now) : std::wstring());
+        }
         if (state == MyClientFeatures::FrameGenPaused) return std::wstring(L"Paused (menu, loading or a hitch)");
         if (state == MyClientFeatures::FrameGenUnavailable) return std::wstring(L"Unavailable on this PC");
         return std::wstring(L"Waiting for the game");
@@ -12270,11 +14254,18 @@ void FrameGenRows(std::vector<GlassSetting>& rows)
         GlassSetting multiplier;
         multiplier.kind = GlassRowKind::Slider;
         multiplier.label = L"Multiplier";
-        multiplier.note = L"Shown FPS = the game's FPS x this, as far as the GPU keeps up";
+        multiplier.note = L"An upper limit: only as many extra frames as fit in each game frame are made";
         const int high = (int)MyClientFeatures::FrameGenMaxMultiplier;
         multiplier.value = [high]() { return (frameGenMultiplier - 2) / (float)(high - 2); };
         multiplier.setValue = [high](float t) { frameGenMultiplier = std::clamp(2 + (int)std::lround(t * (high - 2)), 2, high); };
-        multiplier.text = []() { return L"x" + std::to_wstring(frameGenMultiplier); };
+        multiplier.text = []()
+        {
+            std::wstring text = L"x" + std::to_wstring(frameGenMultiplier);
+            uint32_t shown = 0, fits = 0;
+            if (FrameGenActive() && MinecraftDataProvider::GetFrameGenReach(shown, fits))
+                text += L"  (now x" + std::to_wstring(shown) + (fits ? L", fits x" + std::to_wstring(fits) : std::wstring()) + L")";
+            return text;
+        };
         rows.push_back(multiplier);
     }
     rows.push_back(ChoiceSetting(L"Method", L"Repeat only: the lightest, for testing", {L"Motion", L"Blend", L"Repeat"},
@@ -12356,6 +14347,449 @@ void LiteSettings(std::vector<GlassSetting>& rows)
 // Textures: the buttons and the state, then one row per pack (Default textures first): click to add it on
 // top of the stack or take it out; #n, move up / down, a gear for its subpacks (their rows open under it) and
 // a trash button. Changes wait for Done.
+COLORREF GlassTone(int tone, const GlassColors& c);   // defined with the glass rows
+
+// ---- Textures page: two lists like the game's own resource pack screen (2026-11-03) ----------------------------
+// Left "Available" (packs not in use, A-Z), right "Active" (the edited stack, top = highest priority). Clicking a
+// card moves it to the other list; changes wait for Done (texPendingStack / ApplyPendingTextures) like before.
+int texAvailScroll = 0, texActiveScroll = 0;   // first item shown in each list
+constexpr float kTexCardH = 52, kTexSubH = 30, kTexItemGap = 6, kTexHeadH = 30, kTexFootH = 40, kTexPad = 12;
+
+struct TexItem { int pack = -1; bool sub = false; std::string subpack; };   // pack = index in texState.packs
+
+int TexPackIndex(const std::string& uuid)
+{
+    for (int i = 0; i < (int)texState.packs.size(); i++)
+        if (texState.packs[i].uuid == uuid) return i;
+    return -1;
+}
+std::vector<TexItem> TexAvailItems()
+{
+    std::vector<TexItem> items;
+    const auto& stack = TexShownStack();
+    for (int i = 0; i < (int)texState.packs.size(); i++)
+        if (TexStackPos(stack, texState.packs[i].uuid) < 0) items.push_back(TexItem{i, false, std::string()});
+    return items;
+}
+// Active packs in priority order; under the pack whose subpack list is open, one line per subpack.
+std::vector<TexItem> TexActiveItems()
+{
+    std::vector<TexItem> items;
+    for (const auto& e : TexShownStack())
+    {
+        const int i = TexPackIndex(e.uuid);
+        if (i < 0) continue;
+        items.push_back(TexItem{i, false, std::string()});
+        const TexturePacks::Pack& p = texState.packs[i];
+        if (!p.subpacks.empty() && texSubpackFor == p.folder.wstring())
+            for (const auto& sp : p.subpacks) items.push_back(TexItem{i, true, sp.folder});
+    }
+    return items;
+}
+float TexItemH(const TexItem& t) { return t.sub ? kTexSubH : kTexCardH; }
+
+struct TexParts { RECT avail, active, availList, activeList, foot; };
+TexParts TexPickerParts(const GlassLayout& g, const RECT& row)
+{
+    const int pad = g.L(kTexPad), mid = (row.left + row.right) / 2, half = g.L(6);
+    const int top = row.top + pad, bottom = row.bottom - pad - g.L(kTexFootH);
+    TexParts t;
+    t.avail = RECT{row.left + pad, top, mid - half, bottom};
+    t.active = RECT{mid + half, top, row.right - pad, bottom};
+    t.availList = RECT{t.avail.left, top + g.L(kTexHeadH), t.avail.right, bottom};
+    t.activeList = RECT{t.active.left, top + g.L(kTexHeadH), t.active.right, bottom};
+    t.foot = RECT{row.left + pad, bottom + g.L(6), row.right - pad, row.bottom - pad};
+    return t;
+}
+// The last first item that still shows the end of the list.
+int TexMaxScroll(const GlassLayout& g, const RECT& list, const std::vector<TexItem>& items)
+{
+    int used = 0, first = (int)items.size();
+    while (first > 0 && used + g.L(TexItemH(items[first - 1])) <= list.bottom - list.top)
+        used += g.L(TexItemH(items[--first]) + kTexItemGap);
+    return first;
+}
+// Where each item is drawn (an empty RECT when it is scrolled out of view).
+std::vector<RECT> TexItemRects(const GlassLayout& g, const RECT& list, const std::vector<TexItem>& items, int& scroll)
+{
+    scroll = std::clamp(scroll, 0, TexMaxScroll(g, list, items));
+    std::vector<RECT> rects(items.size(), RECT{0, 0, 0, 0});
+    int y = list.top;
+    for (int i = scroll; i < (int)items.size(); i++)
+    {
+        const int h = g.L(TexItemH(items[i]));
+        if (y + h > list.bottom) break;
+        const int indent = items[i].sub ? g.L(52) : 0;
+        rects[i] = RECT{list.left + indent, y, list.right, y + h};
+        y += h + g.L(kTexItemGap);
+    }
+    return rects;
+}
+// Buttons at a card's right end, i = 0 the rightmost.
+RECT TexCardButton(const GlassLayout& g, const RECT& card, int i)
+{
+    const int size = g.L(26), gap = g.L(6), cy = (card.top + card.bottom) / 2, right = card.right - g.L(10) - i * (size + gap);
+    return RECT{right - size, cy - size / 2, right, cy - size / 2 + size};
+}
+// Active card buttons from the right: [gear (packs with subpacks)] [down] [up].
+int TexGearSlot(const TexturePacks::Pack& p) { return p.subpacks.empty() ? -1 : 0; }
+int TexMoveSlot(const TexturePacks::Pack& p, bool up) { return (p.subpacks.empty() ? 0 : 1) + (up ? 1 : 0); }
+
+// `text` cut to `width` pixels with "..." at the end when it does not fit.
+std::wstring TexFit(HDC hdc, const std::wstring& text, int size, int width)
+{
+    if (TextWidth(hdc, text, size) <= width) return text;
+    std::wstring cut = text;
+    while (!cut.empty() && TextWidth(hdc, cut + L"…", size) > width) cut.pop_back();
+    while (!cut.empty() && cut.back() == L' ') cut.pop_back();
+    return cut + L"…";
+}
+// Up to `lines` lines of `text` in `width` pixels (breaks at a space when there is one; Japanese breaks anywhere).
+std::vector<std::wstring> TexWrap(HDC hdc, const std::wstring& text, int size, int width, int lines)
+{
+    std::vector<std::wstring> out;
+    size_t at = 0;
+    while (at < text.size() && (int)out.size() < lines)
+    {
+        while (at < text.size() && text[at] == L' ') at++;
+        if ((int)out.size() == lines - 1) { out.push_back(TexFit(hdc, text.substr(at), size, width)); break; }
+        size_t end = at;
+        while (end < text.size() && TextWidth(hdc, text.substr(at, end - at + 1), size) <= width) end++;
+        if (end < text.size())
+        {
+            const size_t space = text.rfind(L' ', end);
+            if (space != std::wstring::npos && space > at) end = space;
+        }
+        if (end == at) end = at + 1;
+        out.push_back(text.substr(at, end - at));
+        at = end;
+    }
+    return out;
+}
+
+ItemIcons::FileCache& TexPackIcons() { static ItemIcons::FileCache cache; return cache; }
+// The pack's picture (pack_icon.png), or a tile with its first letter.
+void DrawTexPackIcon(HDC hdc, const GlassLayout& g, const GlassColors& c, const std::filesystem::path& file, const std::wstring& name,
+                     int x, int y, int size)
+{
+    if (const ItemIcons::Icon* icon = file.empty() ? nullptr : TexPackIcons().Get(file, std::max(16, size)))
+    {
+        ItemIcons::Draw(hdc, *icon, x, y, size);
+        return;
+    }
+    GlassBox(hdc, RECT{x, y, x + size, y + size}, g.L(8), c.chip, c.chipA);
+    const std::wstring letter = name.empty() ? L"?" : std::wstring(1, (wchar_t)towupper(name[0]));
+    FontStyle bold(FW_BOLD);
+    DrawTextCentered(hdc, x, y, size, size, letter, c.muted, std::max(12, size / 2));
+}
+std::filesystem::path VanillaPackIcon()
+{
+    const std::wstring game = MinecraftDataProvider::GameTextureDirectory();
+    return game.empty() ? std::filesystem::path() : std::filesystem::path(game) / L"data" / L"resource_packs" / L"vanilla" / L"pack_icon.png";
+}
+
+// One pack card: icon, name, description (2 lines), the controls on the right.
+void DrawTexCard(HDC hdc, const GlassLayout& g, const GlassColors& c, const RECT& r, const TexturePacks::Pack& p, int pos, int count)
+{
+    const bool active = pos >= 0;
+    GlassBox(hdc, r, g.L(10), c.panel, c.panelA);
+    if (active)
+        DrawRoundBox(hdc, r.left + g.L(4), r.top + g.L(12), std::max(2, g.L(3)) - 1, r.bottom - r.top - g.L(24) - 1, g.L(1), GlassAccent());
+    const int icon = g.L(kTexCardH - 14), ix = r.left + g.L(12), iy = (r.top + r.bottom - icon) / 2;
+    DrawTexPackIcon(hdc, g, c, p.folder / L"pack_icon.png", Utf8ToWide(p.name), ix, iy, icon);
+
+    int buttons = 1;   // the trash (available) or the moves / gear (active)
+    if (active) buttons = (count > 1 ? 2 : 0) + (p.subpacks.empty() ? 0 : 1);
+    const int textX = ix + icon + g.L(10);
+    const int textR = (buttons ? TexCardButton(g, r, buttons - 1).left : r.right) - g.L(8) - (active ? g.L(26) : 0);
+    const int nameSize = std::max(12, g.L(12.5f)), noteSize = std::max(11, g.L(10));
+    const std::wstring description = Utf8ToWide(p.description);
+    std::vector<std::wstring> lines;
+    {
+        FontStyle semi(FW_SEMIBOLD);
+        lines = TexWrap(hdc, description, noteSize, textR - textX, 2);
+    }
+    if (!p.subpacks.empty())
+    {
+        const std::wstring sub = L"Subpack: " + TexSubpackLabel(p, TexSubpackChosen(p));
+        if (lines.size() > 1) lines.resize(1);
+        lines.push_back(sub);
+    }
+    const int lineH = noteSize + g.L(2);
+    const int blockH = nameSize + g.L(3) + (int)lines.size() * lineH;
+    int y = (r.top + r.bottom - blockH) / 2;
+    {
+        FontStyle bold(FW_BOLD);
+        DrawTextSimple(hdc, textX, y, TexFit(hdc, Utf8ToWide(p.name), nameSize, textR - textX), c.text, nameSize);
+    }
+    y += nameSize + g.L(3);
+    {
+        FontStyle semi(FW_SEMIBOLD);
+        for (const auto& line : lines)
+        {
+            DrawTextSimple(hdc, textX, y, line, c.muted, noteSize);
+            y += lineH;
+        }
+    }
+
+    if (!active)
+    {
+        DrawGlassTrash(hdc, TexCardButton(g, r, 0), TexDeleteArmed(p), c);
+        return;
+    }
+    // #priority, then [up][down] [gear]
+    const RECT left = TexCardButton(g, r, std::max(0, buttons - 1));
+    {
+        FontStyle bold(FW_BOLD);
+        const std::wstring n = L"#" + std::to_wstring(pos + 1);
+        const int size = std::max(11, g.L(11));
+        DrawTextSimple(hdc, (buttons ? left.left : r.right - g.L(10)) - g.L(6) - TextWidth(hdc, n, size), (r.top + r.bottom) / 2 - TextMiddle(hdc, size),
+                       n, pos == 0 ? GlassAccent() : c.muted, size);
+    }
+    if (count > 1)
+        for (const bool up : {true, false})
+        {
+            const RECT m = TexCardButton(g, r, TexMoveSlot(p, up));
+            const bool can = up ? pos > 0 : pos + 1 < count;
+            GlassBox(hdc, m, g.L(8), c.chip, c.chipA);
+            DrawChevron(hdc, (m.left + m.right) / 2, (m.top + m.bottom) / 2, up, can ? c.text : c.muted, std::max(3, g.L(4)));
+        }
+    if (TexGearSlot(p) >= 0)
+    {
+        const RECT m = TexCardButton(g, r, TexGearSlot(p));
+        const bool open = texSubpackFor == p.folder.wstring();
+        GlassBox(hdc, m, g.L(8), open ? GlassAccentLight() : c.chip, open ? kGlassAccentAlpha : c.chipA);
+        DrawHomeIcon(hdc, HomeItem::Settings, (m.left + m.right) / 2.0f, (m.top + m.bottom) / 2.0f, (float)g.L(18), c.text);
+    }
+}
+
+void DrawTexSubpack(HDC hdc, const GlassLayout& g, const GlassColors& c, const RECT& r, const TexturePacks::Pack& p, const std::string& folder)
+{
+    const bool chosen = TexSubpackChosen(p) == folder;
+    GlassBox(hdc, r, g.L(8), chosen ? GlassAccent() : c.panel, chosen ? kGlassAccentAlpha : c.panelA);
+    const int size = std::max(11, g.L(11));
+    FontStyle semi(FW_SEMIBOLD);
+    DrawTextSimple(hdc, r.left + g.L(12), (r.top + r.bottom) / 2 - TextMiddle(hdc, size),
+                   TexFit(hdc, TexSubpackLabel(p, folder), size, r.right - r.left - g.L(24)), chosen ? RGB(255,255,255) : c.text, size);
+}
+
+void DrawTexColumnHead(HDC hdc, const GlassLayout& g, const GlassColors& c, const RECT& col, const std::wstring& title, size_t count)
+{
+    std::wstring caps = title;
+    for (wchar_t& ch : caps) ch = (wchar_t)towupper(ch);
+    const int size = std::max(8, g.L(12));
+    DrawCaps(hdc, col.left + g.L(4), col.top + g.L(8), caps + L"  " + std::to_wstring(count), c.muted, size, g.L(2));
+}
+
+// A thin scrollbar at a list's right edge when it does not fit.
+void DrawTexListBar(HDC hdc, const GlassLayout& g, const GlassColors& c, const RECT& list, int scroll, int maxScroll)
+{
+    if (maxScroll <= 0) return;
+    const int h = list.bottom - list.top, thumb = std::max(g.L(24), h / (maxScroll + 1));
+    const int y = list.top + (h - thumb) * scroll / maxScroll;
+    GlassBox(hdc, RECT{list.right + g.L(2), y, list.right + g.L(5), y + thumb}, g.L(2), c.muted, 160);
+}
+
+void DrawTexPicker(HDC hdc, const GlassRowCtx& x)
+{
+    const GlassLayout& g = x.g;
+    const GlassColors& c = x.c;
+    const TexParts t = TexPickerParts(g, x.row);
+    const auto& stack = TexShownStack();
+
+    const std::vector<TexItem> avail = TexAvailItems(), active = TexActiveItems();
+    DrawTexColumnHead(hdc, g, c, t.avail, L"Available", avail.size());
+    DrawTexColumnHead(hdc, g, c, t.active, L"Active", stack.size());
+    {
+        const int size = std::max(11, g.L(10));
+        const std::wstring hint = L"Top wins";
+        FontStyle semi(FW_SEMIBOLD);
+        DrawTextSimple(hdc, t.active.right - g.L(4) - TextWidth(hdc, hint, size), t.active.top + g.L(8), hint, c.muted, size);
+    }
+
+    const int noteSize = std::max(11, g.L(10.5f));
+    if (!texState.found || texState.packs.empty())
+    {
+        FontStyle semi(FW_SEMIBOLD);
+        const std::wstring note = texState.note.empty() ? std::wstring(L"No resource packs found") : Utf8ToWide(texState.note);
+        DrawTextCentered(hdc, t.availList.left, t.availList.top, t.availList.right - t.availList.left, g.L(60), note, c.muted, noteSize);
+    }
+    else if (avail.empty())
+    {
+        FontStyle semi(FW_SEMIBOLD);
+        DrawTextCentered(hdc, t.availList.left, t.availList.top, t.availList.right - t.availList.left, g.L(60), L"Every pack is active", c.muted, noteSize);
+    }
+
+    std::vector<RECT> rects = TexItemRects(g, t.availList, avail, texAvailScroll);
+    for (size_t i = 0; i < avail.size(); i++)
+        if (rects[i].right > rects[i].left)
+            DrawTexCard(hdc, g, c, rects[i], texState.packs[avail[i].pack], -1, 0);
+    DrawTexListBar(hdc, g, c, t.availList, texAvailScroll, TexMaxScroll(g, t.availList, avail));
+
+    if (active.empty())
+    {
+        // Nothing active: the game's own textures, the way the game lists them.
+        const RECT r{t.activeList.left, t.activeList.top, t.activeList.right, t.activeList.top + g.L(kTexCardH)};
+        GlassBox(hdc, r, g.L(10), c.panel, c.panelA);
+        const int icon = g.L(kTexCardH - 14), ix = r.left + g.L(12), iy = (r.top + r.bottom - icon) / 2;
+        DrawTexPackIcon(hdc, g, c, VanillaPackIcon(), L"Minecraft", ix, iy, icon);
+        const int nameSize = std::max(12, g.L(12.5f));
+        {
+            FontStyle bold(FW_BOLD);
+            DrawTextSimple(hdc, ix + icon + g.L(10), (r.top + r.bottom) / 2 - g.L(15), L"Default textures", c.text, nameSize);
+        }
+        FontStyle semi(FW_SEMIBOLD);
+        DrawTextSimple(hdc, ix + icon + g.L(10), (r.top + r.bottom) / 2 + g.L(1), L"Click a pack on the left to use it", c.muted, std::max(11, g.L(10)));
+    }
+    rects = TexItemRects(g, t.activeList, active, texActiveScroll);
+    for (size_t i = 0; i < active.size(); i++)
+    {
+        if (rects[i].right <= rects[i].left) continue;
+        const TexturePacks::Pack& p = texState.packs[active[i].pack];
+        if (active[i].sub) DrawTexSubpack(hdc, g, c, rects[i], p, active[i].subpack);
+        else DrawTexCard(hdc, g, c, rects[i], p, TexStackPos(stack, p.uuid), (int)stack.size());
+    }
+    DrawTexListBar(hdc, g, c, t.activeList, texActiveScroll, TexMaxScroll(g, t.activeList, active));
+
+    // Footer: what happened / what to do, and Cancel / Done while there are changes.
+    const int mid = (t.foot.top + t.foot.bottom) / 2, size = std::max(11, g.L(11));
+    std::wstring line = texStatus;
+    int tone = 0;
+    if (line.empty())
+    {
+        unsigned int reloads = 0;
+        if (!MinecraftDataProvider::IsTexturesAvailable()) { line = L"Switching needs the updated DLL"; tone = 3; }
+        else if (MinecraftDataProvider::GetTextureReloads(reloads) && reloads)
+            line = L"Reloaded " + std::to_wstring(reloads) + (reloads == 1 ? L" time" : L" times") + L"  ·  a server's own pack can still win";
+        else line = L"Click a pack to move it to the other list. A server's own pack can still win";
+    }
+    int right = t.foot.right;
+    if (texEditing)
+    {
+        const RECT done{t.foot.right - g.L(84), mid - g.L(15), t.foot.right, mid + g.L(15)};
+        const RECT cancel{done.left - g.L(8) - g.L(84), done.top, done.left - g.L(8), done.bottom};
+        DrawGlassSmallButton(hdc, g, cancel, L"Cancel", false, c);
+        DrawGlassSmallButton(hdc, g, done, L"Done", true, c);
+        right = cancel.left - g.L(12);
+    }
+    if (texEditing && texStatus.rfind(L"Not applied", 0) == 0) tone = 2;
+    FontStyle semi(FW_SEMIBOLD);
+    DrawTextSimple(hdc, t.foot.left + g.L(4), mid - TextMiddle(hdc, size), TexFit(hdc, line, size, right - t.foot.left - g.L(4)),
+                   tone ? GlassTone(tone, c) : c.muted, size);
+}
+
+bool ClickTexPicker(const GlassRowCtx& x, int mx, int my, bool right)
+{
+    if (right) return false;
+    const GlassLayout& g = x.g;
+    const TexParts t = TexPickerParts(g, x.row);
+    const auto begin = [&]() { if (!texEditing) texPendingStack = texState.stack; };
+
+    if (texEditing)
+    {
+        const int mid = (t.foot.top + t.foot.bottom) / 2;
+        const RECT done{t.foot.right - g.L(84), mid - g.L(15), t.foot.right, mid + g.L(15)};
+        const RECT cancel{done.left - g.L(8) - g.L(84), done.top, done.left - g.L(8), done.bottom};
+        if (ContainsPoint(done, mx, my)) { ApplyPendingTextures(); return true; }
+        if (ContainsPoint(cancel, mx, my))
+        {
+            texEditing = false;
+            texPendingStack.clear();
+            texStatus = L"Changes cancelled.";
+            return true;
+        }
+    }
+
+    const std::vector<TexItem> avail = TexAvailItems();
+    std::vector<RECT> rects = TexItemRects(g, t.availList, avail, texAvailScroll);
+    for (size_t i = 0; i < avail.size(); i++)
+    {
+        if (!ContainsPoint(rects[i], mx, my)) continue;
+        const TexturePacks::Pack p = texState.packs[avail[i].pack];
+        if (ContainsPoint(TexCardButton(g, rects[i], 0), mx, my))
+        {
+            if (TexDeleteArmed(p)) { texDeleteArmed.clear(); DeleteTexturePack(p); }
+            else
+            {
+                texDeleteArmed = p.folder.wstring();
+                texDeleteArmedAt = GetTickCount64();
+                texStatus = L"Click the trash again to remove " + Utf8ToWide(p.name) + L".";
+            }
+            return true;
+        }
+        texDeleteArmed.clear();
+        begin();
+        texPendingStack.insert(texPendingStack.begin(), TexturePacks::EntryFor(p));   // like the game: on top
+        texActiveScroll = 0;
+        UpdatePendingStatus();
+        return true;
+    }
+
+    const std::vector<TexItem> active = TexActiveItems();
+    rects = TexItemRects(g, t.activeList, active, texActiveScroll);
+    for (size_t i = 0; i < active.size(); i++)
+    {
+        if (!ContainsPoint(rects[i], mx, my)) continue;
+        const TexturePacks::Pack p = texState.packs[active[i].pack];
+        texDeleteArmed.clear();
+        begin();
+        const int pos = TexStackPos(texPendingStack, p.uuid);
+        if (pos < 0) return true;
+        if (active[i].sub)
+        {
+            texPendingStack[pos] = TexturePacks::WithSubpack(texPendingStack[pos], active[i].subpack);
+            UpdatePendingStatus();
+            if (texEditing) texStatus = L"Subpack: " + TexSubpackLabel(p, active[i].subpack) + L" - click Done to use it.";
+            return true;
+        }
+        if (TexGearSlot(p) >= 0 && ContainsPoint(TexCardButton(g, rects[i], TexGearSlot(p)), mx, my))
+        {
+            texSubpackFor = texSubpackFor == p.folder.wstring() ? std::wstring() : p.folder.wstring();
+            if (!texSubpackFor.empty()) texActiveScroll = (int)i;   // the pack at the top, its subpacks under it
+            UpdatePendingStatus();
+            return true;
+        }
+        if (texPendingStack.size() > 1)
+            for (const bool up : {true, false})
+            {
+                if (!ContainsPoint(TexCardButton(g, rects[i], TexMoveSlot(p, up)), mx, my)) continue;
+                const int to = up ? pos - 1 : pos + 1;
+                if (to >= 0 && to < (int)texPendingStack.size())
+                {
+                    std::swap(texPendingStack[pos], texPendingStack[to]);
+                    UpdatePendingStatus();
+                }
+                return true;
+            }
+        texPendingStack.erase(texPendingStack.begin() + pos);   // the card itself: back to Available
+        if (texSubpackFor == p.folder.wstring()) texSubpackFor.clear();
+        UpdatePendingStatus();
+        return true;
+    }
+    return true;
+}
+
+// Mouse wheel over one of the two lists scrolls that list (true = handled).
+bool WheelTexPicker(const GlassLayout& g, const RECT& row, int mx, int my, int steps)
+{
+    const TexParts t = TexPickerParts(g, row);
+    if (ContainsPoint(t.avail, mx, my)) { texAvailScroll -= steps; TexItemRects(g, t.availList, TexAvailItems(), texAvailScroll); return true; }
+    if (ContainsPoint(t.active, mx, my)) { texActiveScroll -= steps; TexItemRects(g, t.activeList, TexActiveItems(), texActiveScroll); return true; }
+    return false;
+}
+
+GlassSetting TexPickerSetting(const std::vector<GlassSetting>& above)
+{
+    GlassSetting s;
+    s.kind = GlassRowKind::Custom;
+    float used = 0;   // everything under the rows above (Enabled, Keybind, Packs)
+    for (const auto& row : above) used += GlassRowPitch(row);
+    s.pitch = std::max(240.0f, kGlassRowBottom - kGlassRowTop - used - 0.5f);
+    s.draw = [](HDC hdc, const GlassRowCtx& x) { DrawTexPicker(hdc, x); };
+    s.click = [](HWND, const GlassRowCtx& x, int mx, int my, bool right) { return ClickTexPicker(x, mx, my, right); };
+    return s;
+}
+
 void TextureRows(std::vector<GlassSetting>& rows)
 {
     if (!texScanned)
@@ -12382,160 +14816,7 @@ void TextureRows(std::vector<GlassSetting>& rows)
         };
         rows.push_back(s);
     }
-    rows.push_back(InfoSetting(L"Reload", texStatus.empty() ? L"A server that forces its own pack can still override this" : texStatus, []()
-    {
-        unsigned int reloads = 0;
-        if (!MinecraftDataProvider::IsTexturesAvailable()) return std::wstring(L"Unavailable (needs the updated DLL)");
-        return MinecraftDataProvider::GetTextureReloads(reloads) ? std::to_wstring(reloads) + L" done" : std::wstring(L"Available");
-    }, []() { return MinecraftDataProvider::IsTexturesAvailable() ? 0 : 3; }));
-    if (texEditing)
-        rows.push_back(ChoiceSetting(L"Not applied yet", L"Click Done to use the new order", {L"Cancel", L"Done"},
-                                     []() { return 1; }, [](int i)
-                                     {
-                                         if (i == 1) ApplyPendingTextures();
-                                         else { texEditing = false; texPendingStack.clear(); texStatus = L"Changes cancelled."; }
-                                     }));
-    rows.push_back(HeaderSetting(L"Click packs to stack them (#1 = top)"));
-
-    const int total = (int)texState.packs.size() + 1;
-    for (int index = 0; index < total; index++)
-    {
-        GlassSetting s;
-        s.kind = GlassRowKind::Custom;
-        const bool isDefault = index == 0;
-        const TexturePacks::Pack* pack = isDefault ? nullptr : &TexRowPack(index);
-        s.label = isDefault ? std::wstring(L"Default textures") : Utf8ToWide(pack->name);
-        if (pack && !pack->subpacks.empty())
-            s.note = L"Subpack: " + TexSubpackLabel(*pack, TexSubpackChosen(*pack));
-        const std::string uuid = pack ? pack->uuid : std::string();
-        s.lit = [isDefault, uuid]()
-        {
-            const auto& stack = TexShownStack();
-            return isDefault ? stack.empty() : TexStackPos(stack, uuid) >= 0;
-        };
-        // Right-hand buttons, from the right: trash, gear, #n, down, up.
-        const auto part = [](const GlassRowCtx& x, int i)
-        {
-            const int size = x.g.L(32), gap = x.g.L(8), cy = (x.row.top + x.row.bottom) / 2;
-            const int right = x.row.right - x.g.L(16) - i * (size + gap);
-            return RECT{right - size, cy - size / 2, right, cy - size / 2 + size};
-        };
-        s.draw = [index, isDefault, part](HDC hdc, const GlassRowCtx& x)
-        {
-            const TexturePacks::Pack* p = isDefault ? nullptr : &TexRowPack(index);
-            const COLORREF ink = x.lit ? RGB(255,255,255) : x.c.text;
-            if (p)
-            {
-                const bool armed = TexDeleteArmed(*p);
-                DrawGlassTrash(hdc, part(x, 0), armed, x.c);
-                if (!p->subpacks.empty())
-                {
-                    const RECT r = part(x, 1);
-                    const bool open = texSubpackFor == p->folder.wstring();
-                    GlassBox(hdc, r, x.g.L(10), open ? GlassAccentLight() : x.c.panel, open ? kGlassAccentAlpha : x.c.panelA);
-                    DrawHomeIcon(hdc, HomeItem::Settings, (r.left + r.right) / 2.0f, (r.top + r.bottom) / 2.0f, (float)x.g.L(22), x.c.text);
-                }
-                const auto& stack = TexShownStack();
-                const int pos = TexStackPos(stack, p->uuid);
-                if (pos >= 0)
-                {
-                    const RECT n = part(x, 2);
-                    DrawTextCentered(hdc, n.left, n.top, n.right - n.left, n.bottom - n.top, L"#" + std::to_wstring(pos + 1), ink,
-                                     std::max(10, x.g.L(16)));
-                    if (stack.size() > 1)
-                        for (const bool up : {true, false})
-                        {
-                            const RECT m = part(x, up ? 4 : 3);
-                            const bool can = up ? pos > 0 : pos + 1 < (int)stack.size();
-                            GlassBox(hdc, m, x.g.L(10), x.c.panel, x.c.panelA);
-                            DrawChevron(hdc, (m.left + m.right) / 2, (m.top + m.bottom) / 2, up, can ? x.c.text : x.c.muted, std::max(3, x.g.L(5)));
-                        }
-                }
-            }
-        };
-        s.click = [index, isDefault, part](HWND, const GlassRowCtx& x, int mx, int my, bool right)
-        {
-            if (right) return false;
-            if (!texEditing)
-                texPendingStack = texState.stack;
-            if (!isDefault)
-            {
-                const TexturePacks::Pack p = TexRowPack(index);
-                if (ContainsPoint(part(x, 0), mx, my))
-                {
-                    if (TexDeleteArmed(p)) { texDeleteArmed.clear(); DeleteTexturePack(p); }
-                    else
-                    {
-                        texDeleteArmed = p.folder.wstring();
-                        texDeleteArmedAt = GetTickCount64();
-                        texStatus = L"Click the trash again to remove " + Utf8ToWide(p.name) + L".";
-                    }
-                    return true;
-                }
-                if (!p.subpacks.empty() && ContainsPoint(part(x, 1), mx, my))
-                {
-                    texSubpackFor = texSubpackFor == p.folder.wstring() ? std::wstring() : p.folder.wstring();
-                    return true;
-                }
-                const int pos = TexStackPos(texPendingStack, p.uuid);
-                if (pos >= 0 && texPendingStack.size() > 1)
-                    for (const bool up : {true, false})
-                    {
-                        if (!ContainsPoint(part(x, up ? 4 : 3), mx, my)) continue;
-                        const int to = up ? pos - 1 : pos + 1;
-                        if (to >= 0 && to < (int)texPendingStack.size())
-                        {
-                            std::swap(texPendingStack[pos], texPendingStack[to]);
-                            UpdatePendingStatus();
-                        }
-                        return true;
-                    }
-            }
-            // The row itself: put the pack on top of the stack / take it out ("Default textures" empties it).
-            texDeleteArmed.clear();
-            if (isDefault)
-                texPendingStack.clear();
-            else
-            {
-                const TexturePacks::Pack p = TexRowPack(index);
-                const int pos = TexStackPos(texPendingStack, p.uuid);
-                if (pos >= 0) texPendingStack.erase(texPendingStack.begin() + pos);
-                else texPendingStack.insert(texPendingStack.begin(), TexturePacks::EntryFor(p));
-            }
-            UpdatePendingStatus();
-            return true;
-        };
-        rows.push_back(s);
-
-        // The open subpack list: one row per subpack under its pack (picking one waits for Done like any change).
-        if (pack && !pack->subpacks.empty() && texSubpackFor == pack->folder.wstring())
-            for (const auto& sp : pack->subpacks)
-            {
-                const std::string folder = sp.folder;
-                GlassSetting r = RadioSetting(TexSubpackLabel(*pack, folder), L"", [index, folder]()
-                {
-                    return TexSubpackChosen(TexRowPack(index)) == folder;
-                }, [index, folder]()
-                {
-                    const TexturePacks::Pack p = TexRowPack(index);
-                    if (!texEditing)
-                        texPendingStack = texState.stack;
-                    int pos = TexStackPos(texPendingStack, p.uuid);
-                    if (pos < 0)
-                    {
-                        // Picking a subpack of a pack not in use adds the pack on top.
-                        texPendingStack.insert(texPendingStack.begin(), TexturePacks::EntryFor(p));
-                        pos = 0;
-                    }
-                    texPendingStack[pos] = TexturePacks::WithSubpack(texPendingStack[pos], folder);
-                    UpdatePendingStatus();
-                    if (texEditing)
-                        texStatus = L"Subpack: " + TexSubpackLabel(p, folder) + L" - click Done to use it.";
-                });
-                r.indent = true;
-                rows.push_back(r);
-            }
-    }
+    rows.push_back(TexPickerSetting(rows));
 }
 
 // Party Auto Accept: the GameTag box with Add, then the saved players (trash to remove).
@@ -12673,7 +14954,7 @@ std::vector<RECT> GlassRowRects(const GlassLayout& g, const std::vector<GlassSet
         const float h = GlassRowPitch(rows[i]) - kGlassRowGap;
         if (y + h > kGlassRowBottom) break;
         const float indent = rows[i].indent ? 28.0f : 0.0f;
-        rects[i] = g.R(126 + indent, y, kGlassW - 40 - 126 - 14 - indent, h);
+        rects[i] = g.R(kMainX + indent, y, kMainR - kMainX - 14 - indent, h);
         y += GlassRowPitch(rows[i]);
     }
     return rects;
@@ -12698,47 +14979,58 @@ void ClampGlassRowScroll(const std::vector<GlassSetting>& rows)
 // a text box (i = 0) and its button (i = 1), a radio mark.
 RECT GlassControlRect(const GlassLayout& g, const RECT& row, const GlassSetting& s, int i)
 {
-    const int cy = (row.top + row.bottom) / 2, right = row.right - g.L(20);
+    const int cy = (row.top + row.bottom) / 2, right = row.right - g.L(16), half = g.L(14);
     switch (s.kind)
     {
     case GlassRowKind::Switch:
+    {
+        const RECT sw{right - g.L(36), cy - g.L(10), right, cy + g.L(10)};
         if (i == 1)   // the arrow button left of the switch (opens the row's settings)
-        {
-            const RECT sw = GlassSwitchRect(g, row);
-            return RECT{sw.left - g.L(14) - g.L(34), cy - g.L(17), sw.left - g.L(14), cy + g.L(17)};
-        }
-        return GlassSwitchRect(g, row);
+            return RECT{sw.left - g.L(12) - g.L(28), cy - half, sw.left - g.L(12), cy + half};
+        return sw;
+    }
     case GlassRowKind::Slider:
-        return RECT{right - g.L(210), cy - g.L(12), right, cy + g.L(12)};
+        return RECT{right - g.L(190), cy - g.L(10), right, cy + g.L(10)};
     case GlassRowKind::Colors:
     {
-        // slot i (the rainbow button is slot 0 when there is one)
-        const int size = g.L(30), gap = g.L(8), n = (int)s.colors.size() + (s.rainbow ? 1 : 0);
-        const int left = right - n * size - (n - 1) * gap + i * (size + gap);
+        // slot i (the rainbow button is slot 0 when there is one). Every palette starts at the same x (the hue ring
+        // first), so the rows line up; room for 12 slots.
+        const int size = g.L(22), gap = g.L(8);
+        const int left = right - 12 * size - 11 * gap + i * (size + gap);
         return RECT{left, cy - size / 2, left + size, cy - size / 2 + size};
     }
     case GlassRowKind::Choice:
     {
-        const int w = g.L(s.options.size() > 3 ? 92 : 108), gap = g.L(8), n = (int)s.options.size();
-        const int left = right - n * w - (n - 1) * gap + i * (w + gap);
-        return RECT{left, cy - g.L(17), left + w, cy + g.L(17)};
+        const int w = g.L(s.options.size() > 3 ? 80 : 88), n = (int)s.options.size();
+        const int left = right - n * w + i * w;
+        return RECT{left, cy - half, left + w, cy + half};
     }
     case GlassRowKind::Key: case GlassRowKind::Button:
-        return RECT{right - g.L(150), cy - g.L(17), right, cy + g.L(17)};
+        return RECT{right - g.L(124), cy - half, right, cy + half};
     case GlassRowKind::Text:
     {
-        const int button = s.options.empty() ? 0 : g.L(90) + g.L(8);
-        if (i == 1) return RECT{right - g.L(90), cy - g.L(17), right, cy + g.L(17)};
-        return RECT{right - button - g.L(300), cy - g.L(17), right - button, cy + g.L(17)};
+        const int button = s.options.empty() ? 0 : g.L(78) + g.L(8);
+        if (i == 1) return RECT{right - g.L(78), cy - half, right, cy + half};
+        return RECT{right - button - g.L(250), cy - half, right - button, cy + half};
     }
     case GlassRowKind::Radio:
     {
-        const int size = g.L(24);
+        const int size = g.L(20);
         return RECT{right - size, cy - size / 2, right, cy - size / 2 + size};
     }
     default:
         return RECT{0, 0, 0, 0};
     }
+}
+
+// The grey line under a page's title.
+std::wstring GlassPageCaption()
+{
+    if (selectedCategory == MenuCategory::Settings) return L"Menu key, colours and how the menu looks";
+    if (selectedCategory == MenuCategory::Presets) return L"Save and load every module's setup at once";
+    const std::wstring group = ModsTabOf(detailFeature) == ModsTab::Hud ? L"HUD module" : L"Module";
+    if (!FeatureHasSwitch(detailFeature)) return group;
+    return group + (FeatureEnabled(detailFeature) ? L"  \u00B7  On" : L"  \u00B7  Off");
 }
 
 std::wstring GlassPageTitle()
@@ -12766,13 +15058,9 @@ void DrawGlassRows(HDC hdc)
     DrawGlassFrame(hdc, g, c, selectedCategory == MenuCategory::Settings ? GlassRail::Settings
                               : selectedCategory == MenuCategory::Presets ? GlassRail::Presets : GlassRail::Mods);
 
-    {
-        const RECT back = GlassBackRect(g);
-        const int size = std::max(12, g.L(26));
-        DrawTextSimple(hdc, back.right + g.L(16), (back.top + back.bottom) / 2 - TextMiddle(hdc, size), GlassPageTitle(), c.text, size);
-    }
+    DrawGlassTitle(hdc, g, c, GlassPageTitle(), GlassPageCaption());
 
-    // Frame Generation has no page of its own any more (it is at the end of Optimization's): whatever opened it
+    // Frame Generation has no page of its own any more (it is at the top of Optimization's): whatever opened it
     // (the home chips, 2026-10-28) shows Optimization's page at its Frame Generation part.
     bool toFrameGen = glassToFrameGen;
     glassToFrameGen = false;
@@ -12801,7 +15089,15 @@ void DrawGlassRows(HDC hdc)
             }
     ClampGlassRowScroll(rows);
     const std::vector<RECT> rects = GlassRowRects(g, rows);
-    const int labelSize = std::max(11, g.L(18)), noteSize = std::max(9, g.L(13)), smallSize = std::max(10, g.L(15));
+    const int labelSize = std::max(12, g.L(12.5f)), noteSize = std::max(12, g.L(10)), smallSize = std::max(12, g.L(11));
+    // Rows sit together in groups (one card, hairlines between rows) split by the headers; an indented run (a
+    // switch's own settings) is a group of its own.
+    const auto visible = [&](int k) { return k >= 0 && k < (int)rows.size() && rects[k].right > rects[k].left; };
+    const auto sameGroup = [&](int a, int b)
+    {
+        return visible(a) && visible(b) && rows[a].kind != GlassRowKind::Header && rows[b].kind != GlassRowKind::Header &&
+               rows[a].indent == rows[b].indent;
+    };
     for (int i = 0; i < (int)rows.size(); i++)
     {
         const RECT row = rects[i];
@@ -12810,21 +15106,45 @@ void DrawGlassRows(HDC hdc)
         const int mid = (row.top + row.bottom) / 2;
         if (s.kind == GlassRowKind::Header)
         {
-            DrawTextSimple(hdc, row.left + g.L(6), row.bottom - g.L(4) - TextMiddle(hdc, smallSize) * 2, s.label, c.muted, smallSize);
+            std::wstring caps = s.label;
+            for (wchar_t& ch : caps) ch = (wchar_t)towupper(ch);
+            DrawCaps(hdc, row.left + g.L(4), row.bottom - g.L(12) - TextMiddle(hdc, std::max(8, g.L(12))) * 2, caps, c.muted,
+                     std::max(8, g.L(12)), g.L(2));
             continue;
         }
         const bool lit = s.lit && s.lit();
-        GlassBox(hdc, row, g.L(16), lit ? GlassAccent() : c.fill, lit ? kGlassAccentAlpha : c.fillA);
-        const COLORREF ink = lit ? RGB(255,255,255) : (s.dim ? c.muted : c.text);
-        const COLORREF soft = lit ? RGB(230,236,250) : c.muted;
-        int textX = row.left + g.L(20);
-        if (s.kind == GlassRowKind::Custom && s.label.empty()) textX = row.left;
-        if (s.note.empty())
-            DrawTextSimple(hdc, textX, mid - TextMiddle(hdc, labelSize), s.label, ink, labelSize);
-        else
         {
-            DrawTextSimple(hdc, textX, row.top + g.L(8), s.label, ink, labelSize);
-            DrawTextSimple(hdc, textX, row.top + g.L(32), s.note, soft, noteSize);
+            using namespace OverlayAlpha;
+            const bool first = !sameGroup(i - 1, i), last = !sameGroup(i, i + 1);
+            const RECT box{row.left, row.top + (first ? 0 : 0), row.right, row.bottom - (last ? 0 : 0)};
+            GlassBox(hdc, box, g.L(12), c.fill, c.fillA,
+                     Corners(first ? Round : Square, first ? Round : Square, last ? Round : Square, last ? Round : Square));
+            if (!first)
+            {
+                HBRUSH line = CreateSolidBrush(c.line);
+                const RECT hair{row.left + g.L(16), row.top, row.right - g.L(16), row.top + std::max(1, g.L(1))};
+                FillRect(hdc, &hair, line);
+                DeleteObject(line);
+            }
+            if (lit)   // in use (an active texture pack): an accent bar at its left edge
+                DrawRoundBox(hdc, row.left + g.L(6), row.top + g.L(14), std::max(2, g.L(3)) - 1, row.bottom - row.top - g.L(28) - 1, g.L(1),
+                             GlassAccent());
+        }
+        const COLORREF ink = s.dim ? c.muted : c.text;
+        const COLORREF soft = c.muted;
+        int textX = row.left + g.L(16);
+        if (s.kind == GlassRowKind::Custom && s.label.empty()) textX = row.left;
+        {
+            FontStyle bold(FW_BOLD);
+            if (s.note.empty())
+                DrawTextSimple(hdc, textX, mid - TextMiddle(hdc, labelSize), s.label, ink, labelSize);
+            else
+                DrawTextSimple(hdc, textX, mid - g.L(15), s.label, ink, labelSize);
+        }
+        if (!s.note.empty())
+        {
+            FontStyle semi(FW_SEMIBOLD);
+            DrawTextSimple(hdc, textX, mid + g.L(1), s.note, soft, noteSize);
         }
 
         switch (s.kind)
@@ -12880,30 +15200,64 @@ void DrawGlassRows(HDC hdc)
             {
                 const int k = slot == 0 && s.rainbow ? count : slot - off;   // palette index (count = your own colour)
                 const RECT r = GlassControlRect(g, row, s, slot);
-                const int w = r.right - r.left, ring = std::max(2, g.L(3));
-                if (k == chosen)
-                    DrawRoundBox(hdc, r.left - ring, r.top - ring, w + 2 * ring - 1, w + 2 * ring - 1, g.L(9) + ring, c.text);
+                const int w = r.right - r.left, ring = std::max(2, g.L(1.5f));
+                if (k == chosen)   // an accent ring with a light gap
+                {
+                    const int gapPx = std::max(1, g.L(1.5f)), o = ring + gapPx;
+                    DrawRoundBox(hdc, r.left - o, r.top - o, w + 2 * o - 1, w + 2 * o - 1, k == count ? w / 2 + o : g.L(6) + o, GlassAccent());
+                    DrawRoundBox(hdc, r.left - gapPx, r.top - gapPx, w + 2 * gapPx - 1, w + 2 * gapPx - 1, k == count ? w / 2 + gapPx : g.L(6) + gapPx,
+                                 glassDark ? RGB(30,36,50) : RGB(252,253,255));
+                }
                 if (k == count)
                 {
-                    // Rainbow button: four colour dots on a dark tile.
-                    static const COLORREF dots[4] = { RGB(235,70,70), RGB(250,200,40), RGB(60,190,90), RGB(60,130,240) };
-                    DrawRoundBox(hdc, r.left, r.top, w - 1, w - 1, g.L(9), RGB(36,38,48));
-                    const int d = (w - g.L(8)) / 2, pad = g.L(3);
-                    for (int q = 0; q < 4; q++)
-                        DrawRoundBox(hdc, r.left + pad + (q % 2) * (d + g.L(2)), r.top + pad + (q / 2) * (d + g.L(2)), d - 1, d - 1, d / 2, dots[q]);
+                    // Your own colour: a ring of twelve hues.
+                    const float cx = (r.left + r.right) / 2.0f, cy = (r.top + r.bottom) / 2.0f, outer = w / 2.0f, inner = w * 0.22f;
+                    for (int q = 0; q < 12; q++)
+                    {
+                        float xs[8], ys[8];
+                        const float a0 = (q * 30 - 90 - 0.5f) * 3.14159265f / 180, a1 = ((q + 1) * 30 - 90 + 0.5f) * 3.14159265f / 180;
+                        for (int k = 0; k < 4; k++)
+                        {
+                            const float a = a0 + (a1 - a0) * k / 3;
+                            xs[k] = cx + outer * std::cos(a); ys[k] = cy + outer * std::sin(a);
+                            xs[7 - k] = cx + inner * std::cos(a); ys[7 - k] = cy + inner * std::sin(a);
+                        }
+                        FillPolygonSmooth(hdc, xs, ys, 8, HsvToRgb(GlassHsv{q * 30, 78, 96}));
+                    }
                     continue;
                 }
                 // A swatch can be a glass colour of this page (the panel's tint): nudge it so it stays solid.
                 const COLORREF col = s.colors[k];
-                DrawRoundBox(hdc, r.left, r.top, w - 1, w - 1, g.L(9), RGB(GetRValue(col), GetGValue(col), GetBValue(col) ^ 1));
+                if (k != chosen)   // a hairline so dark (or light) swatches stay visible on the panel
+                    DrawRoundBox(hdc, r.left - 1, r.top - 1, w + 1, w + 1, g.L(6) + 1, MixRgb(c.fill, c.text, 22));
+                DrawRoundBox(hdc, r.left, r.top, w - 1, w - 1, g.L(6), RGB(GetRValue(col), GetGValue(col), GetBValue(col) ^ 1));
             }
             break;
         }
         case GlassRowKind::Choice:
         {
-            const int chosen = s.chosen ? s.chosen() : -1;
-            for (int k = 0; k < (int)s.options.size(); k++)
-                DrawGlassSmallButton(hdc, g, GlassControlRect(g, row, s, k), s.options[k], k == chosen, c);
+            // One segmented control: a track, the chosen part in the accent colour, hairlines between the others.
+            const int chosen = s.chosen ? s.chosen() : -1, n = (int)s.options.size();
+            if (n == 0) break;
+            const RECT first = GlassControlRect(g, row, s, 0), lastR = GlassControlRect(g, row, s, n - 1);
+            GlassBox(hdc, RECT{first.left, first.top, lastR.right, lastR.bottom}, g.L(5), c.chip, c.chipA);
+            const int pad = std::max(2, g.L(3));
+            for (int k = 0; k < n; k++)
+            {
+                const RECT r = GlassControlRect(g, row, s, k);
+                if (k == chosen)
+                    GlassBox(hdc, RECT{r.left + pad, r.top + pad, r.right - pad, r.bottom - pad}, g.L(4), GlassAccent(), kGlassAccentAlpha);
+                else if (k > 0 && k - 1 != chosen)
+                {
+                    HBRUSH line = CreateSolidBrush(c.line);
+                    const RECT d{r.left, r.top + g.L(9), r.left + std::max(1, g.L(1)), r.bottom - g.L(9)};
+                    FillRect(hdc, &d, line);
+                    DeleteObject(line);
+                }
+                FontStyle semi(k == chosen ? FW_BOLD : FW_SEMIBOLD);
+                DrawTextCentered(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top, s.options[k],
+                                 k == chosen ? RGB(255,255,255) : c.text, std::max(12, g.L(11)));
+            }
             break;
         }
         case GlassRowKind::Key: case GlassRowKind::Button:
@@ -12913,8 +15267,8 @@ void DrawGlassRows(HDC hdc)
             bool waiting = false;
             if (s.kind == GlassRowKind::Key)
             {
-                const int* key = GetShortcutPtr(s.keyOf);
-                waiting = waitingForShortcut && shortcutFeature == s.keyOf;
+                const int* key = KeyTargetOf(s.keyOf, s.keySlot);
+                waiting = waitingForShortcut && shortcutFeature == s.keyOf && shortcutSlot == s.keySlot;
                 caption = waiting ? L"Press a key..." : KeyName(key ? *key : 0);
             }
             else
@@ -12977,11 +15331,7 @@ void DrawGlassRows(HDC hdc)
     {
         int shown = 0;
         for (const RECT& r : rects) shown += r.right > r.left;
-        const RECT track = g.R(kGlassW - 30, kGlassRowTop, 6, kGlassRowBottom - kGlassRowTop - kGlassRowGap);
-        const int th = track.bottom - track.top, thumb = std::max(g.L(30), th * shown / std::max(1, (int)rows.size()));
-        const int top = track.top + (th - thumb) * glassRowScroll / maxScroll;
-        DrawRoundBox(hdc, track.left, track.top, track.right - track.left - 1, th - 1, g.L(3), c.track);
-        DrawRoundBox(hdc, track.left, top, track.right - track.left - 1, thumb - 1, g.L(3), GlassAccent());
+        DrawGlassScrollbar(hdc, g, c, kGlassRowTop, kGlassRowBottom - kGlassRowTop, glassRowScroll, maxScroll + shown, shown);
     }
 }
 
@@ -13083,14 +15433,19 @@ void HandleGlassRowsClick(HWND hwnd, int mx, int my, bool right)
             if (!ContainsPoint(GlassControlRect(g, row, s, 0), mx, my)) break;
             if (right)
             {
-                if (int* key = GetShortcutPtr(s.keyOf)) { *key = s.keyOf == DetailFeature::MenuOpen ? 'G' : s.keyOf == DetailFeature::DebugMenu ? VK_F3 : 0; SaveConfig(); }
+                if (int* key = KeyTargetOf(s.keyOf, s.keySlot))
+                {
+                    *key = s.keySlot >= 0 ? 0 : s.keyOf == DetailFeature::MenuOpen ? 'G' : s.keyOf == DetailFeature::DebugMenu ? VK_F3 : 0;
+                    SaveConfig();
+                }
                 waitingForShortcut = false;
             }
             else
             {
-                const bool same = waitingForShortcut && shortcutFeature == s.keyOf;
+                const bool same = waitingForShortcut && shortcutFeature == s.keyOf && shortcutSlot == s.keySlot;
                 waitingForShortcut = !same;
                 shortcutFeature = s.keyOf;
+                shortcutSlot = s.keySlot;
                 SetFocus(hwnd);
             }
             break;
@@ -13167,17 +15522,102 @@ void UpdateGlassBlur(bool show)
         shown = false;
         return;
     }
-    const GlassLayout g = GetGlassLayout();
+    // Behind the panel, or behind the home screen's card.
+    RECT box{};
+    int radius = 0;
+    if (selectedCategory == MenuCategory::Home)
+    {
+        const HomeLayout l = GetHomeLayout();
+        box = HomeCardRect(l);
+        radius = (int)std::lround(22 * l.s);
+    }
+    else
+    {
+        const GlassLayout g = GetGlassLayout();
+        box = RECT{g.x, g.y, g.x + g.w, g.y + g.h};
+        radius = g.L(kPanelRadius);
+    }
+    const int bw = box.right - box.left, bh = box.bottom - box.top;
     POINT o{0, 0};
     ClientToScreen(overlayWindow, &o);
-    const RECT r{o.x + g.x, o.y + g.y, o.x + g.x + g.w, o.y + g.y + g.h};
+    const RECT r{o.x + box.left, o.y + box.top, o.x + box.right, o.y + box.bottom};
     if (shown && EqualRect(&r, &last))
         return;
-    const int radius = g.L(28);
-    SetWindowRgn(blurWindow, CreateRoundRectRgn(0, 0, g.w + 1, g.h + 1, radius * 2, radius * 2), FALSE);   // Windows owns the region
-    SetWindowPos(blurWindow, overlayWindow, r.left, r.top, g.w, g.h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowRgn(blurWindow, CreateRoundRectRgn(0, 0, bw + 1, bh + 1, radius * 2, radius * 2), FALSE);   // Windows owns the region
+    SetWindowPos(blurWindow, overlayWindow, r.left, r.top, bw, bh, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     last = r;
     shown = true;
+}
+
+COLORREF ChipGroupColor(ChipGroup group)
+{
+    switch (group)
+    {
+    case ChipGroup::Hud:    return RGB(64,200,255);
+    case ChipGroup::Game:   return RGB(255,184,64);
+    case ChipGroup::Visual: return RGB(92,150,255);
+    default:                return RGB(170,130,255);
+    }
+}
+
+void DrawHomeChips(HDC hdc)
+{
+    const HomeLayout l = GetHomeLayout();
+    const std::vector<HomeChip> chips = HomeChips(hdc);
+    const int textSize = std::max(12, (int)std::lround(10 * l.s));
+    FontStyle semi(FW_SEMIBOLD);
+    for (size_t i = 0; i < chips.size(); i++)
+    {
+        const HomeChip& c = chips[i];
+        const RECT& r = c.rect;
+        const bool hover = (int)i == homeChipHover;
+        GlassBox(hdc, r, (r.bottom - r.top) / 2, hover ? kHomeHoverFill : kHomeChipFill, hover ? kHomeHoverAlpha : kHomeChipAlpha);
+        if (c.more)
+        {
+            DrawTextCentered(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top, L"+" + std::to_wstring(c.more), RGB(230,236,248), textSize);
+            continue;
+        }
+        const int dot = std::max(4, (int)std::lround(5 * l.s)), mid = (r.top + r.bottom) / 2;
+        DrawRoundBox(hdc, r.left + (int)std::lround(10 * l.s), mid - dot / 2, dot - 1, dot - 1, dot / 2, kHomeAccent);
+        DrawTextSimple(hdc, r.left + (int)std::lround(20 * l.s), mid - TextMiddle(hdc, textSize), FeatureTitle(c.feature), RGB(230,236,248), textSize);
+    }
+}
+
+// The OriginX orbit round the home head: a tilted ellipse, its far half drawn before the head (faint) and its near
+// half after it, with the four-pointed star travelling along it once every 9 seconds.
+void DrawHomeOrbit(HDC hdc, const HomeLayout& l, float cx, float cy, bool front)
+{
+    const float rx = 92 * l.s, ry = 20 * l.s, tilt = -0.22f, pi = 3.14159265f, ct = std::cos(tilt), st = std::sin(tilt);
+    const auto at = [&](float t, float& x, float& y)
+    {
+        const float ex = rx * std::cos(t), ey = ry * std::sin(t);
+        x = cx + ex * ct - ey * st;
+        y = cy + ex * st + ey * ct;
+    };
+    std::vector<float> xs, ys;
+    for (int i = 0; i <= 40; i++)
+    {
+        float x, y;
+        at((front ? 0.0f : pi) + pi * i / 40, x, y);
+        xs.push_back(x);
+        ys.push_back(y);
+    }
+    HomeStroke(hdc, xs, ys, false, std::max(1.2f, (front ? 2.0f : 1.4f) * l.s), front ? kHomeAccent : RGB(42,72,130));
+    const float t = std::fmod(GetTickCount64() / 1000.0f * 2 * pi / 9.0f, 2 * pi);
+    if ((t < pi) == front)
+    {
+        float x, y;
+        at(t, x, y);
+        DrawBrandStar(hdc, x, y, (front ? 16.0f : 10.0f) * l.s, front ? RGB(226,244,255) : RGB(60,96,170));
+    }
+}
+
+// Good morning / afternoon / evening, by the PC's clock.
+std::wstring HomeGreeting()
+{
+    SYSTEMTIME t{};
+    GetLocalTime(&t);
+    return t.wHour >= 5 && t.wHour < 12 ? L"Good morning" : t.wHour >= 12 && t.wHour < 18 ? L"Good afternoon" : L"Good evening";
 }
 
 void DrawHome(HDC hdc)
@@ -13191,72 +15631,83 @@ void DrawHome(HDC hdc)
     }
     const auto rgb = [](COLORREF c) { return (uint32_t)((GetRValue(c) << 16) | (GetGValue(c) << 8) | GetBValue(c)); };
     translucentRects.push_back({full.left, full.top, full.right, full.bottom, rgb(kHomeDim), kHomeDimAlpha});
-    translucentRects.push_back({full.left, full.top, full.right, full.bottom, rgb(kHomeFill), kHomeFillAlpha});
-    translucentRects.push_back({full.left, full.top, full.right, full.bottom, rgb(kHomeHoverFill), kHomeHoverAlpha});
-    translucentRects.push_back({full.left, full.top, full.right, full.bottom, rgb(kHomeChipFill), kHomeChipAlpha});
+    const auto S = [&](float u) { return (int)std::lround(u * l.s); };
 
-    // The ring (segments, icons, labels) costs a few hundred ms to draw with its smooth edges, which stalled the
-    // HUD's loop: it is drawn once per window size and hovered segment (none + 4) and copied from then on.
-    static std::vector<uint32_t> ringCaches[5];
-    static int cacheW = 0, cacheH = 0;
-    int width = 0, height = 0;
-    uint32_t* px = DibPixels(hdc, width, height);
-    POINT org{0, 0};
-    LPtoDP(hdc, &org, 1);
-    const int reach = (int)std::ceil(l.outer + 14 * l.s);
-    const int boxL = std::max(0, (int)(l.cx + org.x) - reach), boxR = std::min(width, (int)(l.cx + org.x) + reach);
-    const int boxT = std::max(0, (int)(l.cy + org.y) - reach), boxB = std::min(height, (int)(l.cy + org.y) + reach);
-    if (cacheW != width || cacheH != height)
+    // The card: a soft shadow, a light rim, dark glass (the game behind it is blurred by the blur window).
+    const RECT card = HomeCardRect(l);
+    const int radius = S(22);
+    for (int k = 0; k < 10; k++)
     {
-        for (auto& c : ringCaches) c.clear();
-        cacheW = width; cacheH = height;
+        const float f = (k + 1) / 10.0f;
+        const int grow = S(1.6f * (10 - k)), drop = S(12);
+        GlassBox(hdc, RECT{card.left - grow, card.top - grow / 2 + drop, card.right + grow, card.bottom + grow + drop}, radius + grow,
+                 RGB(0,0,1 + k), (uint8_t)std::clamp(kHomeDimAlpha + (int)(70 * f * f), 1, 255));   // over the dim, so darker than it
     }
-    std::vector<uint32_t>& ringCache = ringCaches[std::clamp((int)homeHover + 1, 0, 4)];
-    const bool cached = px && !ringCache.empty() && ringCache.size() == (size_t)std::max(0, boxR - boxL) * std::max(0, boxB - boxT);
-    if (cached)
-    {
-        const int bw = boxR - boxL;
-        for (int y = boxT; y < boxB; y++)
-            std::memcpy(px + (size_t)y * width + boxL, ringCache.data() + (size_t)(y - boxT) * bw, (size_t)bw * 4);
-    }
-    static const wchar_t* const labels[4] = {L"MODS", L"CLOSET", L"SETTINGS", L"HUD"};
-    std::vector<float> xs, ys;
-    for (int i = 0; i < 4 && !cached; i++)
-    {
-        const bool hover = (int)homeHover == i;
-        const float outer = l.outer + (hover ? 8 * l.s : 0);
-        HomeSegment(l, i, l.inner, outer, xs, ys);
-        FillPolygonSmooth(hdc, xs.data(), ys.data(), (int)xs.size(), hover ? kHomeHoverFill : kHomeFill);
-        HomeStroke(hdc, xs, ys, true, std::max(1.5f, 2.0f * l.s), RGB(255,255,255));
+    GlassBox(hdc, card, radius, kHomeRim, kHomeRimAlpha);
+    const int rim = std::max(1, S(1));
+    GlassBox(hdc, RECT{card.left + rim, card.top + rim, card.right - rim, card.bottom - rim}, radius - rim, kHomeCard, kHomeCardAlpha);
 
-        // Icon and label in the middle of the segment, the label under the icon.
-        const float pi = 3.14159265f, a = i * pi / 2, mid = (l.inner + outer) / 2;
-        const float ix = l.cx + mid * std::sin(a), iy = l.cy - mid * std::cos(a);
-        const float icon = 38 * l.s;
-        DrawHomeIcon(hdc, (HomeItem)i, ix, iy - 11 * l.s, icon, RGB(255,255,255));
-        const int textSize = std::max(11, (int)std::lround(15 * l.s));
-        DrawTextCentered(hdc, (int)(ix - 70 * l.s), (int)(iy + 16 * l.s), (int)(140 * l.s), textSize + 6,
-                         labels[i], RGB(255,255,255), textSize);
-    }
-    if (!cached && px && boxR > boxL && boxB > boxT)
-    {
-        const int bw = boxR - boxL;
-        ringCache.resize((size_t)bw * (boxB - boxT));
-        for (int y = boxT; y < boxB; y++)
-            std::memcpy(ringCache.data() + (size_t)(y - boxT) * bw, px + (size_t)y * width + boxL, (size_t)bw * 4);
-    }
-
-    // The head: a 3D cube that turns toward the mouse and sways a little, bobbing gently.
+    // The head looks at the mouse; a ring of the accent colour behind it.
+    const float hx = (card.left + card.right) / 2.0f, hy = card.top + kHomeHeadY * l.s;
     float yaw = 0, pitch = 0;
-    HeadAngles(l, yaw, pitch);
-    const float bob = 3.0f * l.s * std::sin(GetTickCount64() / 1000.0f * 1.6f);
-    DrawHead3D(hdc, l.cx, l.cy + bob, l.inner * 1.1f, yaw, pitch);
+    HeadAngles(l, hx, hy, yaw, pitch);
+    const float bob = 2.0f * l.s * std::sin(GetTickCount64() / 1000.0f * 1.6f);
+    DrawHomeOrbit(hdc, l, hx, hy + 22 * l.s, false);
+    DrawHead3D(hdc, hx, hy + bob, kHomeHead * l.s, yaw, pitch);
+    DrawHomeOrbit(hdc, l, hx, hy + 22 * l.s, true);
+
+    {
+        FontStyle bold(FW_BOLD);
+        const int size = std::max(16, S(19));
+        DrawTextCentered(hdc, card.left, card.top + S(134), card.right - card.left, S(26), HomeGreeting(), RGB(242,246,252), size);
+    }
+    int on = 0;
+    for (int i = 0; i < kFeatureCount; i++) on += FeatureEnabled(kFeatureList[i]) && FeatureHasSwitch(kFeatureList[i]);
+    {
+        FontStyle semi(FW_SEMIBOLD);
+        DrawTextCentered(hdc, card.left, card.top + S(162), card.right - card.left, S(18),
+                         L"OriginX  \u00B7  " + std::to_wstring(on) + (on == 1 ? L" module on" : L" modules on"), RGB(154,164,186), std::max(12, S(11)));
+    }
+
+    // The four buttons.
+    static const wchar_t* const names[4] = { L"Modules", L"Closet", L"HUD layout", L"Settings" };
+    static const wchar_t* const captions[4] = { L"Switch and set up", L"Skins on this PC", L"Move the HUD", L"Keys and look" };
+    for (int i = 0; i < 4; i++)
+    {
+        const RECT r = HomeTileRect(l, i);
+        const bool hover = homeHover == kHomeTileItems[i];
+        if (hover)
+            GlassRingBox(hdc, r, S(14), kHomeHoverFill, kHomeHoverAlpha, kHomeAccent, 220, std::max(1, S(1)), OverlayAlpha::AllRound);
+        else
+            GlassBox(hdc, r, S(14), kHomeFill, kHomeFillAlpha);
+        const int mid = (r.top + r.bottom) / 2;
+        const RECT ic{r.left + S(14), mid - S(16), r.left + S(46), mid + S(16)};
+        GlassBox(hdc, ic, S(10), kHomeIconFill, kHomeIconAlpha);
+        const float ix = (ic.left + ic.right) / 2.0f, iy = (float)mid, u = (float)S(18);
+        const COLORREF iconInk = RGB(110,170,255);
+        switch (kHomeTileItems[i])
+        {
+        case HomeItem::Mods:     DrawGlassIcon(hdc, GlassIcon::Puzzle, ix, iy, u, iconInk); break;
+        case HomeItem::Settings: DrawHomeIcon(hdc, HomeItem::Settings, ix, iy, u * 1.1f, iconInk); break;
+        case HomeItem::Closet:   DrawHomeIcon(hdc, HomeItem::Closet, ix, iy - u * 0.1f, u, iconInk); break;
+        default:                 DrawHomeIcon(hdc, HomeItem::Hud, ix, iy, u, iconInk); break;
+        }
+        {
+            FontStyle bold(FW_BOLD);
+            DrawTextSimple(hdc, ic.right + S(12), mid - S(15), names[i], RGB(242,246,252), std::max(12, S(13)));
+        }
+        {
+            FontStyle semi(FW_SEMIBOLD);
+            DrawTextSimple(hdc, ic.right + S(12), mid + S(3), captions[i], RGB(146,156,178), std::max(12, S(10)));
+        }
+    }
 
     DrawHomeChips(hdc);
 
-    const int hint = std::max(10, (int)std::lround(13 * l.s));
-    DrawTextCentered(hdc, (int)(l.cx - 200 * l.s), (int)(l.cy + l.outer + 26 * l.s), (int)(400 * l.s), hint + 6,
-                     L"G / ESC to close", RGB(220,220,226), hint);
+    const int hint = std::max(12, S(11));
+    FontStyle semi(FW_SEMIBOLD);
+    DrawTextCentered(hdc, (int)(l.cx - 200 * l.s), (int)(l.cy * 2 - 40 * l.s), (int)(400 * l.s), hint + 6,
+                     L"G or Esc to close", RGB(200,208,224), hint);
 }
 
 void OpenHomeItem(HomeItem item);   // defined with OpenMenu / OpenHudEditor below
@@ -13268,6 +15719,18 @@ void OpenHomeItem(HomeItem item);   // defined with OpenMenu / OpenHudEditor bel
 // skin packs); a click wears one through the game DLL, which also sends it to the server so everyone
 // sees it. A pick made outside a world is worn when the next world loads.
 std::vector<SkinLibrary::Entry> closetSkins;
+int closetTab = 0; // Independent Closet sections: skins / capes.
+bool closetAskingCape = false;
+const std::vector<uint8_t>& ClosetCapePixels(uint32_t id)
+{
+    static std::vector<uint8_t> images[3];
+    static bool loaded[3] = {};
+    if (id > 0 && id <= 2 && !loaded[id]) {
+        loaded[id] = true;
+        CapeLibrary::Load(id, images[id]);
+    }
+    return images[id <= 2 ? id : 0];
+}
 bool closetScanned = false;
 int closetScroll = 0;                   // in rows
 std::wstring closetStatus;              // the line under the buttons (empty = the hint)
@@ -13276,15 +15739,36 @@ ULONGLONG closetAskedAt = 0;            // when it was asked for (0 = no answer 
 MinecraftDataProvider::SkinRequestState closetShown = MinecraftDataProvider::SkinRequestState::None;
 
 // Panel units (GlassLayout, 1100 x 600): the grid of skins right of the "now wearing" card.
-constexpr int kClosetCols = 6, kClosetRows = 3;
-constexpr float kClosetTileW = 104, kClosetTileH = 132, kClosetGap = 12, kClosetGridX = 376, kClosetGridY = 140;
+constexpr int kClosetCols = 5, kClosetRows = 3;
+constexpr float kClosetTileW = 100, kClosetTileH = 128, kClosetGap = 12, kClosetGridX = kMainX + 248, kClosetGridY = 160;
 RECT ClosetTileRect(const GlassLayout& g, int slot)   // slot = visible position 0 .. cols*rows-1
 {
     return g.R(kClosetGridX + (slot % kClosetCols) * (kClosetTileW + kClosetGap),
                kClosetGridY + (slot / kClosetCols) * (kClosetTileH + kClosetGap), kClosetTileW, kClosetTileH);
 }
-RECT ClosetFolderRect(const GlassLayout& g) { return g.R(kGlassW - 40 - 150, 62, 150, 40); }
-RECT ClosetRefreshRect(const GlassLayout& g) { return g.R(kGlassW - 40 - 150 - 10 - 120, 62, 120, 40); }
+RECT ClosetFolderRect(const GlassLayout& g) { return g.R(kMainR - 110, kChipY - 2, 110, 34); }
+RECT ClosetRefreshRect(const GlassLayout& g) { return g.R(kMainR - 110 - 8 - 84, kChipY - 2, 84, 34); }
+// Takes the Closet's skin off: the game's own skin again, and it is no longer put back on in every world.
+RECT ClosetOwnRect(const GlassLayout& g) { return g.R(kMainR - 110 - 8 - 84 - 8 - 96, kChipY - 2, 96, 34); }
+RECT ClosetTabRect(const GlassLayout& g, int tab) { return g.R(kMainX + tab * 94, 114, 86, 30); }
+RECT ClosetCapeRect(const GlassLayout& g, int cape) { return g.R(kMainX + 40 + (cape - 1) * 300, 160, 270, 330); }
+void DrawClosetTabs(HDC hdc, const GlassLayout& g, const GlassColors& c)
+{
+    for (int i = 0; i < 2; ++i) {
+        const RECT r = ClosetTabRect(g, i);
+        GlassBox(hdc, r, g.L(5), closetTab == i ? GlassAccent() : c.chip, closetTab == i ? kGlassAccentAlpha : c.chipA);
+        DrawTextCentered(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top,
+            i ? L"マント" : L"スキン", closetTab == i ? RGB(255,255,255) : c.text, std::max(12, g.L(12)));
+    }
+    const std::wstring note = closetStatus.empty() ? (closetTab ? L"マントを選んで試着できます。" : L"スキンを選んで着替えられます。") : closetStatus;
+    const RECT area = g.R(kMainX + 202, 114, kMainR - kMainX - 202, 30);
+    const int saved = SaveDC(hdc);
+    if (saved) {
+        IntersectClipRect(hdc, area.left, area.top, area.right, area.bottom);
+        DrawTextSimple(hdc, area.left, area.top + g.L(6), note, c.muted, std::max(12, g.L(11)));
+        RestoreDC(hdc, saved);
+    }
+}
 
 int ClosetMaxScroll()
 {
@@ -13341,11 +15825,42 @@ float closetYaw = kClosetYaw, closetPitch = kClosetPitch;
 bool closetSpinning = false;
 POINT closetSpinFrom{};
 float closetSpinYaw = 0, closetSpinPitch = 0;
-RECT ClosetCardRect(const GlassLayout& g) { return g.R(126, 140, 226, 420); }
-RECT ClosetModelRect(const GlassLayout& g) { return g.R(126 + 10, 140 + 14, 226 - 20, 420 - 14 - 92); }
+RECT ClosetCardRect(const GlassLayout& g) { return g.R(kMainX, kClosetGridY, 230, 3 * kClosetTileH + 2 * kClosetGap); }
+RECT ClosetModelRect(const GlassLayout& g) { return g.R(kMainX + 10, kClosetGridY + 14, 230 - 20, 3 * kClosetTileH + 2 * kClosetGap - 14 - 92); }
 
 // The whole player (SkinModel's boxes, both layers) inside `area`, turned by yaw / pitch, lit like the home
 // head. Software ray casting with 2x2 samples per pixel; a ray only tests the boxes whose screen box it is in.
+// A plain classic skin (64x64 RGBA) for the Closet preview before the player's own skin is known: Steve's face,
+// hair, a cyan shirt, blue trousers and grey shoes, flat colours on every face.
+const std::vector<uint8_t>& DefaultSkin()
+{
+    static std::vector<uint8_t> skin;
+    if (!skin.empty()) return skin;
+    skin.assign(64 * 64 * 4, 0);
+    const auto put = [&](int x, int y, uint32_t rgb)
+    {
+        uint8_t* p = &skin[((size_t)y * 64 + x) * 4];
+        p[0] = (uint8_t)(rgb >> 16); p[1] = (uint8_t)(rgb >> 8); p[2] = (uint8_t)rgb; p[3] = 255;
+    };
+    // Every face of the box at (u, v) of size w x h x d, coloured by colour(face, x, y) (face: 0 top, 1 bottom, 2 sides).
+    const auto box = [&](int u, int v, int w, int h, int d, auto colour)
+    {
+        for (int y = 0; y < d; y++) for (int x = 0; x < w; x++) { put(u + d + x, v + y, colour(0, x, y)); put(u + d + w + x, v + y, colour(1, x, y)); }
+        for (int y = 0; y < h; y++) for (int x = 0; x < 2 * (w + d); x++) put(u + x, v + d + y, colour(2, x, y));
+    };
+    const uint32_t skinTone = 0xB4846D, hair = 0x2B1E0D, shirt = 0x00A8A8, trousers = 0x46409A, shoes = 0x5A5A5A;
+    box(0, 0, 8, 8, 8, [&](int face, int, int y) { return face == 0 ? hair : face == 1 ? skinTone : (y < 2 ? hair : skinTone); });
+    for (int i = 0; i < 64; i++) put(8 + i % 8, 8 + i / 8, kDefaultFace[i]);   // the face (front of the head)
+    box(16, 16, 8, 12, 4, [&](int, int, int) { return shirt; });
+    const auto arm = [&](int face, int, int y) { return face == 0 ? shirt : face == 1 ? skinTone : (y < 4 ? shirt : skinTone); };
+    const auto leg = [&](int face, int, int y) { return face == 0 ? trousers : face == 1 ? shoes : (y < 10 ? trousers : shoes); };
+    box(40, 16, 4, 12, 4, arm);
+    box(32, 48, 4, 12, 4, arm);
+    box(0, 16, 4, 12, 4, leg);
+    box(16, 48, 4, 12, 4, leg);
+    return skin;
+}
+
 void DrawSkin3D(HDC hdc, const RECT& area, const std::vector<uint8_t>& skin, uint32_t w, uint32_t h, bool slim,
                 float yawDeg, float pitchDeg)
 {
@@ -13468,8 +15983,8 @@ void DrawSkin3D(HDC hdc, const RECT& area, const std::vector<uint8_t>& skin, uin
 // Left button down on the card: start turning the player. False when the card has no skin to turn.
 bool ClosetStartSpin(HWND hwnd, int mx, int my)
 {
-    uint32_t w = 0, h = 0;
-    if (CurrentSkin(w, h).empty() || !ContainsPoint(ClosetCardRect(GetGlassLayout()), mx, my)) return false;
+    if (closetTab != 0) return false;
+    if (!ContainsPoint(ClosetCardRect(GetGlassLayout()), mx, my)) return false;   // the default body turns too
     closetSpinning = true;
     closetSpinFrom = {mx, my};
     closetSpinYaw = closetYaw;
@@ -13494,6 +16009,7 @@ void ClosetSpin(int mx, int my, bool done)
 // Right-click on the card: face the start angle again.
 bool ClosetResetSpin(int mx, int my)
 {
+    if (closetTab != 0) return false;
     if (!ContainsPoint(ClosetCardRect(GetGlassLayout()), mx, my)) return false;
     closetYaw = kClosetYaw;
     closetPitch = kClosetPitch;
@@ -13511,14 +16027,38 @@ bool PollClosetAnswer()
     std::wstring text;
     switch (state)
     {
-    case State::Sent: text = L"Wearing \"" + closetWearing + L"\" - sent to the server, everyone sees it."; closetAskedAt = 0; break;
-    case State::Failed: text = L"Could not wear \"" + closetWearing + L"\" (see the MyClientData log)."; closetAskedAt = 0; break;
+    case State::Unsupported:
+        text = L"マントはクラシックスキンで試着できます。スキンを読み込んでから選び直してください。";
+        closetAskedAt = 0;
+        break;
+    case State::Saved:
+        text = closetWearing.empty() ? L"Your account skin is selected again."
+                                     : L"Saved \"" + closetWearing + L"\" for your avatar and the next world.";
+        closetAskedAt = 0;
+        break;
+    case State::Sent:
+        text = closetWearing.empty() ? L"Back to your own skin. It stays on when you join a world."
+                                     : L"Wearing \"" + closetWearing + L"\" - everyone sees it, and it stays on in every world.";
+        closetAskedAt = 0;
+        break;
+    case State::Failed:
+        text = closetWearing.empty() ? L"Could not put your own skin back (see the OriginX log)."
+                                     : L"Could not wear \"" + closetWearing + L"\" (see the OriginX log).";
+        closetAskedAt = 0;
+        break;
     case State::NoPlayer: text = L"Join a world first."; closetAskedAt = 0; break;
     case State::Waiting:
         if (waited < 1500) return false;
-        text = L"\"" + closetWearing + L"\" will be worn when you join a world.";
+        text = closetWearing.empty() ? L"Your own skin comes back when you join a world."
+                                     : L"\"" + closetWearing + L"\" will be worn when you join a world.";
         break;
     default: closetAskedAt = 0; return false;
+    }
+    if (closetAskingCape) {
+        if (state == State::Saved) text = L"マントの選択を保存しました。モデルの反映を待っています。";
+        else if (state == State::Sent) text = L"マントの変更を適用しました。サーバー側の設定により他の人からの見え方は異なります。";
+        else if (state == State::Failed) text = L"マントを変更できませんでした。OriginXのログを確認してください。";
+        else if (state == State::Waiting) text = L"マントの反映を待っています…";
     }
     closetShown = state;
     if (text == closetStatus) return false;
@@ -13526,73 +16066,114 @@ bool PollClosetAnswer()
     return true;
 }
 
+void DrawClosetCapes(HDC hdc)
+{
+    const GlassLayout g = GetGlassLayout();
+    const GlassColors c = GlassTheme();
+    DrawGlassFrame(hdc, g, c, GlassRail::Closet);
+    DrawGlassTitle(hdc, g, c, L"Closet", L"");
+    DrawClosetTabs(hdc, g, c);
+    const RECT own = ClosetFolderRect(g);
+    GlassBox(hdc, own, g.L(5), c.chip, c.chipA);
+    DrawTextCentered(hdc, own.left, own.top, own.right - own.left, own.bottom - own.top, L"元のマント", c.text, std::max(12, g.L(11)));
+    const uint32_t selectedCape = MinecraftDataProvider::CapeChoice();
+    for (uint32_t id = 1; id <= 2; ++id) {
+        const RECT r = ClosetCapeRect(g, id);
+        const bool selected = id == selectedCape;
+        GlassRingBox(hdc, r, g.L(12), c.fill, c.fillA, selected ? GlassAccent() : c.line,
+            selected ? kGlassAccentAlpha : 255, std::max(1, g.L(1)));
+        const auto& pixels = ClosetCapePixels(id);
+        const int cell = std::max(1, g.L(10));
+        const int x = (r.left + r.right) / 2 - cell * 5, y = r.top + g.L(28);
+        if (pixels.size() == MyClientSkin::CapeBytes) {
+            std::vector<uint32_t> doll(16 * 32);
+            for (int py = 0; py < 16; ++py)
+                for (int px = 0; px < 10; ++px) {
+                    const auto* p = &pixels[((py + 1) * 64 + px + 12) * 4];
+                    if (p[3] >= 128) doll[(py + 1) * 16 + px + 3] = 0xff000000u | (uint32_t(p[0]) << 16) | (uint32_t(p[1]) << 8) | p[2];
+                }
+            DrawSkinDoll(hdc, doll, x - cell * 3, y - cell, cell);
+        } else DrawTextCentered(hdc, r.left, y, r.right - r.left, g.L(160), L"画像を読み込めませんでした", c.muted, std::max(12, g.L(11)));
+        DrawTextCentered(hdc, r.left, r.top + g.L(220), r.right - r.left, g.L(28), CapeLibrary::Name(id), c.text, std::max(14, g.L(18)));
+        DrawTextCentered(hdc, r.left, r.top + g.L(268), r.right - r.left, g.L(24), selected ? L"選択中" : L"クリックして試着", selected ? GlassAccent() : c.muted, std::max(12, g.L(12)));
+    }
+    DrawTextSimple(hdc, g.x + g.L(kMainX + 40), g.y + g.L(524), L"試着用の2種類です。クラシックスキンに対応しています。", c.muted, std::max(12, g.L(12)));
+}
+
 void DrawCloset(HDC hdc)
 {
+    if (closetTab == 1) { DrawClosetCapes(hdc); return; }
     if (!closetScanned) ScanClosetSkins();
     const GlassLayout g = GetGlassLayout();
     const GlassColors c = GlassTheme();
     DrawGlassFrame(hdc, g, c, GlassRail::Closet);
 
     // Top row: the title, Refresh and Open folder.
+    DrawGlassTitle(hdc, g, c, L"Closet", L"");
+    DrawClosetTabs(hdc, g, c);
+    const int buttonText = std::max(12, g.L(11));
+    for (int k = 0; k < 3; k++)
     {
-        const RECT back = GlassBackRect(g);
-        const int size = std::max(12, g.L(22));
-        DrawTextSimple(hdc, back.right + g.L(16), (back.top + back.bottom) / 2 - TextMiddle(hdc, size), L"CLOSET", c.text, size);
+        const RECT r = k == 1 ? ClosetFolderRect(g) : k == 2 ? ClosetOwnRect(g) : ClosetRefreshRect(g);
+        const bool primary = k == 1 && closetSkins.empty();
+        GlassBox(hdc, r, g.L(5), primary ? GlassAccent() : c.chip, primary ? kGlassAccentAlpha : c.chipA);
+        FontStyle semi(FW_SEMIBOLD);
+        DrawTextCentered(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                         k == 1 ? L"Open folder" : k == 2 ? L"My own skin" : L"Refresh",
+                         primary ? RGB(255,255,255) : c.text, buttonText);
     }
-    const int buttonText = std::max(10, g.L(14));
-    for (int k = 0; k < 2; k++)
-    {
-        const RECT r = k ? ClosetFolderRect(g) : ClosetRefreshRect(g);
-        GlassBox(hdc, r, g.L(12), c.fill, c.fillA);
-        DrawTextCentered(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top, k ? L"Open folder" : L"Refresh", c.text, buttonText);
-    }
-    const int small = std::max(10, g.L(15));
-    DrawTextSimple(hdc, g.x + g.L(126), g.y + g.L(112), closetStatus.empty()
-                   ? L"Click a skin to wear it. Other players see it too." : closetStatus, closetStatus.empty() ? c.muted : c.text, small);
+    const int small = std::max(12, g.L(11.5f));
 
     // Left card: the skin worn now.
     uint32_t w = 0, h = 0;
     const std::vector<uint8_t>& skin = CurrentSkin(w, h);
     const bool persona = MinecraftDataProvider::SkinHasNoPicture();
+    const bool shownDefault = skin.empty();   // the preview then shows a plain default body
     {
         const RECT card = ClosetCardRect(g);
-        GlassBox(hdc, card, g.L(16), c.fill, c.fillA);
-        const int cell = std::max(2, g.L(10));
-        const int dx = (card.left + card.right) / 2 - 8 * cell, dy = card.top + g.L(24);
-        if (!skin.empty())
+        GlassRingBox(hdc, card, g.L(kCardCut), c.fill, c.fillA, c.line, 255, std::max(1, g.L(1)));
         {
+            // The whole model (the player's skin, or a plain default one until it is known); drag to turn it.
             // Cached: LooksSlim reads the arm pixels, and the card is redrawn on every drag step.
             static std::vector<uint8_t> slimOf;
             static bool slim = false;
-            if (slimOf != skin) { slimOf = skin; slim = MyClientSkin::LooksSlim(skin.data(), w, h); }
-            DrawSkin3D(hdc, ClosetModelRect(g), skin, w, h, slim, closetYaw, closetPitch);
+            if (!shownDefault && slimOf != skin) { slimOf = skin; slim = MyClientSkin::LooksSlim(skin.data(), w, h); }
+            DrawSkin3D(hdc, ClosetModelRect(g), shownDefault ? DefaultSkin() : skin, shownDefault ? 64 : w, shownDefault ? 64 : h,
+                       !shownDefault && slim, closetYaw, closetPitch);
             DrawTextCentered(hdc, card.left, card.bottom - g.L(82), card.right - card.left, g.L(18),
-                             L"Drag to turn", c.muted, std::max(9, g.L(12)));
-        }
-        else
-        {
-            int side = 8;
-            const std::vector<uint32_t> face = HeadColors(side);
-            DrawPixelArt(hdc, face, side, dx + 4 * cell, dy, cell * 8 / side);
+                             L"Drag to turn", c.muted, std::max(12, g.L(10)));
         }
         DrawTextCentered(hdc, card.left, card.bottom - g.L(56), card.right - card.left, g.L(20),
-                         skin.empty() ? (persona ? L"Now wearing" : L"Not seen yet") : L"Now wearing", c.text, std::max(10, g.L(16)));
+                         skin.empty() ? (persona ? L"Now wearing" : L"Not seen yet") : L"Now wearing", c.text, std::max(12, g.L(13)));
         DrawTextCentered(hdc, card.left, card.bottom - g.L(34), card.right - card.left, g.L(18),
-                         skin.empty() ? (persona ? L"a character creator skin" : L"join a world once") : std::to_wstring(w) + L" x " + std::to_wstring(h),
-                         c.muted, std::max(9, g.L(13)));
+                         skin.empty() ? (persona ? L"a character creator skin" : L"Join a world to load your skin") : std::to_wstring(w) + L" x " + std::to_wstring(h),
+                         c.muted, std::max(12, g.L(10.5f)));
     }
 
     if (closetSkins.empty())
     {
-        const int x = g.x + g.L(kClosetGridX + 4), y = g.y + g.L(kClosetGridY + 10), line = g.L(24);
-        DrawTextSimple(hdc, x, y, L"No skins found on this PC.", c.text, std::max(11, g.L(18)));
-        const wchar_t* const lines[] = {
-            L"Import one in Minecraft: Dressing Room -> Classic skins -> Import,",
-            L"or press Open folder, put skin PNGs there and press Refresh.",
-            L"Marketplace and Character Creator skins cannot be listed",
-            L"(the game keeps them locked).",
+        const int x = g.x + g.L(kClosetGridX + 4), y = g.y + g.L(kClosetGridY + 10), line = g.L(36);
+        {
+            FontStyle bold(FW_BOLD);
+            DrawTextSimple(hdc, x, y, L"No skins on this PC yet", c.text, std::max(14, g.L(16)));
+        }
+        const wchar_t* const steps[] = {
+            L"In Minecraft: Dressing Room \u2192 Classic skins \u2192 Import",
+            L"Or press Open folder and put skin PNGs there",
+            L"Press Refresh: they show up here",
         };
-        for (int i = 0; i < 4; i++) DrawTextSimple(hdc, x, y + g.L(36) + i * line, lines[i], c.muted, small);
+        for (int i = 0; i < 3; i++)
+        {
+            const int top = y + g.L(40) + i * line, d = g.L(24);
+            GlassBox(hdc, RECT{x, top, x + d, top + d}, d / 2, c.chip, c.chipA);
+            FontStyle bold(FW_BOLD);
+            DrawTextCentered(hdc, x, top, d, d, std::to_wstring(i + 1), GlassAccent(), std::max(12, g.L(11)));
+            FontStyle semi(FW_SEMIBOLD);
+            DrawTextSimple(hdc, x + d + g.L(14), top + d / 2 - TextMiddle(hdc, small), steps[i], c.text, small);
+        }
+        FontStyle semi(FW_SEMIBOLD);
+        DrawTextSimple(hdc, x, y + g.L(40) + 3 * line + g.L(6), L"Marketplace and Character Creator skins stay locked by the game.", c.muted,
+                       std::max(12, g.L(10.5f)));
         return;
     }
 
@@ -13605,24 +16186,40 @@ void DrawCloset(HDC hdc)
         const SkinLibrary::Entry& e = closetSkins[index];
         const RECT r = ClosetTileRect(g, slot);
         const bool worn = !skin.empty() && e.w == w && e.h == h && e.rgba == skin;
-        GlassBox(hdc, r, g.L(16), worn ? GlassAccent() : c.fill, worn ? kGlassAccentAlpha : c.fillA);
+        GlassRingBox(hdc, r, g.L(12), c.fill, c.fillA, worn ? GlassAccent() : c.line, worn ? kGlassAccentAlpha : 255,
+                     std::max(1, worn ? g.L(1.5f) : g.L(1)));
         DrawSkinDoll(hdc, e.doll, (r.left + r.right) / 2 - 8 * cell, r.top + g.L(8), cell);
         const int tileW = r.right - r.left;
         std::wstring name = e.name;
         while (name.size() > 1 && TextWidth(hdc, name, nameSize) > tileW - g.L(10)) name.pop_back();
         if (name.size() < e.name.size() && name.size() > 1) { name.pop_back(); name += L"\u2026"; }
-        DrawTextCentered(hdc, r.left, r.bottom - g.L(22), tileW, g.L(16), name, worn ? RGB(255,255,255) : c.text, nameSize);
+        DrawTextCentered(hdc, r.left, r.bottom - g.L(22), tileW, g.L(16), name, worn ? GlassAccent() : c.text, nameSize);
     }
 
     // Scrollbar, when some rows are out of view (like the Mods page's).
     const int rows = ((int)closetSkins.size() + kClosetCols - 1) / kClosetCols;
-    if (rows > kClosetRows)
+    DrawGlassScrollbar(hdc, g, c, kClosetGridY, kClosetRows * (kClosetTileH + kClosetGap) - kClosetGap, closetScroll, rows, kClosetRows);
+}
+
+// Asks the game to wear a skin (0x0 with no name: take the Closet's skin off) and shows that it was asked.
+void AskClosetSkin(const std::vector<uint8_t>& rgba, uint32_t w, uint32_t h, bool slim, const std::wstring& name)
+{
+    closetAskingCape = false;
+    using State = MinecraftDataProvider::SkinRequestState;
+    const State state = MinecraftDataProvider::RequestSkin(rgba, w, h, slim, WideToUtf8(name));
+    closetWearing = name;
+    closetAskedAt = 0;
+    closetShown = State::None;
+    switch (state)
     {
-        const RECT track = g.R(kGlassW - 30, kClosetGridY, 6, kClosetRows * (kClosetTileH + kClosetGap) - kClosetGap);
-        const int th = track.bottom - track.top, thumb = std::max(g.L(30), th * kClosetRows / rows);
-        const int top = track.top + (th - thumb) * closetScroll / (rows - kClosetRows);
-        DrawRoundBox(hdc, track.left, track.top, track.right - track.left - 1, th - 1, g.L(3), c.track);
-        DrawRoundBox(hdc, track.left, top, track.right - track.left - 1, thumb - 1, g.L(3), GlassAccent());
+    case State::Waiting:
+        closetAskedAt = GetTickCount64();
+        closetShown = State::Waiting;
+        closetStatus = name.empty() ? L"Putting your own skin back..." : L"Putting on \"" + name + L"\"...";
+        break;
+    case State::NoGame: closetStatus = L"Start Minecraft first."; break;
+    case State::OldDll: closetStatus = L"Update the OriginX game DLL to switch skins."; break;
+    default: closetStatus = L"Could not reach the game - try again."; break;
     }
 }
 
@@ -13631,7 +16228,28 @@ void HandleClosetClick(int mx, int my)
 {
     const GlassLayout g = GetGlassLayout();
     if (HandleGlassFrameClick(g, mx, my)) return;
+    for (int tab = 0; tab < 2; ++tab)
+        if (ContainsPoint(ClosetTabRect(g, tab), mx, my)) { closetTab = tab; closetStatus.clear(); return; }
+    if (closetTab == 1) {
+        uint32_t cape = 3;
+        if (ContainsPoint(ClosetFolderRect(g), mx, my)) cape = 0;
+        for (uint32_t id = 1; id <= 2; ++id) if (ContainsPoint(ClosetCapeRect(g, id), mx, my)) cape = id;
+        if (cape <= 2) {
+            const auto& pixels = ClosetCapePixels(cape);
+            if (cape && pixels.empty()) { closetStatus = L"マントの画像を読み込めませんでした。"; return; }
+            using State = MinecraftDataProvider::SkinRequestState;
+            const State answer = MinecraftDataProvider::RequestCape(cape, pixels);
+            closetAskingCape = true;
+            closetWearing = CapeLibrary::Name(cape);
+            closetShown = answer;
+            closetAskedAt = answer == State::Waiting ? GetTickCount64() : 0;
+            closetStatus = answer == State::Waiting ? L"マントを変更しています…" : answer == State::OldDll ?
+                L"マント対応版のOriginXへ更新してください。" : answer == State::NoGame ? L"Minecraftを起動してください。" : L"マントを変更できませんでした。";
+        }
+        return;
+    }
     if (ContainsPoint(ClosetRefreshRect(g), mx, my)) { ScanClosetSkins(); closetStatus.clear(); return; }
+    if (ContainsPoint(ClosetOwnRect(g), mx, my)) { AskClosetSkin({}, 0, 0, false, L""); return; }   // 0x0 = take it off
     if (ContainsPoint(ClosetFolderRect(g), mx, my))
     {
         const std::filesystem::path folder = SkinLibrary::CustomSkinsFolder();
@@ -13647,22 +16265,7 @@ void HandleClosetClick(int mx, int my)
         if (index >= (int)closetSkins.size()) break;
         if (!ContainsPoint(ClosetTileRect(g, slot), mx, my)) continue;
         const SkinLibrary::Entry& e = closetSkins[index];
-        using State = MinecraftDataProvider::SkinRequestState;
-        const State state = MinecraftDataProvider::RequestSkin(e.rgba, e.w, e.h, e.slim, WideToUtf8(e.name));
-        closetWearing = e.name;
-        closetAskedAt = 0;
-        closetShown = State::None;
-        switch (state)
-        {
-        case State::Waiting:
-            closetAskedAt = GetTickCount64();
-            closetShown = State::Waiting;
-            closetStatus = L"Putting on \"" + e.name + L"\"...";
-            break;
-        case State::NoGame: closetStatus = L"Start Minecraft first."; break;
-        case State::OldDll: closetStatus = L"Update MyClientData (the game DLL) to switch skins."; break;
-        default: closetStatus = L"Could not reach the game - try again."; break;
-        }
+        AskClosetSkin(e.rgba, e.w, e.h, e.slim, e.name);
         return;
     }
 }
@@ -13979,6 +16582,7 @@ void DeactivateOverlay(bool backToGame)
 void OpenMenu()
 {
     menuOpen = true;
+    menuParked = false;
     hudEditMode = false;
 
     selectedCategory =
@@ -14006,6 +16610,7 @@ void OpenMenu()
 void OpenHudEditor()
 {
     menuOpen = true;
+    menuParked = false;
     hudEditMode = true;
 
     selectedCategory =
@@ -14051,12 +16656,14 @@ void OpenHomeItem(HomeItem item)
 void CloseMenu(bool backToGame)
 {
     menuOpen = false;
+    menuParked = false;
     UpdateGlassBlur(false);
     replaysOpen = false;
     replaySearching = false;
     replayRenaming.clear();
     searchActive = false;
     presetEditing = false;
+    StopCommandHotkeyEditing();
     if (nickEditing)
     {
         nickEditing = false;
@@ -14154,11 +16761,18 @@ bool AddPartyPlayerFromInput()
 // was still empty left the window black with the closed menu on it. Instead a colour-keyed window stays fully
 // transparent (alpha 0) until its first picture is painted (ShowKeyedPicture); a per-pixel alpha window shows
 // nothing before its first UpdateLayeredWindow anyway.
+// Going to per-pixel alpha the old contents (the in-game drawing fills the whole window with the magenta key)
+// still showed for a frame between the style change and the first UpdateLayeredWindow: a pink flash on G.
+// The window first goes fully transparent, and the empty region stays until that first picture has been
+// sent (ShowAlphaPicture); UpdateLayeredWindow is not clipped by the region the way GDI painting is.
 bool overlayKeyHidden = false;
+bool overlayAlphaHidden = false;
 
 void Relayer(HWND hwnd, bool alpha)
 {
     if (!hwnd) return;
+    if (alpha)   // hide the colour-keyed picture before the style goes
+        SetLayeredWindowAttributes(hwnd, RGB(255,0,255), 0, LWA_COLORKEY | LWA_ALPHA);
     HRGN none = CreateRectRgn(0, 0, 0, 0);
     const bool hidden = none && SetWindowRgn(hwnd, none, FALSE);   // Windows owns the region now
     if (none && !hidden) DeleteObject(none);
@@ -14166,9 +16780,18 @@ void Relayer(HWND hwnd, bool alpha)
     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
     overlayKeyHidden = !alpha;
+    overlayAlphaHidden = alpha && hidden;
     if (!alpha)
         SetLayeredWindowAttributes(hwnd, RGB(255,0,255), 0, LWA_COLORKEY | LWA_ALPHA);
-    if (hidden) SetWindowRgn(hwnd, nullptr, FALSE);
+    if (hidden && !alpha) SetWindowRgn(hwnd, nullptr, FALSE);
+}
+
+// After the first UpdateLayeredWindow (or when it failed and the colour key takes over): show the window again.
+void ShowAlphaPicture(HWND hwnd)
+{
+    if (!hwnd || !overlayAlphaHidden) return;
+    overlayAlphaHidden = false;
+    SetWindowRgn(hwnd, nullptr, FALSE);
 }
 
 void ShowKeyedPicture(HWND hwnd)
@@ -14273,12 +16896,19 @@ LRESULT CALLBACK WindowProc(
             glassShapes.clear();
             textInks.clear();
 
-            DrawChunkBorders(back, w, h);
-            DrawHitboxes(back, w, h);
+            if (hudEditMode || (!menuOpen && !MinecraftDataProvider::IsGameMenuOpen()))
+            {
+                DrawChunkBorders(back, w, h);
+                DrawHitboxes(back, w, h);
+            }
             DrawHud(back);
             DrawDebugScreen(back, w, h);
             DrawToasts(back, w, h);
-            DrawShulkerHover(back, w, h);
+            if (!menuOpen)
+            {
+                DrawShulkerHover(back, w, h);
+                DrawItemCounter(back, w, h);
+            }
             DrawHomeReplaysButton(back);
             DrawReplayPlaybackBar(back);
 
@@ -14286,7 +16916,8 @@ LRESULT CALLBACK WindowProc(
             {
                 DrawMenu(back);
             }
-            UpdateGlassBlur(menuOpen && GlassPageShown());
+            DrawReplayTimeline(back, w, h);   // above the menu: the menu is how the mouse reaches it
+            UpdateGlassBlur(menuOpen && !menuParked && (GlassPageShown() || (selectedCategory == MenuCategory::Home && !replaysOpen && !hudEditMode)));
 
             GdiFlush();
 
@@ -14436,6 +17067,7 @@ LRESULT CALLBACK WindowProc(
                     const DWORD error = ok ? 0 : GetLastError();
                     ReleaseDC(nullptr, screen);
                     overlayAlphaShown = ok != FALSE;
+                    ShowAlphaPicture(hwnd);
                     if (!ok)
                     {
                         // Back to the colour key at once (an unconfirmed layered window shows nothing).
@@ -14516,6 +17148,17 @@ LRESULT CALLBACK WindowProc(
             return 0;
         }
 
+        if (menuOpen && commandHotkeyEditing >= 0)
+        {
+            const int vk = (int)wParam;
+            if (vk == VK_ESCAPE || vk == VK_RETURN)
+            {
+                StopCommandHotkeyEditing();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        }
+
         if (menuOpen &&
             nickEditing)
         {
@@ -14588,10 +17231,11 @@ LRESULT CALLBACK WindowProc(
             }
 
             int* target =
-                GetShortcutPtr(
+                KeyTargetOf(
                     shortcutFeature != DetailFeature::None
                         ? shortcutFeature
-                        : detailFeature
+                        : detailFeature,
+                    shortcutFeature != DetailFeature::None ? shortcutSlot : -1
                 );
 
             if (target &&
@@ -14661,6 +17305,34 @@ LRESULT CALLBACK WindowProc(
             const wchar_t c = (wchar_t)wParam;
             if (c == L'\b') { if (!presetNameText.empty()) presetNameText.pop_back(); }
             else if (c >= 32 && c != 127 && presetNameText.size() < 24) presetNameText.push_back(c);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+
+        if (menuOpen && commandHotkeyEditing >= 0 && commandHotkeyEditing < kCommandHotkeyCount)
+        {
+            const wchar_t c = (wchar_t)wParam;
+            std::wstring& text = commandHotkeys[commandHotkeyEditing].text;
+            constexpr size_t kMax = 200;   // well inside the DLL's 255 UTF-8 bytes for most text
+            if (c == L'\b')
+            {
+                if (!text.empty()) text.pop_back();
+            }
+            else if (c == 0x16 && OpenClipboard(hwnd))   // Ctrl+V
+            {
+                if (HANDLE data = GetClipboardData(CF_UNICODETEXT))
+                {
+                    if (const wchar_t* pasted = static_cast<const wchar_t*>(GlobalLock(data)))
+                    {
+                        for (const wchar_t* p = pasted; *p && text.size() < kMax; p++)
+                            if (*p >= 32 && *p != 127) text.push_back(*p);
+                        GlobalUnlock(data);
+                    }
+                }
+                CloseClipboard();
+            }
+            else if (c >= 32 && c != 127 && text.size() < kMax)
+                text.push_back(c);
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
@@ -14773,6 +17445,7 @@ LRESULT CALLBACK WindowProc(
             return 0;
 
         presetEditing = false;   // a click anywhere ends typing; the name box turns it back on
+        StopCommandHotkeyEditing();   // ...the same for a Command Hotkeys line (its box turns it back on)
         if (nickEditing)
         {
             // A click anywhere ends the edit; the Nick box re-enables it when it is the target.
@@ -14787,6 +17460,12 @@ LRESULT CALLBACK WindowProc(
 
         int my =
             HIWORD(lParam);
+
+        if (!hudEditMode && HandleReplayTimelineClick(mx, my))
+        {
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
 
         if (menuSoundOpen && mx < 400)
             menuSoundOpen = false;   // clicking the module list closes the sound list
@@ -15109,6 +17788,7 @@ LRESULT CALLBACK WindowProc(
 
                     waitingForShortcut = !same;
                     shortcutFeature = kFeatureList[i];
+                    shortcutSlot = -1;
 
                     InvalidateRect(
                         hwnd,
@@ -15157,6 +17837,7 @@ LRESULT CALLBACK WindowProc(
                 {
                     waitingForShortcut = true;
                     shortcutFeature = ActiveDetail();
+                    shortcutSlot = -1;
                     SetFocus(hwnd);
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
@@ -15970,6 +18651,21 @@ LRESULT CALLBACK WindowProc(
 
         if (menuOpen && GlassContentShown())
         {
+            if (selectedCategory == MenuCategory::Feature && detailFeature == DetailFeature::Textures)
+            {
+                // The Textures page: the wheel scrolls the list under the mouse (Available or Active).
+                POINT at{(int)(short)LOWORD(lParam), (int)(short)HIWORD(lParam)};
+                ScreenToClient(hwnd, &at);
+                const GlassLayout g = GetGlassLayout();
+                const std::vector<GlassSetting> rows = GlassSettings();
+                const std::vector<RECT> rects = GlassRowRects(g, rows);
+                if (!rows.empty() && rows.back().pitch > 0 &&
+                    WheelTexPicker(g, rects.back(), at.x, at.y, GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? 1 : -1))
+                {
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
             glassRowScroll -= GET_WHEEL_DELTA_WPARAM(wParam) > 0 ? 1 : -1;
             ClampGlassRowScroll(GlassSettings());
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -16173,7 +18869,7 @@ void CreateOverlay()
             WS_EX_NOACTIVATE,
 
             L"MyClientOverlay",
-            L"MyClient",
+            L"OriginX",
             WS_POPUP,
 
             0,
@@ -16318,7 +19014,7 @@ int WINAPI WinMain(
     bool prevArrows = false;
     bool prevFPS = false;
     bool prevBlockOutline = false;
-    bool prevExtra[26] = {};
+    bool prevExtra[32] = {};
 
 
     bool previousLeft = false;
@@ -16396,6 +19092,7 @@ int WINAPI WinMain(
             minecraftWindow
         );
 
+        PollReplayJoin();
         if (PollClosetAnswer() && menuOpen && overlayWindow)
             InvalidateRect(overlayWindow, nullptr, FALSE);
 
@@ -16436,13 +19133,21 @@ int WINAPI WinMain(
             else if (inactiveSince == 0)
                 inactiveSince = GetTickCount64();
 
+            // With the menu open the other app is put in front on purpose (a click or Alt+Tab): the menu goes
+            // away at once instead of staying over that app for 400 ms (2026-11-03 user report).
             if (!minecraftActive && overlayShown &&
-                GetTickCount64() - inactiveSince >= 400)
+                (menuOpen || GetTickCount64() - inactiveSince >= 400))
             {
-                // Another app is in front: close the menu too. Its invisible input window covers the
-                // game area and would otherwise keep taking the clicks meant for that app.
-                if (menuOpen)
-                    CloseMenu(false);
+                // Another app is in front: the menu stays open but is put away (2026-11-03 user request: no
+                // closing and no pause screen). Its invisible input window covers the game area and would
+                // otherwise keep taking the clicks meant for that app, so it is hidden with the overlay; the DLL
+                // keeps holding the game's lost focus while the menu is open, so the game does not pause.
+                if (menuOpen && !menuParked)
+                {
+                    menuParked = true;
+                    UpdateGlassBlur(false);
+                    DeactivateOverlay(false);
+                }
                 ShowWindow(overlayWindow, SW_HIDE);
                 if (catcherWindow)
                     ShowWindow(catcherWindow, SW_HIDE);
@@ -16451,6 +19156,13 @@ int WINAPI WinMain(
             {
                 ShowWindow(overlayWindow, SW_SHOWNOACTIVATE);
                 hasPreviousRect = false; // Force repositioning over the game.
+                // Back from the other app: the menu that was put away takes the focus and the mouse again.
+                if (menuOpen && menuParked)
+                {
+                    menuParked = false;
+                    ActivateOverlay();
+                    InvalidateRect(overlayWindow, nullptr, FALSE);
+                }
             }
         }
 
@@ -16524,6 +19236,7 @@ int WINAPI WinMain(
             menuOpen &&
             (searchActive ||
              nickEditing ||
+             commandHotkeyEditing >= 0 ||
              presetEditing ||
              partyAddingPlayer ||
              (replaysOpen && (replaySearching || !replayRenaming.empty())));
@@ -16561,6 +19274,8 @@ int WINAPI WinMain(
             );
         }
 
+
+        PollReplayKeys(minecraftActive && !typingText && !gameScreenOpen && !menuOpen);
 
         // A G still held when the game screen closes (e.g. the last letter typed in chat) must not open the menu.
         previousGState =
@@ -16670,7 +19385,18 @@ int WINAPI WinMain(
         CheckShortcut(shortcuts.textures, prevExtra[4], DetailFeature::Textures);
         CheckShortcut(shortcuts.featureList, prevExtra[6], DetailFeature::FeatureList);
         CheckShortcut(shortcuts.shulker, prevExtra[7], DetailFeature::ShulkerPreview);
-        CheckShortcut(shortcuts.tabList, prevExtra[11], DetailFeature::TabList);
+        {
+            // Tab List: the list is shown only while its key is held (it never switches the module itself).
+            const int vk = shortcuts.tabList;
+            const bool shown = tabListEnabled && vk != 0 && vk != shortcuts.menuKey && vk != VK_ESCAPE && IsKeyDown(vk) &&
+                               gameActive && !menuOpen && !waitingForShortcut && GameOwnsKeyboard();
+            if (shown != tabListShown)
+            {
+                tabListShown = shown;
+                if (overlayWindow) InvalidateRect(overlayWindow, nullptr, FALSE);
+            }
+            prevExtra[11] = shown;
+        }
         CheckShortcut(shortcuts.hiveStats, prevExtra[12], DetailFeature::HiveStats);
         CheckShortcut(shortcuts.chunkBorder, prevExtra[13], DetailFeature::ChunkBorder);
         CheckShortcut(shortcuts.hitbox, prevExtra[14], DetailFeature::Hitbox);
@@ -16685,6 +19411,16 @@ int WINAPI WinMain(
         CheckShortcut(shortcuts.dayTimer, prevExtra[23], DetailFeature::DayTimer);
         CheckShortcut(shortcuts.blockDetails, prevExtra[24], DetailFeature::BlockDetails);
         CheckShortcut(shortcuts.healthWarning, prevExtra[25], DetailFeature::HealthWarning);
+        CheckShortcut(shortcuts.coordinates, prevExtra[26], DetailFeature::Coordinates);
+        CheckShortcut(shortcuts.commandHotkeys, prevExtra[27], DetailFeature::CommandHotkeys);
+        PollCommandHotkeys(gameActive);
+        CheckShortcut(shortcuts.timer, prevExtra[28], DetailFeature::Timer);
+        CheckShortcut(shortcuts.cpsLimiter, prevExtra[29], DetailFeature::CpsLimiter);
+        CheckShortcut(shortcuts.itemCounter, prevExtra[30], DetailFeature::ItemCounter);
+        CheckShortcut(shortcuts.packDisplay, prevExtra[31], DetailFeature::PackDisplay);
+        MinecraftDataProvider::SetItemCounterWanted(itemCounterEnabled);
+        PollTimerKeys(gameActive);
+        UpdateCpsLimiter(gameActive);
         {
             // Debug Menu: its key shows / hides the debug screen (it never switches the module itself).
             static bool previousDebugKey = false;
@@ -16746,8 +19482,18 @@ int WINAPI WinMain(
         MinecraftDataProvider::SetRenderDistance(
             liteEnabled && liteRenderEnabled ? (uint32_t)liteRenderDistance : 0u, renderRequestCounter);
         MinecraftDataProvider::SetEntityDistance(liteEnabled && liteEntityLimit ? (uint32_t)liteEntityDistance : 0u, false);
-        MinecraftDataProvider::SetOptimize(liteCullMobs, liteCullItems, liteCullMisc, liteEnabled && liteNoNameTags,
-                                           liteEnabled && litePlayerLimit ? (uint32_t)litePlayerDistance : 0u);
+        {
+            MyClientFeatures::OptimizeExtras extras;   // only while Optimization is on
+            extras.noClouds = liteEnabled && liteClouds;
+            extras.noSky = liteEnabled && liteNoSkyFull;
+            extras.cullBehind = liteEnabled && liteCullBehind;
+            extras.blockEntityBlocks = liteEnabled && liteBlockEntityLimit ? (uint32_t)liteBlockEntityDistance : 0u;
+            extras.verticalRows = liteEnabled && liteVerticalLimit ? (uint32_t)liteVerticalRows : 0u;
+            MinecraftDataProvider::SetOptimize(liteCullMobs, liteCullItems, liteCullMisc, liteEnabled && liteNoNameTags,
+                                               liteEnabled && litePlayerLimit ? (uint32_t)litePlayerDistance : 0u,
+                                               liteEnabled,   // legacy optimization bit; native V-Sync OFF is honored independently
+                                               MyClientFeatures::EncodeOptimizeExtras(extras));
+        }
         {
             static ULONGLONG lastTweak = 0;   // Windows settings on the game's process: about once a second
             if (GetTickCount64() - lastTweak >= 1000) { lastTweak = GetTickCount64(); ApplyProcessTweaks(); }
@@ -16844,7 +19590,10 @@ int WINAPI WinMain(
                 !toasts.empty() ? 0 :
                 !minecraftActive ? 250 :
                 // The home screen's head turns and sways: ~30 frames a second while it is shown.
-                (menuOpen && !hudEditMode && !replaysOpen && selectedCategory == MenuCategory::Home) ? 33 :
+                // (2026-11-03 user report: 30 a second looked jerky; now every loop pass, ~60 a second.)
+                (menuOpen && !hudEditMode && !replaysOpen && selectedCategory == MenuCategory::Home) ? 0 :
+                // A switch is sliding: every pass until it stops.
+                (menuOpen && now < switchAnimUntil) ? 0 :
                 (menuOpen && !hudEditMode) ? 50 :
                 (!menuOpen && !inWorld) ? 100 :
                 0;

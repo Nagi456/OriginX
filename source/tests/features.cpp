@@ -1,10 +1,34 @@
 #include "FeatureData.h"
+#include "../JavaChatChannel.h"
 #include <cstddef>
 #include <cassert>
 #include <iostream>
 #include <limits>
 using namespace MyClientFeatures;
 int main() {
+    {
+        using namespace MyClientJavaChat;
+        assert(MyClientJavaChat::Fresh(1000, 1499) && !MyClientJavaChat::Fresh(1000, 1500) && !MyClientJavaChat::Fresh(1000, 999));
+        assert(NativeChatName("chat_panel") && NativeChatName("chat_text"));
+        assert(!NativeChatName("chat_button") && !NativeChatName("chat_input"));
+        const std::string unicode = std::string(MaxBytes - 2, 'a') + "\xe3\x81\x82";
+        assert(BoundedUtf8(unicode).size() == MaxBytes - 2);
+#ifdef _WIN32
+        Channel producer, consumer;
+        const DWORD pid = GetCurrentProcessId();
+        assert(producer.Open(pid, true) && consumer.Open(pid, false));
+        Snapshot data{};
+        assert(consumer.ReadAndRequest(pid, true, data) && producer.Wanted(pid));
+        assert(data.ready == 0); // No acknowledgment: the HUD must keep the native chat.
+        data.at = GetTickCount64(); data.ready = 1; data.count = 1;
+        std::memcpy(data.lines[0], "hello", 6);
+        producer.Publish(pid, data);
+        Snapshot answer{};
+        assert(consumer.ReadAndRequest(pid, false, answer));
+        assert(answer.ready == 1 && answer.count == 1 && std::strcmp(answer.lines[0], "hello") == 0);
+        assert(!producer.Wanted(pid)); // OFF or expired lease must restore native controls.
+#endif
+    }
     {   // Health Warning: health rides in clockReserved; 0 (older DLLs) is "unknown", 0 health is known
         int points = -1;
         assert(!MyClientFeatures::DecodeHealth(0, points));
@@ -72,6 +96,16 @@ int main() {
         assert(TextureReloadRequested(c, 5100, seen, primed) && seen == 9);
         c.texReload = 10; c.texturesOn = 0; assert(!TextureReloadRequested(c, 5100, seen, primed));   // feature off: ignored
         c.texturesOn = 1; assert(TextureReloadRequested(c, 5100, seen, primed));
+        {   // bit 1 = the experimental in-world apply: still one request per counter change, and only with bit 0
+            Command live = c; uint32_t liveSeen = 0; bool livePrimed = false;
+            live.texturesOn = 3; live.texReload = 20;
+            assert(!TextureReloadRequested(live, 5100, liveSeen, livePrimed));   // first sight only records
+            live.texReload = 21; assert(TextureReloadRequested(live, 5100, liveSeen, livePrimed));
+            assert(WantsLiveTextures(live, 5100) && !WantsLiveTextures(c, 5100));
+            live.texturesOn = 2; live.texReload = 22; assert(!TextureReloadRequested(live, 5100, liveSeen, livePrimed) && !WantsLiveTextures(live, 5100));
+            live.texturesOn = 7; assert(!TextureReloadRequested(live, 5100, liveSeen, livePrimed));   // unknown bits: ignored
+            live.texturesOn = 3; assert(!WantsLiveTextures(live, live.at + CommandLeaseMs + 5000));  // lease
+        }
         c.texReload = 0; assert(TextureReloadRequested(c, 5100, seen, primed));           // HUD restarted its counter: still a change
     }
     Command outline{2000, 0, 0, 0, 0, 1, 0x50B4FF};
@@ -120,6 +154,29 @@ int main() {
     assert((opt & CullMobsBit) && !(opt & CullItemsBit) && (opt & CullMiscBit) && (opt & HideNameTagsBit) && PlayerDistanceBlocks(opt) == 64);
     assert(PlayerDistanceBlocks(EncodeOptimize(false, false, false, false, 0)) == 0 && EncodeOptimize(false, false, false, false, 0) == 0);
     assert(PlayerDistanceBlocks(EncodeOptimize(false, false, false, false, 1000)) == EntityDistanceMax);
+    // FPS cap: its own bit, never touching the player distance (bits 4..8 at their largest).
+    assert(!(opt & UncapFpsBit) && (EncodeOptimize(false, false, false, false, 0, true) == UncapFpsBit));
+    assert(PlayerDistanceBlocks(EncodeOptimize(false, false, false, false, 1000, true)) == EntityDistanceMax && (EncodeOptimize(false, false, false, false, 1000, true) & UncapFpsBit));
+    // Optimization extras: their own bits above the FPS cap, never touching the older ones.
+    {
+        OptimizeExtras e; e.verticalRows = 3; e.blockEntityBlocks = 40; e.noSky = true; e.cullBehind = true; e.noClouds = true;
+        const uint32_t bits = EncodeOptimizeExtras(e);
+        const uint32_t older = EncodeOptimize(true, true, true, true, 1000, true);
+        assert((bits & older) == 0);
+        const OptimizeExtras back = DecodeOptimizeExtras(bits | older);
+        assert(back.verticalRows == 3 && back.blockEntityBlocks == 40 && back.noSky && back.cullBehind && back.noClouds);
+        assert(!DecodeOptimizeExtras(older).noClouds && !DecodeOptimizeExtras(0).noClouds);
+        assert(EncodeOptimizeExtras(OptimizeExtras{0, 0, false, false, true}) == NoCloudsBit);
+        assert(PlayerDistanceBlocks(bits | older) == EntityDistanceMax && (DecodeOptimizeExtras(older).verticalRows == 0));
+        OptimizeExtras big; big.verticalRows = 99; big.blockEntityBlocks = 9999;
+        const OptimizeExtras clamped = DecodeOptimizeExtras(EncodeOptimizeExtras(big));
+        assert(clamped.verticalRows == VerticalRowsMax && clamped.blockEntityBlocks == EntityDistanceMax && !clamped.noSky);
+        assert(DecodeOptimizeExtras(0).verticalRows == 0 && DecodeOptimizeExtras(0).blockEntityBlocks == 0);
+        assert(!OutsideVerticalRows(10, 4, 0) && !OutsideVerticalRows(6, 4, 2) && OutsideVerticalRows(7, 4, 2) && OutsideVerticalRows(1, 4, 2));
+        const float cam[3] = {0, 64, 0}, fwd[3] = {0, 0, 1};
+        const float ahead[3] = {0, 64, 20}, behind[3] = {0, 64, -20}, close[3] = {0, 64, -3}, side[3] = {20, 64, -1};
+        assert(!BehindCamera(cam, fwd, ahead) && BehindCamera(cam, fwd, behind) && !BehindCamera(cam, fwd, close) && !BehindCamera(cam, fwd, side));
+    }
     assert((GameScreenKnown & GameMenuOpen) == 0 && (GameMenuOpen & GamePaused) == 0 && (GameScreenKnown & GamePaused) == 0);
     assert(((GameScreenKnown | GameMenuOpen | GamePaused) & (GameWorldKnown | GameInWorld)) == 0 && (GameWorldKnown & GameInWorld) == 0);
     assert(((GameScreenKnown | GameMenuOpen | GamePaused | GameWorldKnown | GameInWorld) & (GameTitleKnown | GameOnTitle)) == 0 && (GameTitleKnown & GameOnTitle) == 0);

@@ -24,6 +24,9 @@ bool Capture(const Gpu& gpu, ID3D12Resource* back, bool motion);
 bool Generate(const Gpu& gpu, ID3D12Resource* back, D3D12_CPU_DESCRIPTOR_HANDLE rtv, float phase, uint32_t method);
 bool Restore(const Gpu& gpu, ID3D12Resource* back);   // copies the newest game frame into `back`
 void Forget();     // the next Capture has no previous frame (after a pause or a hitch)
-void Release();    // waits for the GPU, then frees everything (resize, swap chain change, stop)
+void Release();    // frees size-dependent textures; retains pipelines/allocators for resize/reuse
+bool Trim();       // FG OFF: retire completed GPU work, then release textures AND pipelines/allocators
+bool HasResources(); // cheap atomic check; avoids a render lock on every frame when FG was never used
+uint64_t TextureBytes(); // owned texture heap sizes; not process RAM or driver/pipeline memory
 bool Failed();     // something could not be created: Frame Generation stays off
 }  // namespace MyClientFrameGen

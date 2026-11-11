@@ -78,6 +78,14 @@ inline bool Fits(double nowMs, double startMs, double intervalMs, const Cost& co
 // (2026-10-28 log: x3, "1787 made-up skipped" of 4376), so the picture came at uneven steps. The count is planned
 // up front from the measured cost and spaced evenly over the frame; it goes down after a few frames that do not
 // fit and up again only after a run of frames with room, so it does not flip every frame.
+// How many made-up frames (at most `most`) fit in one game frame of `intervalMs` at the measured cost; `most`
+// while nothing is measured yet.
+inline uint32_t FitCount(uint32_t most, double intervalMs, const Cost& cost, double nowMs) {
+    if (intervalMs <= 0 || cost.made <= 0 || cost.Stale(nowMs)) return most;
+    uint32_t fit = 0;
+    while (fit < most && (fit + 1) * cost.made + cost.real <= intervalMs * 0.9) ++fit;
+    return fit;
+}
 class Extras {
     uint32_t extra_ = 0, multiplier_ = 0;
     int down_ = 0, up_ = 0;
@@ -86,11 +94,7 @@ public:
     uint32_t Plan(uint32_t multiplier, double intervalMs, const Cost& cost, double nowMs) {
         const uint32_t most = multiplier >= 2 ? multiplier - 1 : 0;
         if (multiplier != multiplier_) { multiplier_ = multiplier; extra_ = most; down_ = up_ = 0; }
-        uint32_t fit = most;
-        if (intervalMs > 0 && cost.made > 0 && !cost.Stale(nowMs)) {
-            fit = 0;
-            while (fit < most && (fit + 1) * cost.made + cost.real <= intervalMs * 0.9) ++fit;
-        }
+        const uint32_t fit = FitCount(most, intervalMs, cost, nowMs);
         if (fit < extra_) {
             up_ = 0;
             if (++down_ >= DownAfter) { extra_ = fit; down_ = 0; }

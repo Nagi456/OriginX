@@ -107,6 +107,9 @@ struct Target {
     std::string loader = "26.51.6";
     std::string runtimeGame = "1.26.51.01";
     std::vector<std::string> versions{"1.26.5101.0", "1.26.51.01", "1.26.51.1", "26.51.1.0"};
+    // A release that runs without LeviLamina (catalog launcherApi 2, loader "standalone"): no loader is installed
+    // and the game's exe is not edited; the launcher loads MyClientData.dll into the game itself (StandaloneWin.h).
+    bool standalone = false;
 };
 
 inline bool SupportedGameVersion(const std::string& version, const Target& target = {})
@@ -256,7 +259,10 @@ inline void CopyFileChunked(const fs::path& from, const fs::path& to, unsigned l
     std::ofstream out(to, std::ios::binary | std::ios::trunc);
     if (!in || !out) throw std::runtime_error("ゲームのファイルをコピーできません: " + from.u8string());
     std::vector<char> buffer(4u << 20);
-    unsigned long long reported = done;
+    // Reported each time the running total passes another 8 MiB, counted over all files: the game's data folder
+    // is thousands of small files, and counting per file never reported until the whole folder was done
+    // (2026-11-05: 0 % for minutes, then 32 % at once).
+    constexpr unsigned long long step = 8ull << 20;
     while (in)
     {
         in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
@@ -264,8 +270,9 @@ inline void CopyFileChunked(const fs::path& from, const fs::path& to, unsigned l
         if (count <= 0) break;
         out.write(buffer.data(), count);
         if (!out) throw std::runtime_error("ゲームのファイルを書き込めません。空き容量を確認してください: " + to.u8string());
+        const unsigned long long before = done;
         done += static_cast<unsigned long long>(count);
-        if (progress && done - reported >= (8ull << 20)) { reported = done; progress(done, total); }
+        if (progress && done / step != before / step) progress(done, total);
     }
     out.close();
     if (!out) throw std::runtime_error("ゲームのファイルを書き込めません。空き容量を確認してください: " + to.u8string());
@@ -380,6 +387,39 @@ inline void CopyTreeOverwrite(const fs::path& from, const fs::path& to)
     }
 }
 
+// Housekeeping (2026-11-03 user request: the logs and backups piled up): keeps the `keep` newest children of
+// `directory` that `wanted` accepts (by last write time) and deletes the older ones. Links are never followed or
+// removed; any error just leaves the file there.
+inline void KeepNewest(const fs::path& directory, size_t keep, const std::function<bool(const fs::directory_entry&)>& wanted)
+{
+    std::error_code error;
+    if (!fs::is_directory(directory, error) || fs::is_symlink(fs::symlink_status(directory, error))) return;
+    std::vector<std::pair<fs::file_time_type, fs::path>> found;
+    for (fs::directory_iterator it(directory, error), end; !error && it != end; it.increment(error))
+    {
+        if (it->is_symlink(error) || !wanted(*it)) continue;
+        found.emplace_back(it->last_write_time(error), it->path());
+    }
+    if (found.size() <= keep) return;
+    std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (size_t i = keep; i < found.size(); i++)
+    {
+        std::error_code ignored;
+        fs::remove_all(found[i].second, ignored);
+    }
+}
+
+// The game's logs (LeviLamina's logs folder) and MyClient's backups of earlier DLLs: the 3 newest of each are kept.
+inline void TidyGameFolder(const fs::path& gameDirectory)
+{
+    KeepNewest(gameDirectory / "MyClient-backups", 3, [](const fs::directory_entry& e) {
+        return e.is_directory() && e.path().filename().u8string().rfind("MyClientData-", 0) == 0;
+    });
+    KeepNewest(gameDirectory / "logs", 3, [](const fs::directory_entry& e) {
+        return e.is_regular_file() && e.path().extension() == ".log";
+    });
+}
+
 inline fs::path InstallMod(const fs::path& source, const fs::path& gameDirectory, const Target& profile = {})
 {
     RequireMod(source, profile);
@@ -422,6 +462,7 @@ inline fs::path InstallMod(const fs::path& source, const fs::path& gameDirectory
             movedOld = true;
         }
         fs::rename(stage, target);
+        TidyGameFolder(gameDirectory);
     }
     catch (...)
     {

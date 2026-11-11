@@ -82,9 +82,35 @@ void WINAPI MyClientBridgeShutdown()
     channel.Close();
 }
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID)
+#if MYCLIENT_STANDALONE
+namespace MyClientStandalone { void Attach(); }   // client/Standalone.cpp
+#endif
+#ifdef MYCLIENT_GAME_VERSION   // MyClientData.dll (the game side): logs/startup.log starts the moment it is loaded
+#include "client/SelfCheck.h"
+#endif
+
+BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID)
 {
+#ifdef MYCLIENT_GAME_VERSION
+    if (reason == DLL_PROCESS_ATTACH)
+    {
+        // Before anything else (docs/version-update.md: no line here = the DLL was never loaded).
+        wchar_t exe[MAX_PATH]{};
+        const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        char path[MAX_PATH * 3]{};
+        WideCharToMultiByte(CP_UTF8, 0, exe, static_cast<int>(n), path, sizeof path - 1, nullptr, nullptr);
+        MyClientSigs::StartupLine(std::string("injected: MyClientData.dll (built for Minecraft " MYCLIENT_GAME_VERSION
+                                              ") loaded into ") + path + " pid " + std::to_string(GetCurrentProcessId()));
+    }
+#endif
     // The game adapter must initialize outside the Windows loader lock.
     // Loading this bridge alone does NOT hook or read Minecraft.
+#if MYCLIENT_STANDALONE
+    // Without LeviLamina nobody calls into the DLL after it is loaded: start MyClient's own thread (it does the
+    // work, after DllMain has returned).
+    if (reason == DLL_PROCESS_ATTACH) { DisableThreadLibraryCalls(module); MyClientStandalone::Attach(); }
+#else
+    (void)module; (void)reason;
+#endif
     return TRUE;
 }
