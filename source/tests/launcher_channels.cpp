@@ -40,8 +40,29 @@ void Reject(const std::function<void()>& action)
     assert(rejected);
 }
 
+// These cases check the status answer itself, not signatures (tests/manifest_signature.cpp does those), so they
+// pass no keys: with the embedded keys every channel list would need a signature.
+static AccountStatus Unsigned(const Json& body) { return ParseStatus(body, {}); }
+
 int main()
 {
+    {
+        // Members only: not logged in, no role, role, expired login, offline within / past the grace.
+        AccountStatus member; member.verified = true;
+        AccountStatus guest; guest.verified = false;
+        const long long now = 1800000000;
+        assert(!MemberGate(false, nullptr, "", 0, now).empty());
+        assert(!MemberGate(true, &guest, "", now, now).empty());
+        assert(MemberGate(true, &member, "", 0, now).empty());
+        assert(!MemberGate(true, nullptr, "ログインの期限が切れました。", now - 60, now).empty());
+        assert(MemberGate(true, nullptr, "timeout", now - 3 * 24 * 3600, now).empty());
+        assert(!MemberGate(true, nullptr, "timeout", now - 8 * 24 * 3600, now).empty());
+        assert(!MemberGate(true, nullptr, "timeout", 0, now).empty());
+        StoredAccount stored; stored.token = "t"; stored.verifiedAt = 1234;
+        assert(ParseAccount(SerializeAccount(stored)).verifiedAt == 1234);
+        assert(ParseAccount("{\"token\":\"t\"}").verifiedAt == 0);
+    }
+
     // --- channel names ---
     assert(std::string(ChannelKey(Channel::Stable)) == "stable" && std::string(ChannelKey(Channel::Early)) == "early" &&
            std::string(ChannelKey(Channel::Test)) == "test");
@@ -88,32 +109,32 @@ int main()
     const Json test = List(Entry("26.51.1", "test", "myclient-26.51.1-r54-test1"));
     const Json early = List(Entry("26.51.1", "early", "myclient-26.51.1-r54-test1"));
     {
-        auto status = ParseStatus(Body(true, false, false, early, test));
+        auto status = Unsigned(Body(true, false, false, early, test));
         assert(status.id == "42" && status.name == "Nagi" && status.avatarUrl.empty() && status.token.empty());
         assert(status.moderator && !status.supporter && !status.verified);
         const auto allowed = AllowedChannels(status);
         assert((allowed == std::vector<Channel>{Channel::Stable, Channel::Early, Channel::Test}));
     }
     {
-        auto status = ParseStatus(Body(false, true, true, early, nullptr));
+        auto status = Unsigned(Body(false, true, true, early, nullptr));
         assert((AllowedChannels(status) == std::vector<Channel>{Channel::Stable, Channel::Early}));
-        status = ParseStatus(Body(false, false, true, nullptr, nullptr));
+        status = Unsigned(Body(false, false, true, nullptr, nullptr));
         assert((AllowedChannels(status) == std::vector<Channel>{Channel::Stable}));
     }
     {
         Json body = Body(false, true, true, early, nullptr);
         body["user"]["avatarUrl"] = "https://cdn.discordapp.com/avatars/42/" + hash + ".png?size=64";
         body["token"] = "v1.payload.sig";
-        const auto status = ParseStatus(body);
+        const auto status = Unsigned(body);
         assert(status.avatarUrl == body["user"]["avatarUrl"].get<std::string>() && status.token == "v1.payload.sig");
         body["user"]["avatarUrl"] = "https://evil.example/x.png";                    // an unsafe icon link is dropped, not trusted
-        assert(ParseStatus(body).avatarUrl.empty());
+        assert(Unsigned(body).avatarUrl.empty());
         body["user"]["name"] = nullptr;
-        assert(ParseStatus(body).name.empty());
+        assert(Unsigned(body).name.empty());
     }
-    Reject([] { ParseStatus(Json::object()); });
-    Reject([] { ParseStatus(Json{{"user", {{"id", "42"}}}}); });
-    Reject([] { ParseStatus(Json{{"error", "login"}}); });
+    Reject([] { Unsigned(Json::object()); });
+    Reject([] { Unsigned(Json{{"user", {{"id", "42"}}}}); });
+    Reject([] { Unsigned(Json{{"error", "login"}}); });
 
     // --- a catalog with signed links is read only when the caller says so ---
     assert(ParseCatalog(test, SignedFileUrl).releases.size() == 1);
@@ -122,7 +143,7 @@ int main()
 
     // --- what Launch does with the chosen channel ---
     {
-        const auto status = ParseStatus(Body(true, false, false, early, test));
+        const auto status = Unsigned(Body(true, false, false, early, test));
         auto plan = PlanLaunch(Channel::Stable, nullptr, "", "26.51.1");
         assert(plan.channel == Channel::Stable && plan.catalog == nullptr && plan.reason.empty() && !plan.release);
         plan = PlanLaunch(Channel::Test, &status, "", "26.51.1");
@@ -140,30 +161,30 @@ int main()
         assert(plan.reason.find("Discord でログイン") != std::string::npos);
     }
     {   // the role was taken away (no catalog for the channel)
-        const auto status = ParseStatus(Body(false, true, true, early, nullptr));
+        const auto status = Unsigned(Body(false, true, true, early, nullptr));
         const auto plan = PlanLaunch(Channel::Test, &status, "", "26.51.1");
         assert(plan.channel == Channel::Stable && !plan.catalog && plan.reason.find("権限") != std::string::npos);
     }
     {   // the channel has no build of the chosen game version
-        const auto status = ParseStatus(Body(true, false, false, early, test));
+        const auto status = Unsigned(Body(true, false, false, early, test));
         const auto plan = PlanLaunch(Channel::Test, &status, "", "26.60.5");
         assert(plan.channel == Channel::Stable && !plan.release && plan.reason.find("26.60.5") != std::string::npos);
     }
     {   // a catalog with urls that are not signed file links of this host is not used
         const Json bad = List(Entry("26.51.1", "test", "myclient-26.51.1-r54-test1", true, false));
-        const auto status = ParseStatus(Body(true, false, false, nullptr, bad));
+        const auto status = Unsigned(Body(true, false, false, nullptr, bad));
         const auto plan = PlanLaunch(Channel::Test, &status, "", "26.51.1");
         assert(plan.channel == Channel::Stable && !plan.release && !plan.reason.empty());
     }
     {   // an entry that is listed but not available is not a build
         const Json off = List(Entry("26.51.1", "test", "myclient-26.51.1-r54-test1", false));
-        const auto status = ParseStatus(Body(true, false, false, nullptr, off));
+        const auto status = Unsigned(Body(true, false, false, nullptr, off));
         assert(PlanLaunch(Channel::Test, &status, "", "26.51.1").channel == Channel::Stable);
     }
 
     // --- the package cache keeps a channel's build apart from the stable release of the same revision ---
     {
-        const auto status = ParseStatus(Body(true, false, false, early, test));
+        const auto status = Unsigned(Body(true, false, false, early, test));
         const auto plan = PlanLaunch(Channel::Test, &status, "", "26.51.1");
         assert(PackageFolder(Channel::Stable, *plan.release).empty());
         const auto folder = PackageFolder(Channel::Test, *plan.release);
@@ -215,7 +236,7 @@ int main()
         const auto stableRelease = ParseCatalog(List(Entry("26.51.1", "stable", "x", true, false)), [](const std::string&) { return true; }).releases[0];
         Json entry = Entry("26.51.1", "test", "myclient-26.51.1-r54-test1");
         const auto plan = [&](const Json& e) {
-            const auto status = ParseStatus(Body(true, false, false, nullptr, List(e)));
+            const auto status = Unsigned(Body(true, false, false, nullptr, List(e)));
             return PlanLaunch(Channel::Test, &status, "", "26.51.1", &stableRelease);
         };
         assert(plan(entry).channel == Channel::Test && plan(entry).release);                // the same loader: used
@@ -223,6 +244,14 @@ int main()
         const auto other = plan(entry);
         assert(other.channel == Channel::Stable && !other.release && other.reason.find("ローダー") != std::string::npos);
         assert(other.reason.find("テスト版を取得できなかったため、安定版で起動します。") == 0);
+        // 2026-11-11: a standalone test build (launcherApi 2, no LeviLamina) needs no loader or runtime: it is used and
+        // carries its own target, so the launch starts it without LeviLamina (MyClientLauncher.cpp launchTarget).
+        Json standalone = Entry("26.51.1", "test", "myclient-26.51.1-r57-test3");
+        standalone["launcherApi"] = 2;
+        standalone["loader"] = "standalone";
+        standalone["files"].erase("runtime.lock.json");
+        const auto alone = plan(standalone);
+        assert(alone.channel == Channel::Test && alone.release && alone.release->target.standalone);
     }
 
     // --- Final review fix 3: a result that started before a logout is not adopted ---

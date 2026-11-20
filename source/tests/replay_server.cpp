@@ -235,15 +235,55 @@ int main()
         assert(x == 1.5f && std::fabs(y - 65.62f) < 1e-4 && z == -3.f && pitch == 10.f && yaw == 90.f && head == 91.f);
         assert(m.U8() == 2);
     }
+    // The viewer's own input, as the game sends it (PlayerAuthInput: pitch, yaw, x, y, z, move x/z, head yaw).
+    const auto viewerInput = [&](float pitch, float yaw, float x, float y, float z) {
+        Out o; o.F32le(pitch); o.F32le(yaw); o.F32le(x); o.F32le(y); o.F32le(z); o.F32le(0); o.F32le(0); o.F32le(yaw); o.Raw("more");
+        c.Send(Batch({Packet(Id::PlayerAuthInput, o.b)}, true));
+        c.Pump(1);
+    };
+    const auto heldBack = [&](size_t at) {   // a MovePlayer back to the last recorded pose
+        auto g = c.Games();
+        if (g.size() <= at || GameId(g[at]) != Id::MovePlayer) return false;
+        In m = Body(g[at]);
+        if (m.VarU64() != 7) return false;
+        const float x = m.F32le(), y = m.F32le(), z = m.F32le(), pitch = m.F32le(), yaw = m.F32le();
+        return x == 1.5f && std::fabs(y - 65.62f) < 1e-4 && z == -3.f && pitch == 10.f && yaw == 90.f;
+    };
+    viewerInput(10.f, 90.f, 4.f, 65.62f, -3.f);   // playing: the next recorded movement does the job, nothing extra
+    assert(c.Games().size() == 8);
     s.SetPaused(true);
     c.Pump(5000);
     assert(c.Games().size() == 8);   // paused: nothing more
+    viewerInput(10.f, 90.f, 4.f, 65.62f, -3.f);   // paused, the viewer walked: put back
+    assert(c.Games().size() == 9 && heldBack(8));
+    viewerInput(10.f, 90.f, 1.5f, 65.62f, -3.f);  // back where it was: nothing
+    assert(c.Games().size() == 9);
+    viewerInput(40.f, 90.f, 1.5f, 65.62f, -3.f);  // looked around: put back too
+    assert(c.Games().size() == 10 && heldBack(9));
+    // Export steps the paused clock by one frame at a time: the records due go out, the clock stays paused.
+    {
+        const uint64_t before = s.PositionMs();
+        const size_t games = c.Games().size();
+        s.Step(500.0);
+        c.Pump(1);
+        assert(s.PositionMs() == before + 500 && s.Paused() && c.Games().size() == games);   // the chat line (at 2000) is not due yet
+        s.Step(-5.0);   // never backwards
+        c.Pump(1);
+        assert(s.PositionMs() == before + 500);
+        s.SetPaused(false);
+        s.Step(100.0);  // only while paused
+        s.SetPaused(true);
+        c.Pump(0);
+        assert(s.PositionMs() == before + 500);
+    }
     s.SetPaused(false);
     s.SetSpeed(2.f);
     c.Pump(800);                     // 800 ms at x2 passes the chat line
-    assert(c.Games().size() == 9 && c.Games()[8] == text);
+    assert(c.Games().size() == 11 && c.Games()[10] == text);
     c.Pump(10);
     assert(s.GetState() == State::Finished && s.PositionMs() == 2000);
+    viewerInput(10.f, 90.f, 1.5f, 70.f, -3.f);    // after the end the viewer cannot walk off either
+    assert(c.Games().size() == 12 && heldBack(11));
     s.Stop(c.now);
     assert(s.GetState() == State::Closed);
 

@@ -210,10 +210,25 @@ void UavDone(ID3D12GraphicsCommandList* l, Texture& t) {
 }
 const D3D12_RESOURCE_STATES kRead = static_cast<D3D12_RESOURCE_STATES>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-void WaitFor(UINT64 value) {
-    if (!fence || !value || !fenceEvent) return;
-    if (fence->GetCompletedValue() < value && SUCCEEDED(fence->SetEventOnCompletion(value, fenceEvent)))
-        WaitForSingleObject(fenceEvent, 500);
+void (*waitWarn)(const std::string& text) = nullptr;   // the last Gpu::warn (for the wait log)
+std::atomic<uint64_t> gpuTimeouts{0};
+bool WaitFor(UINT64 value) {
+    if (!value) return true;
+    if (!fence || !fenceEvent) return false;
+    if (fence->GetCompletedValue() < value && SUCCEEDED(fence->SetEventOnCompletion(value, fenceEvent))) {
+        // r57-test40 stutter: a wait over 30 ms is logged (which wait, timed out or not).
+        const ULONGLONG start = GetTickCount64();
+        const DWORD r = WaitForSingleObject(fenceEvent, 500);
+        const ULONGLONG took = GetTickCount64() - start;
+        static ULONGLONG loggedAt = 0;
+        if (took >= 30 && (!loggedAt || GetTickCount64() - loggedAt >= 2000) && waitWarn) {
+            loggedAt = GetTickCount64();
+            waitWarn("Stutter: GPU wait 'frame generation' took " + std::to_string(took) + " ms (" + (r == WAIT_TIMEOUT ? "timed out" : "finished") + ")");
+        }
+    }
+    const bool done = fence->GetCompletedValue() >= value;
+    if (!done) gpuTimeouts.fetch_add(1, std::memory_order_relaxed);
+    return done;
 }
 
 bool Compile(const Gpu& gpu, CompileFn compile, const char* entry, const char* target, ComPtr<ID3DBlob>& out) {
@@ -375,7 +390,7 @@ void FillSet(ID3D12Device* device, UINT set, Texture* s0, DXGI_FORMAT f0, Textur
 // One command list per call, on its own allocator; returns null when something failed.
 ID3D12GraphicsCommandList* Begin(const Gpu& gpu) {
     Slot& s = slots[slotIndex];
-    WaitFor(s.fenceValue);
+    if (!WaitFor(s.fenceValue)) return nullptr;
     HRESULT hr = s.allocator->Reset();
     if (FAILED(hr)) { Fail(gpu, "ID3D12CommandAllocator::Reset(Frame Generation)", hr); return nullptr; }
     hr = list->Reset(s.allocator.Get(), nullptr);
@@ -415,7 +430,7 @@ bool Ensure(const Gpu& gpu, UINT w, UINT h, DXGI_FORMAT f) {
     if (failed || !gpu.device || !gpu.queue || !gpu.execute) return false;
     if (!CreateObjects(gpu)) return false;
     if (w == width && h == height && f == format && history[0].resource) return true;
-    WaitFor(fenceValue);
+    if (!WaitFor(fenceValue)) return false;
     width = w; height = h; format = f;
     lumaW = Groups(w, kLumaScale); lumaH = Groups(h, kLumaScale);
     blocksW = Groups(lumaW, kBlock); blocksH = Groups(lumaH, kBlock);
@@ -488,6 +503,7 @@ bool Capture(const Gpu& gpu, ID3D12Resource* back, bool motion) {
 }
 
 bool Generate(const Gpu& gpu, ID3D12Resource* back, D3D12_CPU_DESCRIPTOR_HANDLE rtv, float phase, uint32_t method) {
+    waitWarn = gpu.warn;
     if (failed || !back || !havePrevious) return false;
     if (method == MyClientFeatures::FrameGenCopy) return Restore(gpu, back);
     if (method == MyClientFeatures::FrameGenMotion && !motionReady) method = MyClientFeatures::FrameGenBlend;
@@ -531,15 +547,17 @@ bool Restore(const Gpu& gpu, ID3D12Resource* back) {
     return Submit(gpu);
 }
 
-void Release() {
-    WaitFor(fenceValue);
+bool Release() {
+    if (!WaitFor(fenceValue)) return false;
     for (auto& t : history) t = {};
     for (auto& t : luma) t = {};
     rawMotion = {}; motionField = {}; generated = {};
     width = height = 0; format = DXGI_FORMAT_UNKNOWN;
     Forget();
+    return true;
 }
 
+uint64_t TakeGpuTimeouts() { return gpuTimeouts.exchange(0); }
 uint64_t TextureBytes() {
     uint64_t bytes = 0;
     for (const auto* t : {&history[0], &history[1], &luma[0], &luma[1], &rawMotion, &motionField, &generated})
@@ -554,9 +572,9 @@ bool Trim() {
     }
     // The presenter must already be idle (the caller owns the Compositor lock).
     // A timed-out fence is NOT permission to destroy resources still used by the GPU.
-    WaitFor(fenceValue);
+    if (!WaitFor(fenceValue)) return false;
     if (fence && fence->GetCompletedValue() < fenceValue) return false;
-    Release();
+    if (!Release()) return false;
     list.Reset();
     for (auto& slot : slots) slot = {};
     lumaPso.Reset(); motionPso.Reset(); smoothPso.Reset(); synthPso.Reset(); blitPso.Reset();

@@ -3,6 +3,7 @@
 // the saved Discord login, the browser login, the /launcher/status call and the account's icon. The decisions
 // (which links are allowed, what a status means, what Launch does) are in Channels.h and tested there.
 // Include this before <windows.h> (it brings winsock2.h).
+#include "../Lang.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -35,13 +36,13 @@ inline void SaveAccount(const fs::path& dir, const StoredAccount& account)
     {
         std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
         out << SerializeAccount(account);
-        if (!out) throw std::runtime_error("ログイン情報を保存できません。");
+        if (!out) throw std::runtime_error(Lang::T("ログイン情報を保存できません。", "Cannot save the login information."));
     }
     fs::rename(temporary, AccountFile(dir), ec);
     if (ec)
     {
         fs::remove(temporary, ec);
-        throw std::runtime_error("ログイン情報を保存できません。");
+        throw std::runtime_error(Lang::T("ログイン情報を保存できません。", "Cannot save the login information."));
     }
 }
 inline void DeleteAccount(const fs::path& dir)
@@ -60,13 +61,13 @@ inline HttpAnswer HttpsGet(const std::string& url, const std::string& bearer, si
     URL_COMPONENTS parts{}; parts.dwStructSize = sizeof parts;
     parts.dwHostNameLength = parts.dwUrlPathLength = parts.dwExtraInfoLength = static_cast<DWORD>(-1);
     if (!WinHttpCrackUrl(wide.c_str(), 0, 0, &parts) || parts.nScheme != INTERNET_SCHEME_HTTPS)
-        throw std::runtime_error("サーバーのURLが不正です。");
+        throw std::runtime_error(Lang::T("サーバーのURLが不正です。", "Invalid server URL."));
     struct HttpHandle { HINTERNET value; ~HttpHandle() { if (value) WinHttpCloseHandle(value); } };
     HttpHandle session{WinHttpOpen(L"MyClient/1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0)};
     if (!session.value || !WinHttpSetTimeouts(session.value, timeoutMs, timeoutMs, timeoutMs, timeoutMs))
-        throw std::runtime_error("通信を開始できません。");
+        throw std::runtime_error(Lang::T("通信を開始できません。", "Cannot start the connection."));
     HttpHandle connection{WinHttpConnect(session.value, std::wstring(parts.lpszHostName, parts.dwHostNameLength).c_str(), parts.nPort, 0)};
-    if (!connection.value) throw std::runtime_error("サーバーに接続できません。接続を確認してください。");
+    if (!connection.value) throw std::runtime_error(Lang::T("サーバーに接続できません。接続を確認してください。", "Cannot connect to the server. Check your connection."));
     const std::wstring path = std::wstring(parts.lpszUrlPath, parts.dwUrlPathLength) + std::wstring(parts.lpszExtraInfo, parts.dwExtraInfoLength);
     HttpHandle request{WinHttpOpenRequest(connection.value, L"GET", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE)};
     DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP;
@@ -75,24 +76,24 @@ inline HttpAnswer HttpsGet(const std::string& url, const std::string& bearer, si
     {
         // the key goes into a header: only its plain characters (LoginToken / StoredAccount check them) are allowed
         if (bearer.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._") != std::string::npos)
-            throw std::runtime_error("ログインの鍵が不正です。もう一度 Discord でログインしてください。");
+            throw std::runtime_error(Lang::T("ログインの鍵が不正です。もう一度 Discord でログインしてください。", "The login key is invalid. Log in with Discord again."));
         headers += L"Authorization: Bearer " + std::wstring(bearer.begin(), bearer.end()) + L"\r\n";
     }
     if (!request.value || !WinHttpSetOption(request.value, WINHTTP_OPTION_REDIRECT_POLICY, &redirect, sizeof redirect) ||
         !WinHttpSendRequest(request.value, headers.c_str(), static_cast<DWORD>(-1), WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(request.value, nullptr))
-        throw std::runtime_error("サーバーに接続できません。接続を確認してください。");
+        throw std::runtime_error(Lang::T("サーバーに接続できません。接続を確認してください。", "Cannot connect to the server. Check your connection."));
     HttpAnswer answer;
     DWORD size = sizeof answer.status;
     if (!WinHttpQueryHeaders(request.value, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &answer.status, &size, WINHTTP_NO_HEADER_INDEX))
-        throw std::runtime_error("サーバーの応答を読み取れません。");
+        throw std::runtime_error(Lang::T("サーバーの応答を読み取れません。", "Cannot read the server's response."));
     char buffer[16384];
     for (;;)
     {
         DWORD read = 0;
-        if (!WinHttpReadData(request.value, buffer, sizeof buffer, &read)) throw std::runtime_error("通信が中断されました。");
+        if (!WinHttpReadData(request.value, buffer, sizeof buffer, &read)) throw std::runtime_error(Lang::T("通信が中断されました。", "The connection was interrupted."));
         if (!read) break;
-        if (answer.body.size() + read > maxBytes) throw std::runtime_error("サーバーの応答が大きすぎます。");
+        if (answer.body.size() + read > maxBytes) throw std::runtime_error(Lang::T("サーバーの応答が大きすぎます。", "The server's response is too large."));
         answer.body.append(buffer, read);
     }
     return answer;
@@ -102,13 +103,13 @@ inline HttpAnswer HttpsGet(const std::string& url, const std::string& bearer, si
 // to the stable channel (Channels.h PlanLaunch).
 inline AccountStatus FetchStatus(const std::string& token)
 {
-    if (token.empty()) throw std::runtime_error("ログインしていません。Discord でログインしてください。");
+    if (token.empty()) throw std::runtime_error(Lang::T("ログインしていません。Discord でログインしてください。", "Not logged in. Log in with Discord."));
     const auto answer = HttpsGet(std::string(OriginXHost) + "/launcher/status", token, 512 * 1024, 15000);
-    if (answer.status == 401) throw std::runtime_error("ログインの期限が切れました。もう一度 Discord でログインしてください。");
-    if (answer.status == 503) throw std::runtime_error("Discordに接続できませんでした。しばらくしてからもう一度お試しください。");
-    if (answer.status != 200) throw std::runtime_error("サーバーの応答が正しくありません。HTTP " + std::to_string(answer.status));
+    if (answer.status == 401) throw std::runtime_error(Lang::T("ログインの期限が切れました。もう一度 Discord でログインしてください。", "Your login has expired. Log in with Discord again."));
+    if (answer.status == 503) throw std::runtime_error(Lang::T("Discordに接続できませんでした。しばらくしてからもう一度お試しください。", "Could not connect to Discord. Please try again later."));
+    if (answer.status != 200) throw std::runtime_error(Lang::T("サーバーの応答が正しくありません。HTTP ", "The server's response is invalid. HTTP ") + std::to_string(answer.status));
     const Json body = Json::parse(answer.body, nullptr, false);
-    if (body.is_discarded()) throw std::runtime_error("サーバーの応答を読み取れませんでした。");
+    if (body.is_discarded()) throw std::runtime_error(Lang::T("サーバーの応答を読み取れませんでした。", "Could not read the server's response."));
     return ParseStatus(body);
 }
 
@@ -206,10 +207,10 @@ inline std::string LoginInBrowser(std::atomic<bool>& cancel)
         ~Sockets() { if (listener != INVALID_SOCKET) closesocket(listener); if (started) WSACleanup(); }
     } sockets;
     WSADATA data{};
-    if (WSAStartup(MAKEWORD(2, 2), &data) != 0) throw std::runtime_error("通信を開始できません。");
+    if (WSAStartup(MAKEWORD(2, 2), &data) != 0) throw std::runtime_error(Lang::T("通信を開始できません。", "Cannot start the connection."));
     sockets.started = true;
     sockets.listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sockets.listener == INVALID_SOCKET) throw std::runtime_error("ログインの待ち受けを開始できません。");
+    if (sockets.listener == INVALID_SOCKET) throw std::runtime_error(Lang::T("ログインの待ち受けを開始できません。", "Cannot start waiting for the login."));
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);   // this PC only
@@ -217,24 +218,24 @@ inline std::string LoginInBrowser(std::atomic<bool>& cancel)
     int length = sizeof address;
     if (bind(sockets.listener, reinterpret_cast<sockaddr*>(&address), sizeof address) != 0 || listen(sockets.listener, 4) != 0 ||
         getsockname(sockets.listener, reinterpret_cast<sockaddr*>(&address), &length) != 0)
-        throw std::runtime_error("ログインの待ち受けを開始できません。");
+        throw std::runtime_error(Lang::T("ログインの待ち受けを開始できません。", "Cannot start waiting for the login."));
     const unsigned port = ntohs(address.sin_port);
-    if (port < 1024) throw std::runtime_error("ログインの待ち受けを開始できません。");
+    if (port < 1024) throw std::runtime_error(Lang::T("ログインの待ち受けを開始できません。", "Cannot start waiting for the login."));
 
     unsigned char random[16];
-    if (BCryptGenRandom(nullptr, random, sizeof random, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) throw std::runtime_error("ログインの準備に失敗しました。");
+    if (BCryptGenRandom(nullptr, random, sizeof random, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) throw std::runtime_error(Lang::T("ログインの準備に失敗しました。", "Preparing the login failed."));
     std::string state;
     for (unsigned char byte : random) { char two[3]; snprintf(two, sizeof two, "%02x", byte); state += two; }
 
     const std::string url = std::string(OriginXHost) + "/launcher/login?port=" + std::to_string(port) + "&state=" + state;
     const std::wstring wideUrl(url.begin(), url.end());
     if (reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", wideUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
-        throw std::runtime_error("ブラウザーを開けません。");
+        throw std::runtime_error(Lang::T("ブラウザーを開けません。", "Cannot open the browser."));
 
     const ULONGLONG deadline = GetTickCount64() + 120000;
     while (GetTickCount64() < deadline)
     {
-        if (cancel) throw std::runtime_error("ログインを中止しました。");
+        if (cancel) throw std::runtime_error(Lang::T("ログインを中止しました。", "Login cancelled."));
         fd_set readable;
         FD_ZERO(&readable);
         FD_SET(sockets.listener, &readable);
@@ -255,8 +256,8 @@ inline std::string LoginInBrowser(std::atomic<bool>& cancel)
         const std::string line = request.substr(0, request.find("\r\n"));
         const auto token = LoginToken(line, state);
         const std::string page = token
-            ? "<!doctype html><meta charset=utf-8><title>OriginX</title><p>ログインできました。このタブは閉じて、ランチャーに戻ってください。<br>Logged in. You can close this tab."
-            : "<!doctype html><meta charset=utf-8><title>OriginX</title><p>ログインの確認ができませんでした。ランチャーからやり直してください。";
+            ? Lang::T("<!doctype html><meta charset=utf-8><title>OriginX</title><p>ログインできました。このタブは閉じて、ランチャーに戻ってください。<br>Logged in. You can close this tab.", "<!doctype html><meta charset=utf-8><title>OriginX</title><p>ログインできました。このタブは閉じて、ランチャーに戻ってください。<br>Logged in. You can close this tab and return to the launcher.")
+            : Lang::T("<!doctype html><meta charset=utf-8><title>OriginX</title><p>ログインの確認ができませんでした。ランチャーからやり直してください。", "<!doctype html><meta charset=utf-8><title>OriginX</title><p>Could not confirm the login. Try again from the launcher.");
         const std::string reply = std::string(token ? "HTTP/1.1 200 OK" : "HTTP/1.1 400 Bad Request") +
             "\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: " +
             std::to_string(page.size()) + "\r\n\r\n" + page;
@@ -265,6 +266,6 @@ inline std::string LoginInBrowser(std::atomic<bool>& cancel)
         closesocket(client);
         if (token) return *token;
     }
-    throw std::runtime_error("ログインがタイムアウトしました。もう一度お試しください。");
+    throw std::runtime_error(Lang::T("ログインがタイムアウトしました。もう一度お試しください。", "The login timed out. Please try again."));
 }
 }

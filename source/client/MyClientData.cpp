@@ -1,10 +1,20 @@
+#include "OriginMarks.h"
 #include "GameData.h"
+#include "MapChannel.h"
+#include "CapeChannel.h"
+#include "CapeApply.h"
+#include "MapData.h"
+#include "mc/world/level/dimension/Dimension.h"
+#include "mc/world/level/storage/LevelData.h"
 #include "OwnHook.h"
 #include "GameState.h"
 #include "GameAccess.h"
 #include "Log.h"
 #include "FeatureAdapter.h"
+#include "TextureReloadPolicy.h"
 #include "PartyAdapter.h"
+#include "../HiveStats.h"
+#include "../PartyData.h"
 #include "ResourceChannel.h"
 #include "SelfCheck.h"
 #include "ShulkerChannel.h"
@@ -13,10 +23,27 @@
 #include "SkinChannel.h"
 #include "GameSymbols.h"
 #include "Profile.h"
+namespace MyClientProfile {
+// At most one stutter line every 2 s, and 200 per run, so a slow machine does not fill the log.
+void LogSpike(const std::string& line)
+{
+    static std::atomic<uint64_t> lastAt{0};
+    static std::atomic<unsigned> count{0};
+    const uint64_t now = GetTickCount64();
+    const uint64_t last = lastAt.load(std::memory_order_relaxed);
+    if ((last && now - last < 2000) || count.load(std::memory_order_relaxed) >= 200) return;
+    lastAt.store(now, std::memory_order_relaxed);
+    count.fetch_add(1, std::memory_order_relaxed);
+    MyClientLog::Get().info("{}", line);
+}
+}  // namespace MyClientProfile
 #include "GameDataMirror.h"
 #include "Compositor.h"
 #include "SignatureDump.h"
 #include "GameImageDump.h"
+#include "HangWatch.h"
+#include "CrashDiagnostics.h"
+#include <intrin.h>
 #include "ll/api/memory/Hook.h"
 #include "mc/client/gui/screens/controllers/ContainerScreenController.h"
 #include "mc/client/gui/controls/renderers/PaperDollRenderer.h"
@@ -28,6 +55,7 @@
 #include "ll/api/mod/NativeMod.h"
 #endif
 #include "mc/client/game/ClientInstance.h"
+#include "mc/client/game/IMinecraftGame.h"
 #include "mc/client/multiplayer/ClientLevel.h"
 #include "mc/client/player/LocalPlayer.h"
 #include "mc/world/actor/player/Inventory.h"
@@ -96,12 +124,14 @@
 #include <thread>
 #include <cctype>
 #include <fstream>
+#include <set>
 #include <optional>
 #include <cstddef>
 #include <string_view>
 
 namespace {
 std::atomic<bool> enabled{false};
+std::atomic<bool> enableFinished{false};   // the enable step ran to its end, worked or not (HangWatch)
 std::mutex callbackMutex;
 bool worldHooked = false;               // LevelTickHook and LevelExitHook are in (they are never taken out)
 std::atomic<bool> loaded{false};   // the load step ran (LeviLamina's ll_mod_load, or the standalone start)
@@ -238,8 +268,28 @@ bool closetHaveKept = false;
 std::string closetKeptId;
 SkinObject closetOriginal;          // your own skin in this world, before the Closet's was put on
 std::atomic<bool> closetNewWorld{true};
-ULONGLONG closetWorldSince = 0, closetLastTry = 0;   // when this world was first seen / the kept skin last put on
-int closetTries = 0;
+ULONGLONG closetWorldSince = 0;
+MyClientSkin::ReapplyBudget closetReapply;
+bool closetMismatchLogged = false, closetLimitLogged = false;
+unsigned closetCapeResultsLogged = 0;
+std::atomic<unsigned> closetMismatchKind{0}; // generated ID / cape present; never record account IDs
+
+void ResetClosetReapply()
+{
+    closetReapply.Reset();
+    closetMismatchLogged = closetLimitLogged = false;
+    closetCapeResultsLogged = 0;
+}
+
+void LogOwnCapeResult(MyClientSkin::Request const& request, bool ok)
+{
+    if (!request.capeId || !mod) return;
+    const unsigned bit = ok ? 1 : 2;
+    if (closetCapeResultsLogged & bit) return;
+    closetCapeResultsLogged |= bit;
+    MyClientLog::Get().info("Capes: own cape {} request {} (local application and server skin send; visual result unconfirmed)",
+                            request.capeId, ok ? "completed" : "failed");
+}
 std::atomic<uint32_t> closetDollAsked{0}, closetDollGiven{0}, closetDollEmpty{0};
 std::atomic<uint64_t> skinInstanceSerial{1};
 std::atomic<bool> closetWaitingForList{false};
@@ -375,6 +425,8 @@ struct DollMenuState : MyClientSkin::AvatarLifecycle {
     MyClientSkin::AvatarResources resources;
     MyClientSkin::AvatarLoadRetry loadRetry;
     bool retryBuild = false;
+    uint64_t reloadRefreshAt = 0;
+    bool reloadBuildObserved = false;
     const void* context = nullptr;
     std::shared_ptr<PlayerSkinPacket> packet; // keep the exact native ref/images alive across menu updates
     SkinObject accountSkin; // owned original ref; never mutate the account's object
@@ -466,7 +518,19 @@ MYCLIENT_TYPE_INSTANCE_HOOK(DollUpdateHook, ll::memory::HookPriority::Normal, Do
 {
     if (!this || !context || !data) return;
     dollUpdates.fetch_add(1, std::memory_order_relaxed);
-    if (context)
+    bool titleRefreshThisUpdate = false;
+    if (!MyClientGame::TextureReloadHeld() && MyClientGame::TitleAvatarRefreshPending()) {
+        const auto client = MyClientGame::Client();
+        const bool ownTitle = client && MyClientTexturePolicy::IsTitleForReload(client->getLocalPlayer() != nullptr,
+            bool(MyClientGame::WorldLevel()), client->getTopScreenName()) &&
+            static_cast<bool>(reinterpret_cast<PaperDollRenderer*>(this)->mUseSelectedSkin);
+        if (ownTitle && dollReadyHooked.load() && DollDirtyFor(context).fn && MyClientGame::TakeTitleAvatarRefresh()) {
+            titleRefreshThisUpdate = true;
+            SkinChangedForDolls();
+            MyClientLog::Get().info("Closet: own title avatar rebuild requested once after resource completion");
+        }
+    }
+    if (context && !MyClientGame::TextureReloadHeld())
     {
         const uint32_t gen = dollGeneration.load(std::memory_order_relaxed);
         bool tell = false;
@@ -521,7 +585,7 @@ MYCLIENT_TYPE_INSTANCE_HOOK(DollUpdateHook, ll::memory::HookPriority::Normal, Do
                          screen.find("MultiItemPage_PersonaSkinSelector") != std::string::npos;
         // Profile dolls additionally require the title's observed account identity in DollBuildHook.
         // Skin shop, arbitrary previews and inventory are not selected by this screen gate.
-        const bool title = !player && !MyClientGame::WorldLevel() && screen == "start_screen" &&
+        const bool title = MyClientTexturePolicy::IsTitleForReload(player != nullptr, bool(MyClientGame::WorldLevel()), screen) &&
                            static_cast<bool>(reinterpret_cast<PaperDollRenderer*>(this)->mUseSelectedSkin);
         if (dollReadyHooked.load() && client && (title || profileOwnDoll) && !MyClientGame::TextureReloadHeld() && DollDirtyFor(context).fn) {
             titleOwnDoll = true;
@@ -595,7 +659,12 @@ MYCLIENT_TYPE_INSTANCE_HOOK(DollUpdateHook, ll::memory::HookPriority::Normal, Do
         const auto& animation = renderer->mAnimationComponent;
         const bool retainedNative = !profileOwnDoll && state->accountSkin && animation &&
                                     state->initializedAnimation == animation.get();
-        const auto change = state->Select(gen, titlePreview != nullptr, retainedNative);
+        const auto change = state->Select(gen, titlePreview != nullptr, retainedNative, titleRefreshThisUpdate);
+        if (titleRefreshThisUpdate) {
+            state->reloadRefreshAt = GetTickCount64();
+            state->reloadBuildObserved = false;
+            MyClientLog::Get().info("Closet: title post-reload rebuild started (chosen={} initialized={}); invalidating native pack/index cache", titlePreview != nullptr, state->initialized);
+        }
         if (change.changed) state->loadRetry = {};
         const bool retry = state->retryBuild;
         state->retryBuild = false;
@@ -668,6 +737,17 @@ MYCLIENT_TYPE_INSTANCE_HOOK(DollUpdateHook, ll::memory::HookPriority::Normal, Do
             if (!matched || pauseDollBuildSerial != buildsBefore)
                 MyClientLog::Get().info("Closet: own doll render key synchronized (menu={} profile={} alreadyMatched={} waiting={})",
                                       titleOwnDoll, profileOwnDoll, matched, static_cast<bool>(renderer->mWaitForSkinInitialize));
+        }
+    }
+    if (menuState && menuState->reloadRefreshAt) {
+        const auto* renderer = reinterpret_cast<const PaperDollRenderer*>(this);
+        const auto& key = renderer->mSkinName.get();
+        const bool ready = !key.empty() && !static_cast<bool>(renderer->mWaitForSkinInitialize) && DollNativeReady(context, key);
+        const auto elapsed = GetTickCount64() - menuState->reloadRefreshAt;
+        if (ready || elapsed >= 10000) {
+            MyClientLog::Get().info("Closet: title post-reload rebuild observation (nativeBuildCalled={} nativeReady={} keyPresent={} elapsedMs={}; visual result unconfirmed)",
+                menuState->reloadBuildObserved, ready, !key.empty(), elapsed);
+            menuState->reloadRefreshAt = 0; // bounded diagnostic, never force native readiness
         }
     }
     // A dirty notification is not evidence that the doll asked for (or built) the Closet skin. The selected
@@ -757,7 +837,10 @@ MYCLIENT_STATIC_HOOK(DollBuildHook, ll::memory::HookPriority::Normal, MyClientGa
             if (dollMenuState) dollMenuState->fullId.clear();
             return origin(self, animation, skin, images);
         }
-        if (dollMenuState) dollMenuState->accountSkin = skin.mSkinImpl;
+        if (dollMenuState) {
+            dollMenuState->accountSkin = skin.mSkinImpl;
+            if (dollMenuState->reloadRefreshAt) dollMenuState->reloadBuildObserved = true;
+        }
     }
     const auto* applied = self && self == pauseDollContext ? pauseDollSkin : nullptr;
     std::shared_ptr<PlayerSkinPacket> titlePacket; // native constructor + shared ownership; never sent
@@ -922,7 +1005,7 @@ std::string ClosetSkinId(MyClientSkin::Request const& request)
 // Never flatten a persona/custom geometry into a humanoid just to attach a cape.
 bool PrepareClosetRequest(MyClientSkin::Request& request, SerializedSkinImpl* source)
 {
-    if (request.operation > static_cast<uint32_t>(MyClientSkin::Operation::Cape) || request.capeId > 2) return false;
+    if (request.operation > static_cast<uint32_t>(MyClientSkin::Operation::Cape) || !MyClientSkin::KnownCape(request.capeId)) return false;
     const bool capeEdit = request.operation == static_cast<uint32_t>(MyClientSkin::Operation::Cape);
     const uint32_t requestedCape = request.capeId;
     std::vector<uint8_t> cape;
@@ -962,6 +1045,7 @@ bool PrepareClosetRequest(MyClientSkin::Request& request, SerializedSkinImpl* so
 
 void KeepClosetSkin(MyClientSkin::Request const& request, MyClientLog::Logger& log)
 {
+    ResetClosetReapply(); // an explicit user choice gets a fresh budget; native updates do not
     {
         std::lock_guard lock(closetWornMutex);
         closetPreviewRequest = std::make_shared<MyClientSkin::Request>(request);
@@ -1008,12 +1092,20 @@ void LoadClosetSkin(MyClientLog::Logger& log)
     static MyClientSkin::Request saved;
     std::memset(&saved, 0, sizeof(saved));
     in.read(reinterpret_cast<char*>(&saved), offsetof(MyClientSkin::Request, rgba));
-    if (!in || saved.magic != MyClientSkin::RequestMagic || (saved.version != 1 && saved.version != MyClientSkin::RequestVersion) ||
+    if (!in || saved.magic != MyClientSkin::RequestMagic || (saved.version != 1 && saved.version != 2 && saved.version != MyClientSkin::RequestVersion) ||
         !MyClientSkin::UsableRequest(saved))
         return;
     in.read(reinterpret_cast<char*>(saved.rgba), static_cast<std::streamsize>(saved.width) * saved.height * 4);
     if (!in) return;
     if (saved.version == 1) saved.skinOverride = 1;
+    else if (saved.version == 2) {
+        // Before HD capes: the four numbers, then a 64x32 cape.
+        in.read(reinterpret_cast<char*>(&saved.operation), offsetof(MyClientSkin::Request, capeRgba) - offsetof(MyClientSkin::Request, operation));
+        static uint8_t classic[MyClientSkin::ClassicCapeBytes];
+        in.read(reinterpret_cast<char*>(classic), sizeof(classic));
+        if (!in || !MyClientSkin::UsableRequest(saved) || saved.operation || saved.skinOverride > 1) return;
+        MyClientSkin::UpscaleClassicCape(classic, saved.capeRgba);
+    }
     else {
         in.read(reinterpret_cast<char*>(&saved.operation), sizeof(saved) - offsetof(MyClientSkin::Request, operation));
         if (!in || !MyClientSkin::UsableRequest(saved) || saved.operation || saved.skinOverride > 1) return;
@@ -1137,6 +1229,20 @@ bool PutSkinInPlayerList(Level& level, Player& player, std::shared_ptr<Serialize
     return true;
 }
 
+// Cape HD diagnosis (TODO "cape HD, option 2"): %LOCALAPPDATA%\\MyClient\\cape_trial_size.txt may hold 64, 128, 256 or 512 (the
+// cape's width) so one build can try every size, in any order, without a rebuild. Missing or invalid = 64, as before.
+uint32_t CapeTrialWidth()
+{
+    wchar_t base[MAX_PATH]{};
+    const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+    if (!n || n >= MAX_PATH) return 64;
+    std::ifstream in(std::filesystem::path(base) / L"MyClient" / L"cape_trial_size.txt");
+    unsigned value = 0;
+    if (!(in >> value) || (value != 64 && value != 128 && value != 256 && value != 512)) return 64;
+    return value;
+}
+std::atomic<unsigned> capeFillSerial{0};   // which cape fill of this run a log line belongs to
+
 // The Closet's skin written into a skin object: `old` is the skin it replaces (cape and account data are kept from it).
 // `own` = impl is a skin object of its own (not old itself). id gets the skin's MyClient_ id.
 void FillClosetSkin(SerializedSkinImpl& impl, SerializedSkinImpl& old, bool own, MyClientSkin::Request const& request, char (&id)[48])
@@ -1158,12 +1264,33 @@ void FillClosetSkin(SerializedSkinImpl& impl, SerializedSkinImpl& old, bool own,
         impl.mCapeId = capeSource.mCapeId.get();
         mce::Image cape(capeSource.mCapeImage.get());
         if (request.capeId) {
+            // r57-test37: the 512x256 cape was never drawn, 64x32 was. r57-test38 trial: one size per cape to find the
+            // largest the game draws (Founder 64x32, Member 128x64, Patron 256x128, Creator and others 512x256).
+            // r57-test38 result (user): 64x32 and 128x64 are drawn, 256x128 and 512x256 are not. Every cape is 128x64.
+            // r57-test39: at 128x64 no cape was drawn (test38's Member showed only after a 64x32 one). 64x32 until the
+            // size limit is found (TODO: cape HD, option 2).
+            const uint32_t outW = CapeTrialWidth();
+            const uint32_t outH = outW / 2;
+            static std::vector<uint8_t> scaled;
+            scaled.assign(static_cast<size_t>(outW) * outH * 4, 0);
+            const uint32_t sx = MyClientSkin::CapeWidth / outW, sy = MyClientSkin::CapeHeight / outH;
+            for (uint32_t y = 0; y < outH; ++y)
+                for (uint32_t x = 0; x < outW; ++x)
+                    for (uint32_t c = 0; c < 4; ++c) {
+                        uint32_t sum = 0;
+                        for (uint32_t dy = 0; dy < sy; ++dy)
+                            for (uint32_t dx = 0; dx < sx; ++dx)
+                                sum += request.capeRgba[((y * sy + dy) * MyClientSkin::CapeWidth + (x * sx + dx)) * 4 + c];
+                        scaled[(static_cast<size_t>(y) * outW + x) * 4 + c] = static_cast<uint8_t>(sum / (sx * sy));
+                    }
             cape.imageFormat = mce::ImageFormat::RGBA8Unorm;
-            cape.mWidth = MyClientSkin::CapeWidth;
-            cape.mHeight = MyClientSkin::CapeHeight;
+            cape.mWidth = outW;
+            cape.mHeight = outH;
             cape.mDepth = 1;
-            cape.mImageBytes = mce::Blob(request.capeRgba, MyClientSkin::CapeBytes);
+            cape.mImageBytes = mce::Blob(scaled.data(), scaled.size());
             impl.mCapeId = std::string("OriginX_trial_cape_") + std::to_string(request.capeId);
+            MyClientLog::Get().info("Capes fill #{}: cape {} written as {}x{} (trial size file; skin cape image replaced)",
+                                    capeFillSerial.fetch_add(1) + 1, request.capeId, outW, outH);
         }
         static_cast<mce::Image&>(impl.mCapeImage.get()) = std::move(cape);
         impl.mSkinColor = old.mSkinColor.get();
@@ -1188,6 +1315,20 @@ void FillClosetSkin(SerializedSkinImpl& impl, SerializedSkinImpl& old, bool own,
     impl.mIsTrustedSkin = TrustedSkinFlag::True;   // an untrusted skin may be drawn as a default one
 }
 
+// Serialized input only: neither a cape id nor a ready skin proves a dedicated GPU cape registration.
+void NoteCapeRenderInput(const char* who, const SerializedSkinImpl* skin)
+{
+    if (!mod) return;
+    if (!skin) {
+        MyClientLog::Get().info("Capes render input: who={} skinPresent=false nativeCapeTexture=unknown nativeCapeGeometry=unknown", who);
+        return;
+    }
+    const auto& image = skin->mCapeImage.get();
+    MyClientLog::Get().info("Capes render input: who={} skinPresent=true capeIdPresent={} originXCape={} width={} height={} format={} bytes={} capePatchDeclared={} fill#={} nativeCapeTexture=unknown nativeCapeGeometry=unknown (serialized data only)",
+        who, !skin->mCapeId->empty(), MyClientCapes::IsOriginXCape(skin->mCapeId.get()), image.mWidth, image.mHeight,
+        static_cast<uint32_t>(image.imageFormat), image.mImageBytes.size(), skin->mResourcePatch->find("\"cape\"") != std::string::npos, capeFillSerial.load());
+}
+
 void NoteClosetWorld(Player& player);
 std::atomic<bool> closetReapplyWanted{false};
 bool closetSentThisWorld = false;   // the Closet's skin was sent to the server in this world
@@ -1200,8 +1341,73 @@ MYCLIENT_TYPE_INSTANCE_HOOK(PlayerUpdateSkinHook, ll::memory::HookPriority::Norm
                       SerializedSkinRef const& skin, int clientSubId)
 {
     if (!this) return;
-    origin(skin, clientSubId);
-    if (closetApplyDepth || !mod) return;
+    const auto nativeCaller = _ReturnAddress();
+    std::shared_ptr<PlayerSkinPacket> capeEcho; // independent native object; never mutate the const input
+    if (!closetApplyDepth && mod) {
+        try {
+            std::shared_ptr<const MyClientSkin::Request> desired;
+            { std::lock_guard lock(closetWornMutex); desired = closetPreviewRequest; }
+            const auto client = MyClientGame::Client();
+            auto* local = client ? client->getLocalPlayer() : nullptr;
+            const auto incoming = skin.mSkinImpl;
+            if (local && static_cast<Player*>(local) == this && desired && incoming &&
+                incoming->mObject.mCapeId->empty() && !incoming->mObject.mIsPersona) {
+                // r57-test24: the pixel comparison never matched (no "echo matched" line while the cape-less copy
+                // came back 5 times). The copy carries the Closet's own generated id ("MyClient_..."), which only the
+                // Closet makes, so that id with no cape while a cape is wanted is the echo.
+                // r57-test27: replacing the echo with a freshly made skin left the player transparent (the new
+                // object's picture never reached the renderer) and still no cape. The echo is now let through; the
+                // watcher below queues the normal reapply, which puts the cape on locally and is not sent to the
+                // server again within 16 s (so no new echo comes back).
+                // 2026-11-19 (test58, author: the cape flickers and is gone): letting the echo through took the cape
+                // off about 50 ms after it was put on, and the reapply that followed got the next echo, over and
+                // over. When this player already wears the same generated skin with the cape, the echo is dropped
+                // (it carries the same picture, only without the cape), so the cape stays on.
+                const auto* wornNow = this->mSkin ? this->mSkin->mSkinImpl.get() : nullptr;
+                if (desired->capeId != 0 && incoming->mObject.mId->rfind("MyClient_", 0) == 0 && wornNow &&
+                    wornNow != incoming.get() && !wornNow->mObject.mCapeId->empty() &&
+                    wornNow->mObject.mId.get() == incoming->mObject.mId.get()) {
+                    static ULONGLONG dropLogAt = 0;
+                    if (GetTickCount64() - dropLogAt > 10000) {
+                        dropLogAt = GetTickCount64();
+                        MyClientLog::Get().info("Closet: cape-less echo of our skin dropped; the worn skin keeps its cape");
+                    }
+                    return;
+                } else if (desired->capeId != 0 && incoming->mObject.mId->rfind("MyClient_", 0) == 0) {
+                    static ULONGLONG echoLogAt = 0;
+                    if (GetTickCount64() - echoLogAt > 10000) {
+                        echoLogAt = GetTickCount64();
+                        MyClientLog::Get().info("Closet: cape-less echo of our skin seen; local reapply without a server send");
+                    }
+                } else if (false) {
+                    using Factory = std::shared_ptr<Packet> (*)(MinecraftPacketIds);
+                    static const auto create = MyClientGame::ResolveFunction<Factory>("?createPacket@MinecraftPackets@@SA?AV?$shared_ptr@VPacket@@@std@@W4MinecraftPacketIds@@@Z");
+                    if (create) {
+                        if (auto packet = create(MinecraftPacketIds::PlayerSkin))
+                            capeEcho = std::static_pointer_cast<PlayerSkinPacket>(packet);
+                    }
+                    if (capeEcho && capeEcho->mSkin->mSkinImpl && capeEcho->mSkin->mSkinImpl != incoming) {
+                        char id[48];
+                        FillClosetSkin(capeEcho->mSkin->mSkinImpl->mObject, incoming->mObject, true, *desired, id);
+                        HMODULE callerModule = nullptr;
+                        if (nativeCaller) GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                                           reinterpret_cast<LPCWSTR>(nativeCaller), &callerModule);
+                        const HMODULE gameModule = GetModuleHandleW(nullptr);
+                        MyClientLog::Get().info("Closet: cape-less native echo matched saved picture; private local cape restored (caller={} gameRva={} packet origin unconfirmed)",
+                                               nativeCaller, callerModule && callerModule == gameModule ?
+                                               reinterpret_cast<uintptr_t>(nativeCaller) - reinterpret_cast<uintptr_t>(gameModule) : 0);
+                    } else capeEcho.reset();
+                }
+            }
+        } catch (...) { capeEcho.reset(); }
+    }
+    if (capeEcho) {
+        ClosetApplyScope applying;
+        origin(*capeEcho->mSkin, clientSubId);
+        std::lock_guard lock(closetWornMutex);
+        closetWornObject = this->mSkin ? this->mSkin->mSkinImpl : SkinObject{};
+    } else origin(skin, clientSubId);
+    if (!mod) return;
     try {
         std::shared_ptr<const MyClientSkin::Request> desired;
         {
@@ -1212,10 +1418,22 @@ MYCLIENT_TYPE_INSTANCE_HOOK(PlayerUpdateSkinHook, ll::memory::HookPriority::Norm
         const auto client = MyClientGame::Client();
         auto* local = client ? client->getLocalPlayer() : nullptr;
         const auto* current = this->mSkin ? this->mSkin->mSkinImpl.get() : nullptr;
+        if (local && static_cast<Player*>(local) == this && desired->capeId) {
+            const auto incoming = skin.mSkinImpl;
+            MyClientLog::Get().info("Closet trace: updateSkin returned (deliberate={} inputPresent={} inputCape={} inputOriginXCape={} localPresent={} localCape={} localOriginXCape={} wantedCape={})",
+                                   closetApplyDepth != 0, bool(incoming),
+                                   incoming && !incoming->mObject.mCapeId->empty(),
+                                   incoming && MyClientCapes::IsOriginXCape(incoming->mObject.mCapeId.get()), current != nullptr,
+                                   current && !current->mObject.mCapeId->empty(),
+                                   current && MyClientCapes::IsOriginXCape(current->mObject.mCapeId.get()), desired->capeId);
+        }
+        if (closetApplyDepth) return; // diagnostics must not enqueue our deliberate application
         if (local && static_cast<Player*>(local) == this && current &&
             !MyClientSkin::MatchesSelection(current->mObject.mId.get(), ClosetSkinId(*desired))) {
-            if (!closetReapplyWanted.exchange(true))
-                MyClientLog::Get().info("Closet: native skin change completed; saved choice queued after player registration");
+            const auto& observed = current->mObject;
+            closetMismatchKind.store((observed.mId->rfind("MyClient_", 0) == 0 ? 1u : 0u) |
+                                     (!observed.mCapeId->empty() ? 2u : 0u), std::memory_order_relaxed);
+            closetReapplyWanted.store(true);
         }
     } catch (...) {}
 }
@@ -1257,6 +1475,7 @@ MyClientSkin::Result WearSkin(ClientInstance& client, Level& level, Player& play
             const bool own = fresh && fresh != ref->mSkinImpl;
             if (!own) {
                 log.warn("Closet: no private skin object was available; the player's current skin was kept.");
+                LogOwnCapeResult(request, false);
                 return MyClientSkin::Result::Failed;
             }
             SerializedSkinImpl& old = owner->mObject;
@@ -1271,6 +1490,17 @@ MyClientSkin::Result WearSkin(ClientInstance& client, Level& level, Player& play
                 auto* now = ref ? ref->mSkinImpl.get() : nullptr;
                 return now && now->mObject.mId.get() == id;
             };
+            // Only booleans and the public cape selection are logged: no UUID, skin IDs or image bytes.
+            const auto traceCape = [&](const char* phase) {
+                if (!request.capeId) return;
+                const auto local = ref ? ref->mSkinImpl : SkinObject{};
+                log.info("Closet trace: {} (wantedCape={} packetCape={} packetOriginXCape={} localPresent={} localCape={} localOriginXCape={} sharesPacket={} fill#={} packetCapeSize={}x{} localCapeSize={}x{})",
+                         phase, request.capeId, !impl.mCapeId->empty(), MyClientCapes::IsOriginXCape(impl.mCapeId.get()), bool(local),
+                         local && !local->mObject.mCapeId->empty(),
+                         local && MyClientCapes::IsOriginXCape(local->mObject.mCapeId.get()), local == fresh,
+                         capeFillSerial.load(), impl.mCapeImage.get().mWidth, impl.mCapeImage.get().mHeight,
+                         local ? local->mObject.mCapeImage.get().mWidth : 0u, local ? local->mObject.mCapeImage.get().mHeight : 0u);
+            };
             bool sent = false, handled = false, viaHandler = false, viaUpdate = false, listed = false, direct = false;
             closetCanUse.store(-1);
             closetKeep.store(-1);
@@ -1282,18 +1512,50 @@ MyClientSkin::Result WearSkin(ClientInstance& client, Level& level, Player& play
                 skinPacket->mLocalizedOldSkinName = std::string{};
                 if (client.getPacketSender().isInitialized())
                 {
-                    client.getPacketSender().sendToServer(*skinPacket);
+                    // OriginX capes are seen by OriginX users only (capes design 2026-11-12): the server gets the skin
+                    // with your own (account) cape, and the OriginX cape is put back for this game only below.
+                    const uint32_t originxCape = request.capeId;
+                    if (originxCape) {
+                        char plainId[48];
+                        request.capeId = 0;
+                        FillClosetSkin(impl, old, own, request, plainId);
+                        request.capeId = originxCape;
+                    }
+                    traceCape("before server send");
+                    // Servers limit skin changes (Hive: "Please wait 15 seconds between changing skins", r57-test24).
+                    // The same skin again within 16 s (a reapply after the game put another skin on locally) is put
+                    // on locally only: the server already has it.
+                    static std::string lastSentId;
+                    static ULONGLONG lastSentAt = 0;
+                    const std::string sentId = impl.mId.get();
+                    const ULONGLONG sendNow = GetTickCount64();
+                    // r57-test25: the reapply makes a new id each time, so "same id" never held and Hive still
+                    // refused; any send within 16 s of the last one is skipped (the server keeps the first).
+                    (void)lastSentId;
+                    // Only a reapply in the same world is held back (a new world or a choice made in the Closet is sent).
+                    const bool reapply = closetReapply.attempts > 1;
+                    if (!reapply || lastSentAt == 0 || sendNow - lastSentAt >= 16000) {
+                        client.getPacketSender().sendToServer(*skinPacket);
+                        lastSentId = sentId;
+                        lastSentAt = sendNow;
+                    } else if (mod) MyClientLog::Get().info("Closet: a skin was sent {} ms ago; put on locally, not sent to the server again", sendNow - lastSentAt);
+                    traceCape("after server send");
+                    if (originxCape) FillClosetSkin(impl, old, own, request, id);
+                    traceCape("after local cape refill");
                     sent = true;
                     closetSentThisWorld = true;
                 }
                 try { handled = HandleSkinLocally(*skinPacket); } catch (...) { handled = false; }
+                traceCape("after local handler");
                 viaHandler = handled && wearing();
                 if (!viaHandler && updateSkin)
                 {
                     try { updateSkin(&player, *skinPacket->mSkin, 0); } catch (...) {}
+                    traceCape("after local updateSkin");
                     viaUpdate = wearing();
                 }
                 try { listed = PutSkinInPlayerList(level, player, skinPacket->mSkin->mSkinImpl); } catch (...) { listed = false; }
+                traceCape("after player list update");
             }
             if (wearing())
             {
@@ -1301,6 +1563,7 @@ MyClientSkin::Result WearSkin(ClientInstance& client, Level& level, Player& play
                 closetWornObject = ref->mSkinImpl;
                 closetWornUuid = MyClientGame::UuidOf(player);
             }
+            if (request.capeId) NoteCapeRenderInput("own", ref && ref->mSkinImpl ? &ref->mSkinImpl->mObject : nullptr);
             SkinChangedForDolls();
             log.info("Closet: wearing \"{}\"{} ({}x{}, {} arms{}){}{}{}{}{}", name, when, w, h, slim ? "slim" : "wide",
                      wasPersona ? ", was a persona skin" : "", sent ? ", sent to the server" : ", NOT sent (no packet sender)",
@@ -1320,6 +1583,7 @@ MyClientSkin::Result WearSkin(ClientInstance& client, Level& level, Player& play
     {
         log.error("Closet: wearing the skin failed with an exception.");
     }
+    LogOwnCapeResult(request, result == MyClientSkin::Result::Sent);
     return result;
 }
 
@@ -1372,6 +1636,209 @@ MyClientSkin::Result TakeOffSkin(ClientInstance& client, Level& level, Player& p
     {
         log.error("Closet: putting your own skin back failed with an exception.");
         return MyClientSkin::Result::Failed;
+    }
+}
+
+// --- OriginX capes on the other OriginX users in your world (capes design 2026-11-12, CapeChannel.h) ------------
+// Once a second: the XUIDs of the players in the player list go to the HUD, which asks the Worker which capes they
+// wear; a player whose cape changed gets their own skin again with that cape, handed to this game's own skin packet
+// handler only (HandleSkinLocally): nothing is sent to the server, so only you see it. Persona skins and skins of a
+// size the Closet cannot hold are left as they are. The pictures are the HUD's (%LOCALAPPDATA%\MyClient\capes\<id>.rgba).
+MyClientCapes::Channel capeChannel;
+std::unordered_map<std::string, uint32_t> capesApplied;   // xuid -> cape put on in this world
+const Level* capesLevel = nullptr;
+
+const std::vector<uint8_t>* CapePicture(uint32_t id)
+{
+    static std::vector<uint8_t> pictures[7];
+    if (id < 1 || id > 6) return nullptr;
+    auto& picture = pictures[id];
+    if (picture.size() != MyClientSkin::CapeBytes) {
+        wchar_t base[MAX_PATH]{};
+        const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+        if (!n || n >= MAX_PATH) return nullptr;
+        std::ifstream in(std::filesystem::path(base) / L"MyClient" / L"capes" / (std::to_wstring(id) + L".rgba"), std::ios::binary);
+        std::vector<uint8_t> bytes(MyClientSkin::CapeBytes);
+        if (!in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) return nullptr;
+        picture = std::move(bytes);
+    }
+    return &picture;
+}
+
+bool PutCapeOn(Level& level, PlayerListEntry& entry, uint32_t cape)
+{
+    using PacketFactory = std::shared_ptr<Packet> (*)(MinecraftPacketIds);
+    static const auto createPacket = MyClientGame::ResolveFunction<PacketFactory>("?createPacket@MinecraftPackets@@SA?AV?$shared_ptr@VPacket@@@std@@W4MinecraftPacketIds@@@Z");
+    const auto* picture = CapePicture(cape);
+    if (!createPacket || !picture) return false;
+    auto* owner = entry.mSkin->mSkinImpl.get();   // mSkin is held by value; its skin object may be null (checked)
+    if (!owner) return false;
+    SerializedSkinImpl& old = owner->mObject;
+    if (old.mIsPersona) return false;
+    auto const& skin = reinterpret_cast<mce::Image const&>(old.mSkinImage);
+    auto const& bytes = skin.mImageBytes;
+    const uint32_t w = skin.mWidth, h = skin.mHeight;
+    if (!MyClientCapes::UsableSkinSize(w, h)) return false;
+    static std::vector<uint8_t> rgba;
+    if (!MyClientSkin::ToRgba(static_cast<uint32_t>(skin.imageFormat), bytes.data(), bytes.size(), w, h, rgba) ||
+        rgba.size() < static_cast<size_t>(w) * h * 4) return false;
+    static MyClientSkin::Request request;   // ~1 MB: not on the stack
+    std::memset(&request, 0, sizeof(request));
+    request.width = w; request.height = h;
+    const std::string& geometry = old.mDefaultGeometryName;
+    request.slim = geometry.find("Slim") != std::string::npos || geometry.find("slim") != std::string::npos;
+    std::memcpy(request.rgba, rgba.data(), static_cast<size_t>(w) * h * 4);
+    std::snprintf(request.name, sizeof(request.name), "OriginX cape");
+    request.capeId = cape;
+    std::memcpy(request.capeRgba, picture->data(), MyClientSkin::CapeBytes);
+    const auto packet = std::static_pointer_cast<PlayerSkinPacket>(createPacket(MinecraftPacketIds::PlayerSkin));
+    if (!packet) return false;
+    const auto fresh = packet->mSkin->mSkinImpl;
+    if (!fresh || fresh == entry.mSkin->mSkinImpl) return false;
+    char id[48];
+    FillClosetSkin(fresh->mObject, old, true, request, id);
+    packet->mUUID = entry.mUUID.get();
+    packet->mLocalizedNewSkinName = std::string{};
+    packet->mLocalizedOldSkinName = std::string{};
+    const auto uuid = entry.mUUID.get();
+    const bool handled = HandleSkinLocally(*packet); // this game only, never sendToServer
+    // The handler can rebuild the player list: reacquire by UUID instead of retaining entry across it.
+    const auto& list = level.getPlayerList();
+    const auto applied = list.find(uuid);
+    const auto object = applied != list.end() ? applied->second.mSkin->mSkinImpl : SkinObject{};
+    NoteCapeRenderInput("other", object ? &object->mObject : nullptr);
+    return handled;
+}
+
+void PublishOriginMarks(const OriginMarks::Table& table, uint64_t now)
+{
+    OriginMarks::Publish(table);
+    static unsigned lastCount = 0;
+    static uint64_t lastLog = 0;
+    const auto alloc = OriginMarks::statMarkAlloc.load(std::memory_order_relaxed);
+    const unsigned count = table.count + (table.self.tier != 0);
+    if (count != lastCount || (count && now - lastLog >= 30000)) {
+        MyClientLog::Get().info("Origin marks: marks={} alloc={}", count, alloc);
+        lastCount = count; lastLog = now;
+    }
+}
+
+// Cape HD diagnosis (TODO "マント高画質（案 2）"): 26.51's query.has_cape reads player+0xAB0 -> [0] -> +0xF8 (non-zero =
+// has a cape). Logs that slot and its neighbours when they change (and every 30 s), so a 64x32 cape and a 128x64 one
+// can be compared: whether the game keeps a cape object at all for the larger size. 26.51 only (offsets from its image).
+#ifndef MYCLIENT_GAME_VERSION
+#define MYCLIENT_GAME_VERSION "1.26.51"
+#endif
+void LogNativeCapeSlot(Player& player, uint64_t now)
+{
+    if (std::string_view(MYCLIENT_GAME_VERSION) != "1.26.51") return;
+    static uint64_t lastLog = 0;
+    static uintptr_t lastSlot[6]{};
+    static bool lastOk = false;
+    const auto* bytes = reinterpret_cast<const char*>(&player);
+    uintptr_t holder = 0, object = 0, slot[6]{};
+    bool ok = ReadableBytes(bytes + 0xAB0, 8);
+    if (ok) { std::memcpy(&holder, bytes + 0xAB0, 8); ok = ReadableBytes(reinterpret_cast<const void*>(holder), 8); }
+    if (ok) { std::memcpy(&object, reinterpret_cast<const void*>(holder), 8); ok = ReadableBytes(reinterpret_cast<const char*>(object) + 0xE8, 6 * 8); }
+    if (ok) std::memcpy(slot, reinterpret_cast<const char*>(object) + 0xE8, sizeof slot);
+    const bool changed = ok != lastOk || std::memcmp(slot, lastSlot, sizeof slot) != 0;
+    if (!changed && now - lastLog < 30000) return;
+    lastLog = now;
+    lastOk = ok;
+    std::memcpy(lastSlot, slot, sizeof slot);
+    if (!ok) { MyClientLog::Get().info("Capes native slot: unreadable (holder={:#x} object={:#x})", holder, object); return; }
+    // +0xF8 (has_cape) and, if it looks like a pointer, the first 4 qwords it points at.
+    uintptr_t inner[4]{};
+    const bool innerOk = slot[2] && ReadableBytes(reinterpret_cast<const void*>(slot[2]), sizeof inner);
+    if (innerOk) std::memcpy(inner, reinterpret_cast<const void*>(slot[2]), sizeof inner);
+    MyClientLog::Get().info("Capes native slot: +E8={:#x} +F0={:#x} +F8={:#x} (has_cape={}) +100={:#x} +108={:#x} +110={:#x} "
+                            "[+F8]={} {:#x} {:#x} {:#x} {:#x} fill#={}",
+                            slot[0], slot[1], slot[2], slot[2] != 0, slot[3], slot[4], slot[5],
+                            innerOk ? "read" : "none", inner[0], inner[1], inner[2], inner[3], capeFillSerial.load());
+}
+
+void TickCapes(Level& level, Player& player)
+{
+    static uint64_t last = 0;
+    const uint64_t now = GetTickCount64();
+    if (now - last < 1000) return;
+    last = now;
+    LogNativeCapeSlot(player, now);
+    if (capesLevel != &level) { capesApplied.clear(); capesLevel = &level; }
+    const DWORD pid = GetCurrentProcessId();
+    if (!capeChannel.Data() && !capeChannel.Open(pid, true)) { PublishOriginMarks({}, now); return; }
+    auto& list = const_cast<std::unordered_map<mce::UUID, PlayerListEntry>&>(level.getPlayerList());
+    const mce::UUID self = MyClientGame::UuidOf(player);
+    std::string own;
+    std::vector<PlayerListEntry*> others;
+    for (auto& [uuid, entry] : list) {
+        if (uuid == self) { own = entry.mXUID.get(); continue; }
+        if (others.size() < MyClientCapes::MaxPlayers && !entry.mXUID->empty()) others.push_back(&entry);
+    }
+    std::vector<uint32_t> wanted(others.size(), 0);
+    if (!capeChannel.Lock()) { PublishOriginMarks({}, now); return; }
+    auto& shared = *capeChannel.Data();
+    OriginMarks::Table marks;
+    if (!list.empty() && MyClientCapes::Valid(shared, pid) && MyClientCapes::AnswerFresh(shared.hudAt, now)) {
+        const auto fill = [](OriginMarks::Row& row, std::string_view name, uint32_t tier) {
+            if (!tier || tier > 7 || name.empty() || name.size() >= OriginMarks::NameMax) return false;
+            std::memcpy(row.name, name.data(), name.size());
+            row.tier = static_cast<uint8_t>(tier);
+            return true;
+        };
+        if (!own.empty() && own == shared.ownXuid) fill(marks.self, player.mName.get(), shared.ownTier);
+        if (shared.showMarks) {
+            for (const auto* entry : others) {
+                for (uint32_t i = 0; i < shared.count; ++i) {
+                    if (entry->mXUID.get() != shared.xuids[i]) continue;
+                    if (marks.count < OriginMarks::MaxUsers &&
+                        fill(marks.rows[marks.count], entry->mName.get(), shared.flags[i] & 15)) ++marks.count;
+                    break;
+                }
+            }
+        }
+    }
+    // The HUD's answers belong to the list as it was: read them before the list is written again.
+    // Kept between ticks (review I6): a HUD answer stays good for AnswerKeepMs, so a slow HUD loop does not take every
+    // cape off and put it back again.
+    static std::unordered_map<std::string, uint32_t> answered;
+    static uint64_t answeredAt = 0;
+    if (MyClientCapes::Valid(shared, pid) && MyClientCapes::AnswerFresh(shared.hudAt, now) && shared.hudAt != answeredAt) {
+        answeredAt = shared.hudAt;
+        for (uint32_t i = 0; i < shared.count; ++i) answered[shared.xuids[i]] = shared.capes[i];
+    }
+    if (!MyClientCapes::AnswerFresh(answeredAt, now)) answered.clear();
+    if (own != shared.ownXuid) shared.ownTier = 0;
+    MyClientCapes::CopyXuid(shared.ownXuid, own);
+    uint8_t reorderedFlags[MyClientCapes::MaxPlayers]{};
+    if (MyClientCapes::Valid(shared, pid) && MyClientCapes::AnswerFresh(shared.hudAt, now)) {
+        for (size_t j = 0; j < others.size(); ++j)
+            for (uint32_t i = 0; i < shared.count; ++i)
+                if (others[j]->mXUID.get() == shared.xuids[i]) { reorderedFlags[j] = shared.flags[i]; break; }
+    }
+    std::memcpy(shared.flags, reorderedFlags, sizeof shared.flags);
+    shared.count = static_cast<uint32_t>(others.size());
+    for (size_t i = 0; i < others.size(); ++i) {
+        MyClientCapes::CopyXuid(shared.xuids[i], others[i]->mXUID.get());
+        const auto it = answered.find(shared.xuids[i]);
+        shared.capes[i] = it == answered.end() ? 0 : static_cast<uint8_t>(it->second);
+        wanted[i] = shared.capes[i];
+    }
+    shared.dllAt = now;
+    capeChannel.Unlock();
+    PublishOriginMarks(marks, now);
+    std::vector<uint32_t> applied(others.size(), 0);
+    for (size_t i = 0; i < others.size(); ++i) {
+        const auto it = capesApplied.find(others[i]->mXUID.get());
+        applied[i] = it == capesApplied.end() ? 0 : it->second;
+    }
+    for (size_t i : MyClientCapes::NeedsApply(wanted, applied)) {
+        if (!wanted[i]) { capesApplied.erase(others[i]->mXUID.get()); continue; }   // the server's skin comes back with their next skin change
+        bool ok = false;
+        try { ok = PutCapeOn(level, *others[i], wanted[i]); } catch (...) { ok = false; }
+        capesApplied[others[i]->mXUID.get()] = wanted[i];   // tried once per change, whatever the result
+        MyClientLog::Get().info("Capes: other player's cape {} local handler {} (visual result unconfirmed)",
+                               wanted[i], ok ? "accepted" : "failed (persona, unusual skin, or unavailable resources)");
     }
 }
 
@@ -1435,8 +1902,7 @@ void NoteClosetWorld(Player& player)
     seen = &player;
     closetOriginal.reset();
     closetWorldSince = GetTickCount64();
-    closetLastTry = 0;
-    closetTries = 0;
+    ResetClosetReapply();
     closetSentThisWorld = false;
     closetWaitingForList.store(false);
     std::lock_guard lock(closetWornMutex);
@@ -1452,6 +1918,7 @@ void WearRequestedSkin(ClientInstance& client, Level& level, Player& player)
     const uint32_t serial = request.serial;
     const auto current = player.mSkin ? player.mSkin->mSkinImpl : SkinObject{};
     if (!PrepareClosetRequest(request, current ? &current->mObject : nullptr)) {
+        LogOwnCapeResult(request, false);
         skinRequests.Finish(pid, serial, MyClientSkin::Result::Unsupported);
         return;
     }
@@ -1488,9 +1955,20 @@ void SendWornSkin(ClientInstance& client, Player& player)
         if (auto packet = createPacket(MinecraftPacketIds::PlayerSkin)) skinPacket = std::static_pointer_cast<PlayerSkinPacket>(packet);
         if (!skinPacket) return;
         skinPacket->mUUID = MyClientGame::UuidOf(player);
-        skinPacket->mSkin->mSkinImpl = ref->mSkinImpl;
+        if (MyClientCapes::IsOriginXCape(ref->mSkinImpl->mObject.mCapeId.get())) {
+            // OriginX capes are for OriginX users only (review C1): the server gets the same skin with your own cape.
+            const auto fresh = skinPacket->mSkin->mSkinImpl;
+            if (!fresh || fresh == ref->mSkinImpl || !closetHaveKept) return;
+            static MyClientSkin::Request plain;
+            std::memcpy(&plain, &closetKept, sizeof(plain));
+            plain.capeId = 0;
+            char id[48];
+            FillClosetSkin(fresh->mObject, ref->mSkinImpl->mObject, true, plain, id);
+        }
+        else skinPacket->mSkin->mSkinImpl = ref->mSkinImpl;
         skinPacket->mLocalizedNewSkinName = std::string(closetKept.name);
         skinPacket->mLocalizedOldSkinName = std::string{};
+        if (MyClientCapes::IsOriginXCape(skinPacket->mSkin->mSkinImpl->mObject.mCapeId.get())) return;   // never to the server
         client.getPacketSender().sendToServer(*skinPacket);
         if (mod) MyClientLog::Get().info("Closet: \"{}\" sent to the server for this world.", closetKept.name);
     }
@@ -1521,13 +1999,16 @@ void KeepClosetSkinOn(ClientInstance& client, Level& level, Player& player)
                               updates, dollDirtied.load(), dollOtherContexts.load(), asked, closetDollGiven.load(),
                               closetDollEmpty.load(), closetDollPictured.load());
     }
-    // A new native account update is a new restore request, not one of a previous transaction's failed attempts.
+    // A native notification must not reset the same world's retry interval or attempt limit.
     if (closetReapplyWanted.exchange(false)) {
-        closetTries = 0;
-        closetLastTry = 0;
-        closetSentThisWorld = false;
+        if (!closetMismatchLogged) {
+            closetMismatchLogged = true;
+            const unsigned kind = closetMismatchKind.load(std::memory_order_relaxed);
+            MyClientLog::Get().info("Closet: native skin differs from saved choice (generatedId={} capePresent={} wantedCape={}); bounded reapply queued",
+                                   (kind & 1) != 0, (kind & 2) != 0, closetKept.capeId);
+        }
     }
-    if (!closetHaveKept || closetTries >= 5 || (closetLastTry && now - closetLastTry < 2000)) return;
+    if (!closetHaveKept) return;
     if (!clientPacketHandler.load(std::memory_order_relaxed)) return;   // the world's handler is not known yet
     auto& ref = player.mSkin;
     auto* wearing = ref ? ref->mSkinImpl.get() : nullptr;
@@ -1554,9 +2035,15 @@ void KeepClosetSkinOn(ClientInstance& client, Level& level, Player& player)
         if (!closetSentThisWorld && client.getPacketSender().isInitialized()) SendWornSkin(client, player);
         return;
     }
-    closetTries++;
-    closetLastTry = now;
-    WearSkin(client, level, player, closetKept, closetTries == 1 ? " again in this world" : " again in this world (it was taken off)");
+    if (!closetReapply.CanTry(now)) {
+        if (closetReapply.attempts >= 5 && !closetLimitLogged) {
+            closetLimitLogged = true;
+            MyClientLog::Get().warn("Closet: saved choice reapply stopped after 5 attempts in this world; choose again to retry");
+        }
+        return;
+    }
+    closetReapply.Tried(now);
+    WearSkin(client, level, player, closetKept, closetReapply.attempts == 1 ? " again in this world" : " again in this world (it was taken off)");
 }
 
 void PublishTabList(const MyClientTabList::Shared& snapshot, bool known)
@@ -1895,8 +2382,172 @@ void PublishResources(const MyClientResources::Counts& counts, bool known)
     resourceChannel.Publish(GetCurrentProcessId(), counts, known ? GetTickCount64() : 0);
 }
 
+MyClientMap::Channel mapChannel;
+MyClientMap::Shared mapState{};
+Level* mapLevel = nullptr;
+std::string mapWorldIdentity,mapServerIdentity;
+size_t mapCursor = 0;
+void ClearMap() {
+    mapState = {}; mapLevel = nullptr; mapCursor = 0; mapWorldIdentity.clear();mapServerIdentity.clear();
+    if (mapChannel.Data() && mapChannel.Lock()) {
+        mapChannel.Data()->at = 0; mapChannel.Data()->mobCount = 0;
+        mapChannel.Data()->locality = 0; mapChannel.Data()->realm = 0;
+        mapChannel.Unlock();
+    }
+}
+// The game's save folders (...\games\com.mojang\minecraftWorlds) on this PC.
+std::vector<std::filesystem::path> WorldFolders() {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> roots; std::error_code ec;
+    if (const wchar_t* appData = _wgetenv(L"APPDATA"))
+        for (fs::directory_iterator it(fs::path(appData) / L"Minecraft Bedrock" / L"Users", ec), end; !ec && it != end; it.increment(ec))
+            roots.push_back(it->path() / L"games" / L"com.mojang" / L"minecraftWorlds");
+    if (const wchar_t* local = _wgetenv(L"LOCALAPPDATA"))
+        roots.push_back(fs::path(local) / L"Packages" / L"Microsoft.MinecraftUWP_8wekyb3d8bbwe" / L"LocalState" / L"games" / L"com.mojang" / L"minecraftWorlds");
+    return roots;
+}
+
+// A save folder on this PC for this world: by its id when the game gives one, else by its name (levelname.txt).
+// Only asked when the game says it is not on a server or a Realm, so a server never matches by its name.
+bool LocalWorldOnThisPc(const std::string& id, const std::string& name) {
+    static std::string checkedKey; static bool checked = false;
+    const std::string key = id + "\n" + name;
+    if (key == checkedKey) return checked;
+    namespace fs = std::filesystem;
+    bool byId = false, byName = false; int scanned = 0;
+    for (auto const& root : WorldFolders()) {
+        std::error_code ec;
+        if (MyClientMap::ValidLevelId(id) && fs::exists(root / fs::path(id) / L"level.dat", ec) && !ec) { byId = true; break; }
+        if (name.empty()) continue;
+        for (fs::directory_iterator it(root, ec), end; !ec && it != end && scanned < 500 && !byName; it.increment(ec), ++scanned) {
+            std::ifstream in(it->path() / L"levelname.txt", std::ios::binary);
+            std::string line; if (in && std::getline(in, line)) {
+                while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+                byName = line == name;
+            }
+        }
+    }
+    checkedKey = key; checked = byId || byName;
+    MyClientLog::Get().info("Minimap: own-world check id='{}' byId={} byName={} (scanned {} folders)", id, byId, byName, scanned);
+    return checked;
+}
+
+void SampleMap(ClientInstance& client, Level& level, Player& player) {
+    using namespace MyClientMap;
+    if (!mapChannel.Data() && !mapChannel.Open(GetCurrentProcessId(), true)) return;
+    bool want = false, mobs = false;
+    if (!mapChannel.Lock()) return;
+    auto* shared = mapChannel.Data();
+    if (Valid(*shared, GetCurrentProcessId()) && Fresh(shared->hudAt, GetTickCount64())) {
+        want = shared->wantMap != 0; mobs = shared->wantMobs != 0;
+    }
+    mapChannel.Unlock();
+    if (!want) { ClearMap(); return; }
+    using RegionFn = BlockSource& (Actor::*)() const;
+    static const auto getRegion = MyClientGame::ResolveMember<RegionFn>(MyClientGame::Symbols::DimensionBlockSource);
+    auto* region = getRegion ? &(player.*getRegion)() : client.getRegion();
+    if (!region) { ClearMap(); return; }
+    const auto at = player.getPosition();
+    if (!std::isfinite(at.x) || !std::isfinite(at.z) || !std::isfinite(at.y) ||
+        std::abs(at.x) > 30000000 || std::abs(at.z) > 30000000) { ClearMap(); return; }
+    const int dimension = static_cast<Dimension&>(region->mDimension).mId->mValue;
+    std::string levelId; try { levelId = level.getLevelId(); } catch (...) { levelId.clear(); }
+    const std::string levelName = level.getLevelData().mLevelName.get();
+    const std::string world = MyClientMap::WorldIdentity(levelName, levelId, sizeof(mapState.world));
+    // Recheck eligibility each tick: never carry a previous server's permission through a transition.
+    uint32_t locality = 0; bool realm = false; std::string host;
+    try { locality = MyClientGame::MapConnectionLocality(); } catch (...) { locality = 0; }
+    try { realm = client.isInRealm(); } catch (...) { realm = false; }
+    try { uint32_t port = 0, transport = 0; MyClientGame::CurrentServer(host, port, transport); } catch (...) { host.clear(); }
+    {
+        static std::string lastDecision;
+        const std::string decision = "locality=" + std::to_string(locality) + " host='" + host + "' realm=" + std::to_string(realm) +
+                                     " levelId='" + levelId + "'";
+        if (decision != lastDecision) { lastDecision = decision; MyClientLog::Get().info("Minimap: connection {}", decision); }
+    }
+    // Unknown connection, no server address, the game says it is not on a server or a Realm, and this world's
+    // save folder is on this PC => the player's own world.
+    if (locality == 0 && host.empty() && !realm) {
+        bool inServer = true;
+        try { inServer = client.getMinecraftGame_DEPRECATED().isInServer(); } catch (...) { inServer = true; }
+        static int loggedServer = -1;
+        if (loggedServer != int(inServer)) { loggedServer = int(inServer); MyClientLog::Get().info("Minimap: game says in a server={}", inServer); }
+        if (!inServer && LocalWorldOnThisPc(levelId, levelName)) locality = 1;
+    }
+    if (mapLevel != &level || mapState.dimension != dimension || world != mapWorldIdentity || host != mapServerIdentity) {
+        mapState = {}; mapCursor = 0; mapLevel = &level;mapWorldIdentity=world;mapServerIdentity=host;
+        CopyText(mapState.world, sizeof(mapState.world), world);
+        CopyText(mapState.server, sizeof(mapState.server), host);
+        mapState.originX = int(std::floor(at.x)) - Window/2;
+        mapState.originZ = int(std::floor(at.z)) - Window/2;
+    }
+    int ox = int(std::floor(at.x)) - Window/2, oz = int(std::floor(at.z)) - Window/2;
+    Shift(mapState, ox-mapState.originX, oz-mapState.originZ);
+    mapState.originX=ox; mapState.originZ=oz; mapState.dimension=dimension;
+    mapState.x=at.x;mapState.y=at.y;mapState.z=at.z;mapState.yaw=player.getRotation().y;
+    mapState.locality=locality;mapState.realm=realm?1u:0u;mapState.mobCount=0;
+    const int minHeight=region->getMinHeight();
+    for(int n=0;n<768;++n) {
+        const size_t i=mapCursor++ % (Window*Window);
+        const int x=ox+int(i%Window),z=oz+int(i/Window);
+        int y=region->getAboveTopSolidBlock(x,z,true,true);
+        if(y<=minHeight) {mapState.cells[i]=0;continue;}
+        if(dimension==1) {
+            y=int(std::floor(at.y))-1; bool found=false;
+            for(int down=0;down<64 && y>minHeight;++down,--y) {
+                auto const& b=region->getBlock(BlockPos{x,y,z});
+                if(b.getBlockType().mMapColor->a>0) {found=true;break;}
+            }
+            if(!found){mapState.cells[i]=0;continue;}
+        } else --y;
+        auto const& block=region->getBlock(BlockPos{x,y,z});
+        auto const& color=block.getBlockType().mMapColor.get();
+        auto byte=[](float v){return uint32_t(std::clamp(v,0.f,1.f)*255.f);};
+        uint32_t rgb=(byte(color.r)<<16)|(byte(color.g)<<8)|byte(color.b);
+        if(color.a<=0 || rgb==0) {
+            // Biome-tinted blocks (grass, leaves, water...) keep no fixed map colour; use a fixed one by name.
+            const std::string name=MyClientGame::TypeNameOf(block);
+            rgb=MyClientMap::FallbackColor(name);
+            static std::set<std::string> logged;
+            if(logged.size()<16 && logged.insert(name).second)
+                MyClientLog::Get().info("Minimap: '{}' has no map colour (a={:.2f}); fallback {:06x}", name, color.a, rgb);
+            if(!rgb){mapState.cells[i]=0;continue;}
+        }
+        unsigned depth=0;
+        if(MyClientGame::TypeNameOf(block).find("water")!=std::string::npos) {
+            for(int d=1;d<=16 && y-d>=minHeight;++d) {
+                if(MyClientGame::TypeNameOf(region->getBlock(BlockPos{x,y-d,z})).find("water")==std::string::npos)break;
+                ++depth;
+            }
+        }
+        mapState.cells[i]=Cell(rgb,depth,true);
+        mapState.heights[i]=static_cast<int16_t>(std::clamp(y,-32768,32767));
+    }
+    if(mobs && AutoMobs(locality,realm)) {
+        using TypeFn=ActorType (Actor::*)() const;
+        static const auto getType=MyClientGame::ResolveMember<TypeFn>(MyClientGame::Symbols::EntityTypeId);
+        if(getType) for(auto* other:level.getRuntimeActorList()) {
+            if(!other || other==&player || mapState.mobCount>=MaxMobs)continue;
+            bool isPlayer=MyClientGame::IsPlayer(*other);
+            if(!isPlayer && !other->hasCategory(ActorCategory::Mob))continue;
+            auto p=other->getPosition();float dx=p.x-at.x,dz=p.z-at.z;
+            if(!std::isfinite(dx) || !std::isfinite(dz) || dx*dx+dz*dz>64*64)continue;
+            mapState.mobs[mapState.mobCount++]={p.x,p.z,uint32_t((other->*getType)()),
+                uint8_t(other->hasCategory(ActorCategory::Monster)),uint8_t(isPlayer),0};
+        }
+    }
+    mapState.at=GetTickCount64();
+    if(mapChannel.Lock()) {
+        auto* dest=mapChannel.Data();auto hudAt=dest->hudAt;auto wantMap=dest->wantMap, wantMobs=dest->wantMobs;
+        *dest=mapState;dest->magic=Magic;dest->version=Version;dest->size=sizeof(Shared);dest->pid=GetCurrentProcessId();
+        dest->hudAt=hudAt;dest->wantMap=wantMap;dest->wantMobs=wantMobs;mapChannel.Unlock();
+    }
+}
+
 void PublishEmpty()
 {
+    PublishOriginMarks({}, GetTickCount64());
+    ClearMap();
     PublishResources({}, false);
     PublishShulkers({}, false);
     ClearHover();
@@ -2056,6 +2707,32 @@ void AddStack(MyClientGame::ArrowCounter& counter, MyClientResources::Counter& r
     resources.Add(name, count);
 }
 
+// Hive Statistic: which server and which sidebar this is. Logged once per change, so the real Hive sidebar
+// strings can be collected for the game table. The host is checked at most once a second (it copies the
+// connection info). Returns whether this is The Hive (the HUD shows the stats only there).
+bool LogHiveDetection(const std::string& display, const std::string& name)
+{
+    static std::string lastHost, lastDisplay, lastName;
+    static bool first = true;
+    static uint64_t checkedAt = 0;
+    const uint64_t now = GetTickCount64();
+    std::string host = lastHost;
+    if (first || now - checkedAt >= 1000) { checkedAt = now; host = MyClientGame::ConnectionHost(); }
+    const bool hostChanged = first || host != lastHost;
+    const bool hive = MyClientParty::HiveDomain(host);
+    if (!hostChanged && display == lastDisplay && name == lastName) return hive;
+    first = false;
+    if (hostChanged)
+        MyClientLog::Get().info("Hive判定: {} ({})", hive ? "true" : "false", host.empty() ? "local" : host);
+    const std::string both = display + " " + name;
+    const int game = both.size() > 1 ? HiveStats::DetectGame(both) : -1;
+    // The result only: the scoreboard's own text can hold player names (release-checklist 2026-11-20, item 4).
+    MyClientLog::Get().info("ゲーム判定: {}", game >= 0 ? HiveStats::kGames[game].id : "none");
+    MyClientLog::Get().debug("ゲーム判定の元: scoreboard mDisplayName=\"{}\" mName=\"{}\"", display, name);
+    lastHost = host; lastDisplay = display; lastName = name;
+    return hive;
+}
+
 void Sample(Level& tickedLevel)
 {
     MyClientProfile::Scope prof(MyClientProfile::Tick);
@@ -2085,6 +2762,7 @@ void Sample(Level& tickedLevel)
             MyClientTabList::Collector tab;
             for (auto const& entry : level->getPlayerList())
                 tab.Add(entry.second.mName.get());
+            std::string sidebarDisplay, sidebarName;
             try
             {
                 // Sidebar title / objective name: lets the HUD tell which Hive game this is.
@@ -2096,9 +2774,12 @@ void Sample(Level& tickedLevel)
                 {
                     auto const* objective = display->mObjective;
                     tab.SetTitle(objective->mDisplayName.get() + " " + objective->mName.get());
+                    sidebarDisplay = objective->mDisplayName.get();
+                    sidebarName = objective->mName.get();
                 }
             }
             catch (...) {}
+            tab.SetHive(LogHiveDetection(sidebarDisplay, sidebarName));
             MyClientGame::NoteHitboxActors(nullptr, nullptr, 0);
             if (MyClientGame::HitboxRequested())
             {
@@ -2198,6 +2879,7 @@ void Sample(Level& tickedLevel)
             MyClientCompositor::SetBoxes(tab.Result().boxes, std::min<uint32_t>(tab.Result().boxCount, MyClientTabList::MaxBoxes));
         }
 
+        try { SampleMap(*client, *level, *player); } catch (...) { ClearMap(); }
         MyClientGame::TickParty();
         MyClientGame::TickAutoRq();
         MyClientGame::TickChatHotkeys();
@@ -2210,6 +2892,7 @@ void Sample(Level& tickedLevel)
         KeepClosetSkinOn(*client, *level, *player);
         if (MyClientGame::TakeSkinRefresh()) RefreshOwnSkinLook(*level, *player);
         PublishSkin(*player);
+        try { TickCapes(*level, *player); } catch (...) { PublishOriginMarks({}, GetTickCount64()); }
         Inventory& inventory = *MyClientGame::InventoryOf(*player);   // checked non-null above
         const int slots = inventory.getContainerSize();
         // Bound traversal even if the layout or container is unexpected.
@@ -2334,7 +3017,9 @@ void StartGameDataMirror()
 {
     std::thread([]
     {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
+        // Below normal, not lowest: r57-test56 logs never showed the copy finishing (no HUD icons) while the game used
+        // every core; at the lowest priority it may never get to run before the game is closed.
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         namespace fs = std::filesystem;
         const auto utf8 = [](const std::wstring& w) {
             std::string out;
@@ -2345,52 +3030,139 @@ void StartGameDataMirror()
         wchar_t exe[MAX_PATH * 2] = {};
         const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
         const fs::path root = MyClientGameData::MirrorRoot();
-        if (!n || n >= MAX_PATH * 2 || root.empty()) return;
+        if (!n || n >= MAX_PATH * 2 || root.empty()) {
+            MyClientLog::Get().warn("Game textures for the HUD: no game exe path or LOCALAPPDATA; nothing copied.");
+            return;
+        }
         const fs::path gameDir = fs::path(exe).parent_path();
         WIN32_FILE_ATTRIBUTE_DATA info{};
-        if (!GetFileAttributesExW(exe, GetFileExInfoStandard, &info)) return;
-        const std::string stamp = utf8(gameDir.wstring()) + "|" +
+        if (!GetFileAttributesExW(exe, GetFileExInfoStandard, &info)) {
+            MyClientLog::Get().warn("Game textures for the HUD: the game exe cannot be read (error {}); nothing copied.", GetLastError());
+            return;
+        }
+        const std::string stamp = "v3|" + utf8(gameDir.wstring()) + "|" +
             std::to_string((static_cast<unsigned long long>(info.nFileSizeHigh) << 32) | info.nFileSizeLow) + "|" +
             std::to_string((static_cast<unsigned long long>(info.ftLastWriteTime.dwHighDateTime) << 32) | info.ftLastWriteTime.dwLowDateTime);
-        if (MyClientGameData::ReadStamp(root) == stamp) return;
+        if (MyClientGameData::ReadStamp(root) == stamp && MyClientGameData::HasLooseItemTextures(root.wstring())) {
+            MyClientLog::Get().info("Game textures for the HUD: copy in '{}' is up to date.", utf8(root.wstring()));
+            return;
+        }
         try
         {
             std::error_code ec;
             const fs::path from = gameDir / L"data" / L"resource_packs";
             const fs::path to = root / L"data" / L"resource_packs";
+            MyClientLog::Get().info("Game textures for the HUD: copying from the game folder (runs in the background).");
             fs::remove(root / L"stamp.txt", ec);
+            if (ec) {
+                MyClientLog::Get().warn("Game textures for the HUD: stamp cleanup failed ({}); archives 0 (entries 0, extracted 0, bad 0).", ec.message());
+                return;
+            }
             fs::remove_all(root / L"data", ec);
+            if (ec) {
+                // Keep going: loose files are copied with overwrite_existing, so they still win over old extracted ones,
+                // and stopping here would leave no stamp, which makes the HUD ignore the mirror (TextureFolder).
+                MyClientLog::Get().warn("Game textures for the HUD: old mirror cleanup failed ({}); copying over it.", ec.message());
+                ec.clear();
+            }
             size_t files = 0, failed = 0, packs = 0;
+            size_t archives = 0, entries = 0, extracted = 0, bad = 0;
+            struct ArchiveSource { fs::path file, packTarget; std::string dir; };
+            std::vector<ArchiveSource> pendingArchives;
             unsigned long long bytes = 0;
             for (fs::directory_iterator pack(from, ec), end; !ec && pack != end; pack.increment(ec))
             {
                 std::error_code inner;
-                if (!pack->is_directory(inner)) continue;
+                const bool directory = pack->is_directory(inner);
+                if (inner) { ++failed; continue; }
+                if (!directory) continue;
                 packs++;
                 for (fs::recursive_directory_iterator it(pack->path(), inner), stop; !inner && it != stop; it.increment(inner))
                 {
                     std::error_code fileError;
-                    if (!it->is_regular_file(fileError)) continue;
-                    std::string rel = utf8(fs::relative(it->path(), pack->path(), fileError).generic_wstring());
-                    if (fileError) continue;
+                    const bool regular = it->is_regular_file(fileError);
+                    if (fileError) { ++failed; continue; }
+                    if (!regular) continue;
+                    const fs::path relative = fs::relative(it->path(), pack->path(), fileError);
+                    if (fileError) { ++failed; continue; }
+                    std::string rel = utf8(relative.generic_wstring());
                     std::transform(rel.begin(), rel.end(), rel.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+                    if (MyClientGameData::StartsWith(rel, "__brarchive/") && MyClientGameData::EndsWith(rel, ".brarchive")) {
+                        ++archives;
+                        const auto dir = MyClientGameData::BrArchiveDir(rel);
+                        if (dir.empty()) ++bad;
+                        else pendingArchives.push_back({it->path(), to / pack->path().filename(), dir});
+                        continue;
+                    }
                     if (!MyClientGameData::Wanted(rel)) continue;
-                    const fs::path target = to / pack->path().filename() / fs::relative(it->path(), pack->path(), fileError);
+                    const auto size = it->file_size(fileError);
+                    if (fileError) { ++failed; continue; }
+                    const fs::path target = to / pack->path().filename() / relative;
                     fs::create_directories(target.parent_path(), fileError);
-                    if (fs::copy_file(it->path(), target, fs::copy_options::overwrite_existing, fileError)) { files++; bytes += it->file_size(fileError); }
-                    else failed++;
+                    if (fileError) { ++failed; continue; }
+                    if (fs::copy_file(it->path(), target, fs::copy_options::overwrite_existing, fileError)) { ++files; bytes += size; }
+                    else ++failed;
+                }
+                if (inner) ++failed;
+            }
+            // All loose files are copied first, regardless of directory iteration order.
+            // Parse the entire archive before any writes; keep at most one <=64 MiB payload in memory.
+            for (const auto& archive : pendingArchives) {
+                std::error_code readError;
+                const auto size = fs::file_size(archive.file, readError);
+                if (readError) { ++failed; continue; } // transient I/O must be retried next start
+                if (size > 64ull * 1024 * 1024) { ++bad; continue; }
+                std::ifstream input(archive.file, std::ios::binary);
+                std::vector<uint8_t> data(static_cast<size_t>(size));
+                if (!input || !input.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(data.size()))) {
+                    ++failed; continue;
+                }
+                std::vector<MyClientGameData::BrEntry> contents;
+                size_t dataStart = 0;
+                if (!MyClientGameData::ParseBrArchive(data.data(), data.size(), contents, dataStart)) { ++bad; continue; }
+                entries += contents.size();
+                for (const auto& entry : contents) {
+                    std::string name = entry.name;
+                    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+                    const std::string rel = archive.dir + "/" + name;
+                    if (!MyClientGameData::Wanted(rel)) continue;
+                    const fs::path target = archive.packTarget / fs::path(rel);
+                    std::error_code writeError;
+                    fs::create_directories(target.parent_path(), writeError);
+                    if (writeError) { ++failed; continue; }
+                    // CREATE_NEW enforces loose-file priority, including Windows case-insensitive aliases.
+                    HANDLE output = CreateFileW(target.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+                    if (output == INVALID_HANDLE_VALUE) {
+                        const auto error = GetLastError();
+                        if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) ++failed;
+                        continue;
+                    }
+                    DWORD written = 0;
+                    const bool ok = WriteFile(output, data.data() + dataStart + entry.offset, entry.size, &written, nullptr) && written == entry.size;
+                    CloseHandle(output);
+                    if (ok) { ++files; ++extracted; bytes += entry.size; }
+                    else { ++failed; fs::remove(target, writeError); } // never leave a truncated extracted image
                 }
             }
             if (ec || !files)
             {
-                MyClientLog::Get().warn("Game textures for the HUD: nothing copied from '{}' ({}).", utf8(from.wstring()), ec ? ec.message() : "no files");
+                MyClientLog::Get().warn("Game textures for the HUD: nothing copied from '{}' ({}); archives {} (entries {}, extracted {}, bad {}).",
+                                      utf8(from.wstring()), ec ? ec.message() : "no files", archives, entries, extracted, bad);
                 return;
             }
-            std::ofstream out(root / L"stamp.txt", std::ios::binary);
-            out << stamp;
-            out.close();
-            MyClientLog::Get().info("Game textures for the HUD: copied {} files ({} KB, {} failed) of {} packs to '{}'.",
-                                  files, bytes / 1024, failed, packs, utf8(root.wstring()));
+            // The HUD uses the mirror only while stamp.txt is not empty (TextureFolder), so a copy with some
+            // failures still gets a stamp. "|partial" makes it differ from the expected stamp, so the next start
+            // retries the copy, while the HUD keeps the icons that were copied.
+            const bool partial = failed != 0;
+            {
+                std::ofstream out(root / L"stamp.txt", std::ios::binary);
+                out << stamp << (partial ? "|partial" : "");
+                out.close();
+                if (!out) ++failed;
+            }
+            MyClientLog::Get().info("Game textures for the HUD: copied {} files ({} KB, {} failed) of {} packs to '{}'; archives {} (entries {}, extracted {}, bad {}).{}",
+                                  files, bytes / 1024, failed, packs, utf8(root.wstring()), archives, entries, extracted, bad,
+                                  failed ? " Incomplete copy; retried on next start." : "");
         }
         catch (const std::exception& e)
         {
@@ -2445,7 +3217,17 @@ bool MyClientStart::Load()
         MyClientSigs::ShowNotStarted(verdict.version, verdict.why);
         return false;
     }
+    MyClientLog::Get().info("Crash diagnostics: unhandled-exception minidump installed={} (local logs folder; best effort)", MyClientCrash::Install());
+    MyClientLog::Get().info("Crash diagnostics: reload AV observer installed={} (first chance only; four candidate slots plus one unhandled slot)", MyClientCrash::vectoredHandler != nullptr);
     loaded.store(true);
+    // A start-up that stops before OriginX is enabled writes every thread's call stack to logs/startup.log (HangWatch.h).
+    // Standalone: the enable step waits for the game window, up to 120 s after load (Standalone.cpp), so a slow
+    // first start is not a hang there before 150 s.
+#if MYCLIENT_STANDALONE
+    MyClientDiag::StartHangWatch(enableFinished, 150);
+#else
+    MyClientDiag::StartHangWatch(enableFinished);
+#endif
     // Before any of MyClient's hooks patch them: the first bytes of every game function MyClient uses.
     MyClientGame::SnapshotSignatures(MYCLIENT_GAME_VERSION);
     // The game's code as it sits in memory, once per game build, for finding functions without LeviLamina (GameImageDump.cpp).
@@ -2464,6 +3246,7 @@ bool MyClientStart::Load()
 bool MyClientStart::Enable()
 {
     if (enabled.load()) return true;
+    struct Finished { ~Finished() { enableFinished.store(true); } } finished;   // every return below counts
     // Before any hook: LeviLamina's stubs still lead to the game here (SignatureDump.cpp).
     MyClientGame::ResolveSignaturesBeforeHooks();
     // Real addresses of the functions only called (not hooked), for running without LeviLamina (SignatureDump.cpp).
@@ -2531,12 +3314,23 @@ bool MyClientStart::Enable()
                             *MyClientHook::LastError() ? "; last refusal " : "", MyClientHook::LastError(),
                             std::filesystem::path(MyClientLog::FilePath()).string());
 #endif
+#if MYCLIENT_OWN_HOOKS
+    if (const std::string off = MyClientHook::DisabledReport(); !off.empty())
+        MyClientLog::Get().warn("Hooks left out by disabled-hooks.txt (diagnostics; their features stay off): {}", off);
+#endif
     std::thread([] {
         std::this_thread::sleep_for(std::chrono::seconds(60));
         try { if (loaded.load()) MyClientLog::Get().info("Game functions by address (60 s): {}", MyClientGame::RvaReport()); } catch (...) {}
 #if MYCLIENT_OWN_HOOKS
         try { MyClientLog::Get().info("Own hooks (60 s): {} put in{}{}", MyClientHook::Installed(),
                                       *MyClientHook::LastError() ? "; last refusal " : "", MyClientHook::LastError()); } catch (...) {}
+        // The busiest hooks, every 30 s from now on (the FPS regression of 2026-11: which hook runs how often).
+        (void)MyClientHook::CallReport(1.0);   // start counting from here
+        for (;;)
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            try { MyClientLog::Get().info("Hook calls per second (30 s): {}", MyClientHook::CallReport(30.0)); } catch (...) {}
+        }
 #endif
     }).detach();
     // Bytes at each game function MyClient uses, for signatures that work without LeviLamina (SignatureDump.cpp).

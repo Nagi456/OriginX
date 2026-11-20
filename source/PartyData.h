@@ -51,12 +51,33 @@ inline bool Registered(const Config& c, std::string_view tag, uint64_t now) {
     for (uint32_t i = 0; i < c.count; ++i) if (Lower(c.tags[i]) == Lower(tag)) return true;
     return false;
 }
-inline bool HiveHost(std::string_view host) {
+// The bare, lower-case host name. Featured servers report a URL instead of a name (2026-11-19, Hive from the
+// featured list: "https://nethernet.playhive.com:19132"), so a scheme, a path and a trailing ":port" are dropped.
+inline std::string HostName(std::string_view host) {
+    if (const auto scheme = host.find("://"); scheme != host.npos) host.remove_prefix(scheme + 3);
+    if (const auto slash = host.find('/'); slash != host.npos) host = host.substr(0, slash);
+    if (const auto colon = host.rfind(':'); colon != host.npos && host.find(':') == colon && colon + 1 < host.size() &&
+        host.find_first_not_of("0123456789", colon + 1) == host.npos) host = host.substr(0, colon);
     auto h = Lower(host);
     if (!h.empty() && h.back() == '.') h.pop_back();
+    return h;
+}
+inline bool DomainOrSub(std::string_view h, std::string_view base) {
+    return h == base || (h.size() > base.size() + 1 && h[h.size() - base.size() - 1] == '.' &&
+        h.compare(h.size() - base.size(), base.size(), base) == 0);
+}
+// hivebedrock.network or playhive.com, or any subdomain of them (Hive Statistic).
+inline bool HiveDomain(std::string_view host) {
+    const auto h = HostName(host);
+    return DomainOrSub(h, "hivebedrock.network") || DomainOrSub(h, "playhive.com");
+}
+// The exact Hive server names party acceptance trusts. nethernet.playhive.com is the featured-list entry.
+inline bool HiveHost(std::string_view host) {
+    const auto h = HostName(host);
     return h == "geo.hivebedrock.network" || h == "hivebedrock.network" ||
         h == "as.hivebedrock.network" || h == "eu.hivebedrock.network" || h == "sg.hivebedrock.network" ||
-        h == "ca.hivebedrock.network" || h == "us.hivebedrock.network" || h == "na.hivebedrock.network";
+        h == "ca.hivebedrock.network" || h == "us.hivebedrock.network" || h == "na.hivebedrock.network" ||
+        h == "nethernet.playhive.com";
 }
 inline std::string Clean(std::string_view input) {
     if (input.size() > 1024) return {};

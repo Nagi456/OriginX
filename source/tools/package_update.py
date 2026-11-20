@@ -56,6 +56,31 @@ def _import_names_have_loader(data):
     return False
 
 
+SUPPORTED = 'mods/MyClientData/supported.json'
+
+
+def supported_images(version, sigs_path=None):
+    """mods/MyClientData/supported.json: the game images (from tools/sigs.json "supported") the DLL of this game
+    version was made for. The launcher reads the running game's TimeDateStamp, SizeOfImage and file version and
+    does not inject when they do not match a row (launcher/GameImageCheck.h)."""
+    sigs = json.loads(Path(sigs_path or ROOT / 'tools/sigs.json').read_text(encoding='utf-8'))
+    rows = []
+    for row in sigs['supported']:
+        parts = row['version'].split('.')
+        if parts[0] == '1':
+            parts = parts[1:]
+        if '.'.join(parts) != version:
+            continue
+        sizes = []
+        for key in ('imageSize', 'imageSizeEdited'):
+            if row.get(key) and row[key] not in sizes:
+                sizes.append(row[key])
+        rows.append({'fileVersion': row['version'], 'timestamp': row['timestamp'], 'imageSizes': sizes})
+    if not rows:
+        raise ValueError(f'tools/sigs.json has no supported image for {version}')
+    return {'schemaVersion': 1, 'gameVersion': version, 'images': rows}
+
+
 def package(sdk: Path, output: Path, revision=1, sequence=1, catalog_path=None, package_dir=None, version="26.51.1",
             hud=None, base_url=BASE_URL, channel="stable", test_number=None, standalone=False):
     """channel="stable" (default) prepares a public release. channel="test" prepares a build for the moderators'
@@ -101,9 +126,13 @@ def package(sdk: Path, output: Path, revision=1, sequence=1, catalog_path=None, 
         files.pop('runtime.lock.json', None)   # no loader is installed: nothing to lock
     if hud:
         files[HUD] = Path(hud)
+    if SUPPORTED not in files:
+        generated = output / f'.supported-{version}.json'
+        generated.write_text(json.dumps(supported_images(version), indent=2) + '\n', encoding='utf-8', newline='\n')
+        files[SUPPORTED] = generated
     for name in files:
         allowed = name in {'runtime.lock.json', 'mods/MyClientData/MyClientData.dll',
-                           'mods/MyClientData/manifest.json', 'mods/MyClientData/THIRD_PARTY_NOTICES.md', HUD}
+                           'mods/MyClientData/manifest.json', 'mods/MyClientData/THIRD_PARTY_NOTICES.md', HUD, SUPPORTED}
         if not allowed and not re.fullmatch(r'mods/MyClientData/licenses/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+(\.(txt|md|MIT|LESSER|spdx))?', name):
             raise ValueError(f'Unexpected package file: {name}')
     major, minor, patch = map(int, version.split('.'))

@@ -17,12 +17,12 @@
 
 namespace GameSigs {
 
-struct Build { int index; const char* version; uint32_t timestamp, imageSize; };
+struct Build { int index; const char* version; uint32_t timestamp, imageSize, imageSizeEdited; };   // see GameRva.h Exe
 struct Sig { int index; const char* name; bool fatal; const char* purpose; const char* breaks; const char* lastUpdated; };
 struct At { int sig, build; uint32_t rva; const char* pattern; };
 struct Offset { const char* name; int build; uint32_t value; };
 
-#define MYCLIENT_SIG_BUILD(index, version, timestamp, size) {index, version, timestamp, size},
+#define MYCLIENT_SIG_BUILD(index, version, timestamp, size, edited) {index, version, timestamp, size, edited},
 #define MYCLIENT_SIG(index, name, fatal, purpose, breaks, last)
 #define MYCLIENT_SIG_AT(sig, build, rva, pattern)
 #define MYCLIENT_SIG_OFFSET(name, build, value)
@@ -31,7 +31,7 @@ inline constexpr Build kBuilds[] = {
 };
 #undef MYCLIENT_SIG_BUILD
 #undef MYCLIENT_SIG
-#define MYCLIENT_SIG_BUILD(index, version, timestamp, size)
+#define MYCLIENT_SIG_BUILD(index, version, timestamp, size, edited)
 #define MYCLIENT_SIG(index, name, fatal, purpose, breaks, last) {index, name, fatal, purpose, breaks, last},
 inline constexpr Sig kSigs[] = {
 #include "GameSigs.inc"
@@ -63,8 +63,19 @@ inline constexpr size_t kOffsetCount = sizeof(kOffsets) / sizeof(kOffsets[0]);
 inline int FindBuild(uint32_t timestamp, uint32_t imageSize)
 {
     for (const Build& b : kBuilds)
-        if (b.timestamp == timestamp && b.imageSize == imageSize) return b.index;
+        if (b.timestamp == timestamp && (b.imageSize == imageSize || b.imageSizeEdited == imageSize)) return b.index;
     return -1;
+}
+
+// The DLL built for `dllFor` ("1.26.51", its SDK's class layouts) fits this build version ("1.26.51.1"): the same
+// numbers up to a dot, so every 1.26.51.x but never 1.26.510.x.
+inline bool SameGameVersion(const char* build, const char* dllFor)
+{
+    if (!build || !dllFor || !*dllFor) return false;
+    size_t i = 0;
+    for (; dllFor[i]; ++i)
+        if (build[i] != dllFor[i]) return false;
+    return build[i] == '.' || build[i] == '\0';
 }
 
 inline const At* AtFor(int sig, int build)

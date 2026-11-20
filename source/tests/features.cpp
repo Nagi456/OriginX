@@ -6,6 +6,24 @@
 #include <limits>
 using namespace MyClientFeatures;
 int main() {
+    static_assert(Version == 17 && sizeof(Shared) == 1608);
+    static_assert(offsetof(Shared,combo)==1592 && offsetof(Shared,comboAt)==1600);
+    Shared comboTest{}; comboTest.combo=3; comboTest.comboFlags=1; comboTest.comboAt=123;
+    Shared comboCopy=comboTest;
+    assert(comboCopy.combo==3 && comboCopy.comboFlags==1 && comboCopy.comboAt==123);
+
+    assert(MyClientFeatures::JavaChatJsonSupportOf(MyClientFeatures::FlagJavaChatChecked | MyClientFeatures::FlagJavaChatAvailable, true) == 0); // native-only old DLL
+    assert(MyClientFeatures::JavaChatJsonSupportOf(MyClientFeatures::FlagJavaChatChecked | MyClientFeatures::FlagJavaChatAvailable | MyClientFeatures::FlagJavaChatJson, true) == 1);
+    assert(MyClientFeatures::JavaChatJsonSupportOf(MyClientFeatures::FlagJavaChatChecked | MyClientFeatures::FlagJavaChatJson, true) == 0);
+    assert(MyClientFeatures::JavaChatJsonSupportOf(0, true) == -1);
+    assert(MyClientFeatures::JavaChatJsonSupportOf(MyClientFeatures::FlagJavaChatChecked | MyClientFeatures::FlagJavaChatAvailable | MyClientFeatures::FlagJavaChatJson, false) == -1);
+
+    assert(MyClientFeatures::JavaChatAvailabilityOf(0, true) == -1); // old DLL / not checked
+    assert(MyClientFeatures::JavaChatAvailabilityOf(MyClientFeatures::FlagJavaChatChecked, true) == 0);
+    assert(MyClientFeatures::JavaChatAvailabilityOf(MyClientFeatures::FlagJavaChatAvailable, true) == -1);
+    assert(MyClientFeatures::JavaChatAvailabilityOf(MyClientFeatures::FlagJavaChatChecked | MyClientFeatures::FlagJavaChatAvailable, true) == 1);
+    assert(MyClientFeatures::JavaChatAvailabilityOf(MyClientFeatures::FlagJavaChatChecked | MyClientFeatures::FlagJavaChatAvailable, false) == -1);
+
     {
         using namespace MyClientJavaChat;
         assert(MyClientJavaChat::Fresh(1000, 1499) && !MyClientJavaChat::Fresh(1000, 1500) && !MyClientJavaChat::Fresh(1000, 999));
@@ -66,6 +84,10 @@ int main() {
     assert(RenderChunksOf(EncodeAutoRqField(1, 0, 9)) == 0 && RenderChunksOf(EncodeAutoRqField(1, 2, 9)) == 4);
     assert(RenderChunksOf(EncodeAutoRqField(1, 200, 9)) == 48 && EncodeAutoRqField(3, 0, 0) == 3u);
     assert(RenderDistanceOption(12) == "gfx_viewdistance:192");
+    // FPS limit bits 22..24 do not touch the Optimization extras (bits 10..21).
+    assert(FpsLimitCodeOf(EncodeFpsLimit(6) | EncodeOptimizeExtras({8, 128, true, true, true})) == 6);
+    assert((EncodeFpsLimit(6) & EncodeOptimizeExtras({8, 128, true, true, true})) == 0);
+    assert(FpsLimitOf(6, 144) == 144 && FpsLimitOf(3, 0) == 144 && FpsLimitOf(0, 144) == 0 && FpsLimitOf(1, 0) == 60);
     assert(ZoomFov(90, true, 6.f) < ZoomFov(90, true, 3.f));
     assert(ZoomFov(0, true) == 0 && ZoomFov(200, true) == 200);
     assert(std::isnan(ZoomFov(std::numeric_limits<float>::quiet_NaN(), true)));

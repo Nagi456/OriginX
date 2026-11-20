@@ -17,7 +17,7 @@
 
 namespace {
 MyClientJavaChat::Channel chat;
-std::atomic<bool> active{false};
+std::atomic<bool> active{false}, jsonHidden{false};
 bool hooked = false;
 using Dirty = void (*)(UIControl*);
 Dirty markDirty = nullptr;
@@ -107,7 +107,7 @@ void Publish(ClientInstance& client, bool ready) {
             for (size_t i = end; i > begin && lines.size() < MyClientJavaChat::MaxLines;) {
                 --i;
                 const auto& message = messages[i];
-                if (message.mDuration <= 0 || (!message.mHasBeenSeen && !message.mHasEverBeenSeen)) continue;
+                if (message.mDuration <= 0) continue; // JSON-hidden controls may never mark native messages as seen
                 // Use the native post-filter, localized full message, never raw TextPacket data.
                 const auto& filtered = message.mFilteredFullString.get();
                 const auto& text = filtered ? *filtered : message.mFullString.get();
@@ -143,15 +143,22 @@ MYCLIENT_TYPE_INSTANCE_HOOK(JavaChatRenderHook, ll::memory::HookPriority::Normal
 
 namespace MyClientJavaChat {
 bool Enable() {
-    (void)JavaChatRenderHook::_AutoHookCount;
-    markDirty = reinterpret_cast<Dirty>(MyClientGame::ResolveFirst({"?_setPositionDirty@UIControl@@QEAAXXZ",
-        "?_setPositionDirty@UIControl@@AEAAXXZ", "?_setPositionDirty@UIControl@@IEAAXXZ"}));
-    if (!markDirty) { MyClientLog::Get().warn("JAVA Chat: native UI invalidation is unavailable; keeping default chat."); return false; }
+    // JSON profile owns native visibility. Do not install ScreenView::render or resolve markDirty.
     if (!chat.IsOpen() && !chat.Open(GetCurrentProcessId(), true)) return false;
-    if (!hooked) hooked = MyClientGame::Target(RenderSymbol) && JavaChatRenderHook::hook() == 0;
-    active.store(hooked);
-    if (!hooked) MyClientLog::Get().warn("JAVA Chat: ScreenView renderer unavailable; keeping default chat.");
-    return hooked;
+    jsonHidden.store(false);
+    active.store(true);
+    MyClientLog::Get().info("JAVA Chat: JSON profile mode enabled; waiting for resource reload completion");
+    return true;
+}
+void JsonProfileApplied(bool hidden) {
+    jsonHidden.store(hidden);
+    MyClientLog::Get().info("JAVA Chat: resource reload completed; applied JSON hidden={}", hidden);
+}
+void Tick(ClientInstance& client) {
+    if (!active.load()) return;
+    const bool ready = jsonHidden.load() && chat.ConsumerAlive(GetCurrentProcessId()) && client.getLocalPlayer() &&
+        client.getTopScreenName() == "hud_screen";
+    try { Publish(client, ready); } catch (...) { try { Publish(client, false); } catch (...) {} }
 }
 void Disable() {
     // The still-installed native hook restores on its next UI render. Do not touch UI controls

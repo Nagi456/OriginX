@@ -16,6 +16,7 @@
 #include "mc/client/game/ClientInstance.h"
 #include "mc/client/network/ClientNetworkHandler.h"
 #include "mc/network/GameConnectionInfo.h"
+#include "MapChannel.h"
 #include "mc/network/MinecraftPackets.h"
 #include "mc/network/PacketSender.h"
 #include "mc/network/packet/TextPacket.h"
@@ -63,9 +64,9 @@ std::string Hive(IClientInstance& client) {
     const auto& connection = snapshot.Get();
     if (!connection) return {};
     const auto& host = connection->mUnresolvedUrl.get();
-    if (MyClientParty::HiveHost(host)) return MyClientParty::Lower(host);
+    if (MyClientParty::HiveHost(host)) return MyClientParty::HostName(host);
     const auto& ip = connection->mHostIpAddress.get();
-    return MyClientParty::HiveHost(ip) ? MyClientParty::Lower(ip) : std::string{};
+    return MyClientParty::HiveHost(ip) ? MyClientParty::HostName(ip) : std::string{};
 }
 MyClientParty::Config ReadConfig() {
     MyClientParty::Config config{};
@@ -148,17 +149,34 @@ void Receive(IClientInstance& client, TextPacket const& packet) {
         NoteSkipped(type, packet.mLocalize, authored, body->mMessage.get());
         return;
     }
+    // r57-test38: an invite arrived (chat line, HiveUtils on, inviter registered) and nothing happened, with no
+    // log line at all: every early return below was silent. Each now says why, once per 30 s, for party lines.
+    const auto partyLine = [&] {
+        const auto l = MyClientParty::Lower(MyClientParty::Clean(body->mMessage.get()));
+        return l.find("party") != std::string::npos;
+    };
+    const auto why = [&](const char* reason) {
+        static ULONGLONG at = 0;
+        const auto t = GetTickCount64();
+        if (partyLine() && (!at || t - at >= 30000)) { at = t; MyClientLog::Get().info("Hive party: a party line was not acted on ({})", reason); }
+    };
     auto host = Hive(client);
-    if (host.empty()) return;
+    if (host.empty()) { why("the server was not recognised as Hive"); return; }
     auto tag = MyClientParty::Invite(body->mMessage.get(), type, false, false);
     std::lock_guard guard(mutex);
     if (!active.load()) return;
     const auto now = GetTickCount64();
     const auto config = ReadConfig();
-    if (!MyClientParty::Active(config, now)) return;
+    if (!MyClientParty::Active(config, now)) {
+        why(!MyClientParty::Fresh(config.at, now) ? "no fresh settings from the HUD" : config.enabled != 1 ? "auto join is off in the settings"
+            : !config.count ? "no players registered" : "a registered name is not valid");
+        return;
+    }
     if (!tag.empty()) {
-        if (MyClientParty::Registered(config, tag, now))
+        if (MyClientParty::Registered(config, tag, now)) {
+            MyClientLog::Get().info("Hive party: invite from a registered player; joining");
             pending = Pending{std::move(tag), std::move(host), &client, now};
+        } else why("the inviter is not in the registered list (names are compared as Hive shows them)");
         return;
     }
     const auto clean = MyClientParty::Clean(body->mMessage.get());
@@ -193,6 +211,33 @@ uint32_t TransportOf(const Info& info)
         return static_cast<uint32_t>(info.mTransportType);
     else
         return 0u;
+}
+
+bool CanReadConnection() { return destroyConnection != nullptr; }
+uint32_t MapConnectionLocality() {
+    if (!destroyConnection) return 0;
+    auto client = MyClientGame::Client();
+    if (!client) return 0;
+    ConnectionSnapshot snapshot(*client);
+    auto const& connection = snapshot.Get();
+    if (!connection) return 0; // Absence is not proof of a local world.
+    auto const type = static_cast<Social::ConnectionType>(connection->mType);
+    std::string host = connection->mHostIpAddress.get();
+    if (host.empty()) host = connection->mUnresolvedUrl.get();
+    return MyClientMap::ConnectionLocality(true,true,static_cast<int>(type),host);
+}
+
+std::string ConnectionHost()
+{
+    if (!destroyConnection) return {};
+    const auto client = MyClientGame::Client();
+    if (!client) return {};
+    ConnectionSnapshot snapshot(*client);
+    const auto& connection = snapshot.Get();
+    if (!connection) return {};
+    std::string host = connection->mUnresolvedUrl.get();
+    if (host.empty()) host = connection->mHostIpAddress.get();
+    return host;
 }
 
 bool CurrentServer(std::string& host, uint32_t& port, uint32_t& transport)

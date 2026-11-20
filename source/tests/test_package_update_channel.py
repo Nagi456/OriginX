@@ -30,6 +30,8 @@ class ChannelPackageTest(unittest.TestCase):
         self.stable_list = self.root / "launcher/catalog.json"
         self.stable_list.write_text("stable list, must stay as it is")
         package_update.ROOT = self.root  # keep the repository's catalog out of the test
+        (self.root / "tools").mkdir()
+        (self.root / "tools/sigs.json").write_text((ROOT / "tools/sigs.json").read_text(encoding="utf-8"), encoding="utf-8")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -53,6 +55,19 @@ class ChannelPackageTest(unittest.TestCase):
         entry = json.loads((out / tag / "entry.json").read_text())
         self.assertEqual(entry, catalog["versions"][0])
         self.assertEqual(self.stable_list.read_text(), "stable list, must stay as it is")
+
+    def test_the_package_carries_the_supported_images_of_its_game_version(self):
+        out = self.build("s")
+        tag = "myclient-26.51.1-r54-test1"
+        entry = json.loads((out / tag / "entry.json").read_text())
+        self.assertIn("mods/MyClientData/supported.json", entry["files"])
+        table = json.loads((out / tag / "mods__MyClientData__supported.json").read_text())
+        self.assertEqual(table, {"schemaVersion": 1, "gameVersion": "26.51.1", "images": [
+            {"fileVersion": "1.26.51.1", "timestamp": "0x6AA482FD", "imageSizes": ["0x12C01000", "0x12C0C000"]}]})
+        # 26.45.1: both sizes are the same, listed once
+        self.assertEqual(package_update.supported_images("26.45.1", self.root / "tools/sigs.json")["images"][0]["imageSizes"], ["0x12888000"])
+        with self.assertRaises(ValueError):
+            package_update.supported_images("26.99.1", self.root / "tools/sigs.json")
 
     def test_a_test_build_needs_a_test_number(self):
         for number in (None, 0, -1):
@@ -93,6 +108,8 @@ class StandalonePackageTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         (self.root / "launcher").mkdir()
         package_update.ROOT = self.root
+        (self.root / "tools").mkdir()
+        (self.root / "tools/sigs.json").write_text((ROOT / "tools/sigs.json").read_text(encoding="utf-8"), encoding="utf-8")
 
     def tearDown(self):
         self.tmp.cleanup()

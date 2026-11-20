@@ -1,12 +1,22 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include "CapeVisibility.h"
+#include "ConfigText.h"
 #include <atomic>
+#include <condition_variable>
 #include <windows.h>
+#include "LangWin.h"
+#include "LogPrivacy.h"
+#include <tlhelp32.h>
+#include <windowsx.h>
 #include <shellapi.h>
+#include <shlobj.h>
+#include <knownfolders.h>
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <tuple>
 #include <cmath>
 #include <cstring>
@@ -20,6 +30,8 @@
 #include "SkinChannel.h"
 #include "SkinLibrary.h"
 #include "CapeLibrary.h"
+#include "CapeClient.h"
+#include "CapeChannel.h"
 #include "SkinModel.h"
 #include "MinecraftDataProvider.h"
 #include "AutoRq.h"
@@ -28,6 +40,8 @@
 #include "Presets.h"
 #include "ReplayLibrary.h"
 #include "ReplayPlayer.h"
+#include "ReplayCamera.h"
+#include "ReplayExport.h"
 #include "OverlayAlpha.h"
 #include "HudFrameChannel.h"
 #include "PingMonitor.h"
@@ -40,6 +54,13 @@
 #include "HiveStats.h"
 #include "ToggleSound.h"
 #include "LitePack.h"
+#include "HomeBrandPack.h"
+#include "JavaChatPack.h"
+#include "MarksPack.h"
+#include "HomeReplayInput.h"
+#include <cstdarg>
+#include "TextureReloadPolicy.h"
+#include "ClosetLayout.h"
 #include "TexturePacks.h"
 #include "PackInstall.h"
 
@@ -81,6 +102,8 @@
 // myclient_config.txt (next to MyClient.exe) and restored on every start.
 bool keystrokesEnabled = false;
 bool cpsEnabled = false;
+bool comboEnabled = false;
+bool comboHideZero = false;
 bool armorHudEnabled = false;
 bool resourceBackground = false;   // Resource Counter: a dark box behind each row
 bool arrowBackground = false;      // Arrow Counter: a dark box behind the row
@@ -121,7 +144,7 @@ bool hiveStatsEnabled = false;
 bool hiveStatsAuto = true;     // pick the game from the scoreboard title
 std::string hiveDetectedTitle;
 int hiveDetectedGame = -1;
-int hiveStatsGame = 0;        // index into HiveStats::kGames
+int hiveStatsGame = HiveStats::kAllGames;   // index into HiveStats::kGames, kAllGames or kHidden; used when the game is unknown
 // Hive Utils groups Party Auto Accept and Auto RQ. hiveEnabled is the group's master switch;
 // the two sub-features keep their own flags (partyAutoAcceptEnabled / autoRqEnabled).
 bool hiveEnabled = true;
@@ -136,12 +159,19 @@ std::vector<Presets::Preset> presets;
 bool presetsLoaded = false;
 bool presetEditing = false;      // typing in the preset name box
 bool applyingPreset = false;     // ToggleFeature stays quiet (no toast / sound per module) while a preset is applied
+bool deferLiteApply = false;     // a shared config is being applied: ToggleFeature marks liteApplyPending instead of ApplyLite()
+bool liteApplyPending = false;   // ...and the apply calls ApplyLite() once at the end
+int liteApplyCount = 0;          // ApplyLite() calls so far (the Share page shows how many one apply made)
 std::wstring presetNameText;
 std::wstring presetStatus;
 // Fast Inventory: inventory / container screens open with a 0.1 s transition (same generated pack)
 bool fastInventoryEnabled = false;
 // Left Hand: your first-person arm and item on the left (mirrored animations in the same pack)
 bool leftHandEnabled = false;
+bool minimapEnabled=false, minimapRotate=false, minimapCoordinates=true, minimapMobs=true, minimapBorder=true;
+int minimapSize=1, minimapZoom=1, minimapBorderIndex=0;
+bool minimapWorldMobs=true;
+const COLORREF kMinimapBorders[]={RGB(240,60,65),RGB(255,180,60),RGB(80,180,255),RGB(255,255,255)};
 bool hitEffectEnabled = false;      // Hit Effect: Java-style crit particles on every hit
 bool hitEffectCrit = true;          // ...white crit sparks on every hit
 bool hitEffectMagic = true;         // ...blue sparks with an enchanted weapon
@@ -173,6 +203,10 @@ bool timerFlash = true;             // ...when the countdown runs out: the time 
 bool timerSound = true;             // ...and three beeps play
 int timerStartKey = 0;              // ...keys while playing: start / pause, reset (0 = none)
 int timerResetKey = 0;
+// Replay playback keys (settings: Replay Mod > Keys): pause, add a camera point (free camera), take back the last one.
+int replayPauseKey = 'K';
+int replayPointKey = 'P';
+int replayUndoKey = 'O';
 ClientTimer::Clock timerClock;
 ULONGLONG timerDoneAt = 0;          // the countdown ran out at (0 = it has not)
 bool cpsLimiterEnabled = false;     // CPS Limiter: presses over the limit never reach the game
@@ -229,6 +263,9 @@ int liteBlockEntityDistance = 32;  // 8..128 blocks, steps of 8
 int liteVerticalRows = 4;          // sub-chunk rows (16 blocks) kept above and below the camera, 1..8
 // Optimization > System: done by the HUD on the game's process (Windows calls), undone when switched off.
 bool liteHighPriority = false, liteNoThrottle = false, liteGpuPriority = false;
+// FPS limit (r57-test42, stutter): on by default at the display's rate. Code 1..6 = 60/120/144/165/240/display.
+bool liteFpsLimit = true;
+int liteFpsLimitCode = 6;
 int liteSliderDrag = -1;           // the Optimization page's slider being dragged (LiteRowKind::...), -1 = none
 int liteScrollRow = 0;             // first row shown on the Optimization page
 // Render Distance (Optimization): sets Minecraft's own view distance from here (in chunks).
@@ -236,7 +273,7 @@ bool liteRenderEnabled = false;
 int liteRenderDistance = 12;
 uint32_t renderRequestCounter = 0;   // bumped when a new distance should be applied in the game
 std::wstring liteStatus;
-void ApplyLite();
+bool ApplyLite();
 void RequestRenderDistance();
 void RefreshTextures();
 // Auto RQ: queue the next Hive game when you die or the game ends. mode = index into MyClientAutoRq::kModes
@@ -275,8 +312,136 @@ std::atomic<int> zoomFactorX100{300};
 std::atomic<bool> zoomFactorDirty{false};
 HHOOK wheelHook = nullptr;
 
+// The world map (M) zooms with the wheel: the same hook, installed while the map is open, hands the wheel to it.
+std::atomic<bool> worldMapWheel{false};
+std::atomic<int> worldMapWheelDelta{0};
+
+// Windows hook events retain short clicks that can fall between two 16ms polling samples.
+bool homeReplayHookWanted = false;
+HomeReplayInput homeReplayInput;
+RECT homeReplayScreenRect{};
+extern HWND overlayWindow;
+// The HUD is not DPI aware: at a display scale other than 100% Windows draws the overlay scaled, while the cursor
+// (GetPhysicalCursorPos, the low-level hook's pt) is in physical pixels. r57-test53 at 125%: every press landed
+// ~1.25x below the Replays button's rectangle. Map a physical screen point into overlay client (logical) pixels.
+bool OverlayClientFromPhysical(POINT physical, POINT& client, double* scale = nullptr)
+{
+    RECT wr{};
+    if (!overlayWindow || !GetWindowRect(overlayWindow, &wr) || wr.right <= wr.left || wr.bottom <= wr.top) return false;
+    // Windows' own conversion first (2026-11-19, test59 at 125%: the button still reacted away from where it is
+    // drawn with the ratio below). It maps a physical point into this DPI-unaware window's logical space.
+    using ToLogicalFn = BOOL(WINAPI*)(HWND, LPPOINT);
+    static const auto toLogical = reinterpret_cast<ToLogicalFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "PhysicalToLogicalPointForPerMonitorDPI")));
+    if (POINT logical = physical; toLogical && toLogical(overlayWindow, &logical)) {
+        client = logical;
+        if (scale) {
+            POINT one{wr.left, wr.top}, two{wr.right, wr.bottom};
+            using ToPhysicalFn = BOOL(WINAPI*)(HWND, LPPOINT);
+            static const auto toPhysical = reinterpret_cast<ToPhysicalFn>(
+                reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "LogicalToPhysicalPointForPerMonitorDPI")));
+            *scale = toPhysical && toPhysical(overlayWindow, &one) && toPhysical(overlayWindow, &two) && two.y > one.y
+                ? double(two.y - one.y) / double(wr.bottom - wr.top) : 1.0;
+        }
+        return ScreenToClient(overlayWindow, &client) != FALSE;
+    }
+    POINT tl{wr.left, wr.top}, br{wr.right, wr.bottom};
+    double sx = 1.0, sy = 1.0;
+    // Windows 8.1+; looked up at run time (the HUD builds for Windows 7, _WIN32_WINNT 0x0601).
+    using ToPhysicalFn = BOOL(WINAPI*)(HWND, LPPOINT);
+    static const auto toPhysical = reinterpret_cast<ToPhysicalFn>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "LogicalToPhysicalPointForPerMonitorDPI")));
+    if (toPhysical && toPhysical(overlayWindow, &tl) && toPhysical(overlayWindow, &br) &&
+        br.x > tl.x && br.y > tl.y) {
+        sx = double(br.x - tl.x) / double(wr.right - wr.left);
+        sy = double(br.y - tl.y) / double(wr.bottom - wr.top);
+    } else { tl = {wr.left, wr.top}; }
+    client = {wr.left + LONG(std::lround((physical.x - tl.x) / sx)), wr.top + LONG(std::lround((physical.y - tl.y) / sy))};
+    if (scale) *scale = sy;
+    return ScreenToClient(overlayWindow, &client) != FALSE;
+}
+bool OverlayCursorClient(POINT& client, double* scale = nullptr)
+{
+    POINT physical{};
+    if (GetPhysicalCursorPos(&physical) && OverlayClientFromPhysical(physical, client, scale)) return true;
+    return GetCursorPos(&client) && overlayWindow && ScreenToClient(overlayWindow, &client);
+}
+// r57-test52 diagnostics (the home Replays button did nothing): what the hook saw, counted on the hook thread
+// and written once per press by the GUI loop to %LOCALAPPDATA%\MyClient\logs\hud-replay.log.
+uint32_t homeReplayHookDowns = 0, homeReplayHookInside = 0;
+void HomeReplayDiag(const char* format, ...)
+{
+    static FILE* file = nullptr;
+    static bool opened = false;
+    if (!opened) {
+        opened = true;
+        wchar_t local[MAX_PATH]{};
+        const DWORD size = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+        if (size && size < MAX_PATH) {
+            const std::wstring folder = std::wstring(local) + L"\\MyClient\\logs";
+            CreateDirectoryW((std::wstring(local) + L"\\MyClient").c_str(), nullptr);
+            CreateDirectoryW(folder.c_str(), nullptr);
+            file = _wfopen((folder + L"\\hud-replay.log").c_str(), L"wb");
+        }
+    }
+    if (!file) return;
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    std::fprintf(file, "%02u:%02u:%02u.%03u INFO [OriginX] ", now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
+    char text[2048];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(text, sizeof text, format, args);
+    va_end(args);
+    std::fprintf(file, "%s\r\n", LogPrivacy::Redact(std::string_view(text)).c_str());
+    std::fflush(file);
+}
+
+// Armor HUD icons (2026-11-19, test58 on an OderSo folder install: no picture at all although the DLL's copy of
+// the textures was there): which folder the HUD read and whether each picture loaded, once per item and folder,
+// to %LOCALAPPDATA%\MyClient\logs\hud-icons.log.
+void HudIconDiag(const std::wstring& gameDir, const std::string& item, bool found)
+{
+    static FILE* file = nullptr;
+    static bool opened = false;
+    static std::set<std::wstring> seen;
+    if (!seen.insert(gameDir + L"|" + Utf8ToWide(item)).second || seen.size() > 200) return;
+    if (!opened) {
+        opened = true;
+        wchar_t local[MAX_PATH]{};
+        const DWORD size = GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
+        if (size && size < MAX_PATH) {
+            const std::wstring folder = std::wstring(local) + L"\\MyClient\\logs";
+            CreateDirectoryW((std::wstring(local) + L"\\MyClient").c_str(), nullptr);
+            CreateDirectoryW(folder.c_str(), nullptr);
+            file = _wfopen((folder + L"\\hud-icons.log").c_str(), L"wb");
+        }
+    }
+    if (!file) return;
+    SYSTEMTIME now{};
+    GetLocalTime(&now);
+    std::fprintf(file, "%02u:%02u:%02u.%03u INFO [OriginX] icon '%s' from '%s': %s\r\n", now.wHour, now.wMinute,
+                 now.wSecond, now.wMilliseconds, item.c_str(), LogPrivacy::Redact(gameDir).c_str(), found ? "loaded" : "MISSING");
+    std::fflush(file);
+}
+
 LRESULT CALLBACK ZoomWheelHook(int code, WPARAM wParam, LPARAM lParam)
 {
+    if (code == HC_ACTION && homeReplayHookWanted && (wParam == WM_LBUTTONDOWN || wParam == WM_LBUTTONUP)) {
+        const auto* mouse = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+        if (mouse) {
+            POINT client{};
+            const bool inside = OverlayClientFromPhysical(mouse->pt, client) && PtInRect(&homeReplayScreenRect, client) != FALSE;
+            if (wParam == WM_LBUTTONDOWN) { ++homeReplayHookDowns; if (inside) ++homeReplayHookInside; }
+            homeReplayInput.Event(wParam == WM_LBUTTONDOWN, inside);
+        }
+    }
+    if (code == HC_ACTION && wParam == WM_MOUSEWHEEL && worldMapWheel.load() && !zoomActive)
+    {
+        const auto* info = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+        worldMapWheelDelta += static_cast<short>(HIWORD(info->mouseData));
+        return 1;   // the game's hotbar does not scroll while the map is open
+    }
     if (code == HC_ACTION && wParam == WM_MOUSEWHEEL && zoomActive)
     {
         const auto* info = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
@@ -308,6 +473,17 @@ MenuCategory selectedCategory =
     MenuCategory::Feature;
 
 bool menuOpen = false;
+// While a recording plays (2026-11-12, user request): the mouse reaches the replay bar without the G menu. From the
+// recorded player's eyes always (nothing to look at with the mouse there), with the free camera while left Alt is
+// held. Only the bar is drawn, the menu stays closed (UpdateReplayBarMode).
+bool replayBarMode = false;
+uint64_t replayBarClickSeenAt = 0;   // the overlay got the bar click as a message (the polling fallback skips it)
+// A key the bar does not use, pressed while the bar had the keyboard (Esc, T, F5...): the game gets it back
+// (review 2026-11-12: from the eyes the game never saw Esc or the chat key). The bar steps aside for a moment.
+int replayBarForwardKey = 0;
+ULONGLONG replayBarSuspendUntil = 0;
+// F1, as in the game: every picture of this HUD hidden too, until F1 again (the menu still opens with G).
+bool hideAllUi = false;
 bool hudEditMode = false;
 ULONGLONG editorNoticeUntil = 0;   // shows "positions reset" in the HUD editor toolbar for a moment
 bool gameActive = true; // Minecraft (or this overlay) is the foreground window
@@ -359,7 +535,9 @@ enum class DetailFeature
     CpsLimiter,
     ItemCounter,
     PackDisplay,
-    JavaChat   // keep new features last: presets store these values
+    JavaChat,
+    Minimap,
+    Combo   // keep new features last: presets store these values
 };
 
 DetailFeature detailFeature =
@@ -420,6 +598,7 @@ struct ShortcutSettings
     int lite = 0;
     int fastInventory = 0;
     int leftHand = 0;
+    int minimap = 'M'; // world map key, not a module toggle
     int hitEffect = 0;
     int frameGen = 0;
     int menuKey = 'G';   // Menu Open: opens / closes this menu (never None)
@@ -433,6 +612,7 @@ struct ShortcutSettings
     int cpsLimiter = 0;
     int itemCounter = 0;
     int packDisplay = 0;
+    int combo = 0;
 };
 
 ShortcutSettings shortcuts;
@@ -538,6 +718,9 @@ HudElement cpsHud{
     1.0f
 };
 
+// Below CPS, offset right so the existing armor default remains unobstructed.
+HudElement comboHud{200, 305, 1.0f};
+
 HudElement armorHud{
     25,
     315,
@@ -591,6 +774,7 @@ HudElement packDisplayHud{
     420,
     1.0f
 };
+HudElement minimapHud{-1, 20, 1.0f};
 HudElement javaChatHud{12, -1, 1.0f}; // y=-1: initialize against the actual window's bottom edge.
 
 // Block Details: x / y is the top-left of a 300-wide area; the box is centred in it.
@@ -645,7 +829,9 @@ enum class HudElementId
     Coordinates,
     Timer,
     PackDisplay,
-    JavaChat
+    JavaChat,
+    Minimap,
+    Combo
 };
 
 
@@ -799,7 +985,7 @@ struct HudLook
     int box = -1;
     bool see = false;
 };
-constexpr int kHudLookCount = (int)HudElementId::JavaChat + 1;
+constexpr int kHudLookCount = (int)HudElementId::Combo + 1;
 HudLook hudLooks[kHudLookCount];
 
 bool HudBoxOn(HudElementId id)
@@ -1121,6 +1307,7 @@ int* GetShortcutPtr(
     case DetailFeature::Keystrokes:
         return &shortcuts.keystrokes;
 
+    case DetailFeature::Combo: return &shortcuts.combo;
     case DetailFeature::CPS:
         return &shortcuts.cps;
 
@@ -1198,6 +1385,7 @@ int* GetShortcutPtr(
 
     case DetailFeature::LeftHand:
         return &shortcuts.leftHand;
+    case DetailFeature::Minimap: return &shortcuts.minimap;
     case DetailFeature::HitEffect:
         return &shortcuts.hitEffect;
     case DetailFeature::FrameGen:
@@ -1241,6 +1429,12 @@ int* KeyTargetOf(DetailFeature f, int slot)
         return &timerStartKey;
     if (f == DetailFeature::Timer && slot == 1)
         return &timerResetKey;
+    if (f == DetailFeature::Replay && slot == 0)
+        return &replayPauseKey;
+    if (f == DetailFeature::Replay && slot == 1)
+        return &replayPointKey;
+    if (f == DetailFeature::Replay && slot == 2)
+        return &replayUndoKey;
     return GetShortcutPtr(f);
 }
 
@@ -1260,15 +1454,49 @@ bool IsValidPlayerTag(const std::wstring& value)
 // Simple wide text format.
 // Party names are stored after PARTY_BEGIN until PARTY_END.
 
+// Bits 0/1 hide our cape/mark; bit 2 shows other marks. Atomic snapshot across UI/service.
+std::atomic<uint32_t> capeVisibility{CapeVisibility::Default};
+std::mutex capeWakeMutex;
+std::condition_variable capeWake;
+bool capeSettingsPending = false;
+void NotifyCapeSettings() {
+    { std::lock_guard lock(capeWakeMutex); capeSettingsPending = true; }
+    capeWake.notify_one();
+}
+
+// The settings are written in full to a temporary file next to the real one, checked after close,
+// and only then moved over it (2026-11-20): a stop mid-write or a full disk keeps the previous file.
+// The file is UTF-8, so a Nick in any language no longer stops the stream and loses the lines after it.
+// The same for any small file the HUD rewrites whole (presets, replay list): `bytes` as they are.
+bool ReplaceFileBytes(const std::wstring& path, const std::string& bytes)
+{
+    const std::wstring temp = path + L".tmp";
+    HANDLE out = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (out == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD written = 0;
+    bool ok = WriteFile(out, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
+              written == bytes.size() && FlushFileBuffers(out);
+    if (!CloseHandle(out)) ok = false;
+    if (!ok) {
+        DeleteFileW(temp.c_str());
+        return false;
+    }
+    if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(temp.c_str());
+        return false;
+    }
+    return true;
+}
+bool ReplaceConfigFile(const std::wstring& path, const std::wstring& text)
+{
+    return ReplaceFileBytes(path, ConfigText::EncodeUtf8(text));
+}
+
 void SaveConfig()
 {
-    std::wofstream file(
-        std::filesystem::path(ConfigPath()),
-        std::ios::trunc
-    );
-
-    if (!file.is_open())
-        return;
+    std::wostringstream file;
 
     file << L"VERSION 4\n";
 
@@ -1326,12 +1554,13 @@ void SaveConfig()
          << shortcuts.timer << L' '
          << shortcuts.cpsLimiter << L' '
          << shortcuts.itemCounter << L' '
-         << shortcuts.packDisplay
+         << shortcuts.packDisplay << L' ' << shortcuts.minimap << L' ' << shortcuts.combo
          << L"\n";
 
     file << L"REPLAY "
          << replayEnabled
          << L"\n";
+    file << L"REPLAYKEYS " << replayPauseKey << L' ' << replayPointKey << L' ' << replayUndoKey << L"\n";
 
     file << L"MENUSOUNDS " << menuSoundsEnabled << L' ' << toggleSoundMode << L"\n";
 
@@ -1342,6 +1571,8 @@ void SaveConfig()
          << resourceTranslucent << L' ' << arrowTranslucent << L"\n";
 
     file << L"LEFTHAND " << leftHandEnabled << L"\n";
+    file << L"COMBO " << comboEnabled << L' ' << comboHideZero << L' ' << comboHud.x << L' ' << comboHud.y << L' ' << comboHud.scale << L"\n";
+    file << L"MINIMAP " << minimapEnabled << L' ' << minimapSize << L' ' << minimapZoom << L' ' << minimapRotate << L' ' << minimapCoordinates << L' ' << minimapMobs << L' ' << minimapBorder << L' ' << minimapBorderIndex << L' ' << minimapHud.x << L' ' << minimapHud.y << L' ' << minimapHud.scale << L"\n";
     file << L"HITEFFECT " << hitEffectEnabled << L' ' << hitEffectMagic << L' ' << hitEffectCrit << L"\n";
     file << L"FRAMEGEN " << frameGenEnabled << L' ' << frameGenMultiplier << L' ' << frameGenMethod << L' ' << frameGenPacing << L"\n";
 
@@ -1353,7 +1584,10 @@ void SaveConfig()
          << L' ' << liteHighPriority << L' ' << liteNoThrottle << L' ' << liteGpuPriority << L"\n";
     file << L"LITE3 " << liteNoSkyFull << L' ' << liteCullBehind << L' ' << liteBlockEntityLimit << L' ' << liteBlockEntityDistance
          << L' ' << liteVerticalLimit << L' ' << liteVerticalRows << L"\n";
+    file << L"LITE4 " << liteFpsLimit << L' ' << liteFpsLimitCode << L"\n";
 
+    const uint32_t visibility = capeVisibility.load();
+    file << L"CAPEVIS "; CapeVisibility::Write(file, visibility); file << L"\n";
     file << L"NICK "
          << nickEnabled << L' '
          << nickText
@@ -1542,18 +1776,19 @@ void SaveConfig()
     }
 
     file << L"PARTY_END\n";
+    ReplaceConfigFile(ConfigPath(), file.str());
 }
 
 
 void LoadConfig()
 {
-    std::wifstream file(
-        std::filesystem::path{ConfigPath()}
-    );
-
-    if (!file.is_open())
+    std::ifstream raw(std::filesystem::path{ConfigPath()}, std::ios::binary);
+    if (!raw.is_open())
         return;
+    // UTF-8 (2026-11-20 on) or the older one-byte-per-character file.
+    std::wistringstream file(ConfigText::DecodeFile(std::string(std::istreambuf_iterator<char>(raw), {})));
 
+    capeVisibility.store(CapeVisibility::Default); // old configs have no CAPEVIS line
     std::wstring key;
 
     partyPlayers.clear();
@@ -1710,6 +1945,9 @@ void LoadConfig()
                 int packDisplayKey = shortcuts.packDisplay;
                 if (ss >> packDisplayKey)     // optional: absent in configs from before Pack Display
                     shortcuts.packDisplay = packDisplayKey;
+                int mapKey=shortcuts.minimap; if(ss >> mapKey && mapKey>0 && mapKey<256 && mapKey!=VK_ESCAPE)shortcuts.minimap=mapKey;
+                int comboKey = shortcuts.combo;
+                if (ss >> comboKey) shortcuts.combo = comboKey;
                 shortcuts.shulker = read.shulker;
                 shortcuts.hive = read.hive;
                 shortcuts.resources = read.resources;
@@ -2072,6 +2310,21 @@ void LoadConfig()
             bool on = false;
             if (ss >> on) leftHandEnabled = on;
         }
+        else if (key == L"COMBO") {
+            bool enabled = comboEnabled, hideZero = comboHideZero;
+            int x = comboHud.x, y = comboHud.y; float scale = comboHud.scale;
+            if (ss >> enabled) comboEnabled = enabled;
+            if (ss >> hideZero) comboHideZero = hideZero;
+            if (ss >> x >> y >> scale && std::isfinite(scale))
+                comboHud = {x, y, std::clamp(scale, 0.5f, 3.0f)};
+        }
+        else if (key == L"MINIMAP") {
+            ss >> minimapEnabled;
+            int n; if(ss>>n)minimapSize=std::clamp(n,0,2);if(ss>>n)minimapZoom=std::clamp(n,0,3);
+            ss>>minimapRotate>>minimapCoordinates>>minimapMobs>>minimapBorder;
+            if(ss>>n)minimapBorderIndex=std::clamp(n,0,3);
+            ss>>minimapHud.x>>minimapHud.y;float scale;if(ss>>scale && std::isfinite(scale))minimapHud.scale=std::clamp(scale,0.5f,3.f);
+        }
         else if (key == L"HITEFFECT")
         {
             bool on = false, magic = true;
@@ -2181,10 +2434,31 @@ void LoadConfig()
                 liteVerticalRows = std::clamp(rows, 1, (int)MyClientFeatures::VerticalRowsMax);
             }
         }
+        else if (key == L"LITE4")
+        {
+            bool limit = true; int code = 6;
+            if (ss >> limit >> code) { liteFpsLimit = limit; liteFpsLimitCode = std::clamp(code, 1, 6); }
+        }
         else if (key == L"REPLAY")
         {
             // Recording never starts by itself after a restart: the switch always begins OFF.
             replayEnabled = false;
+        }
+        else if (key == L"REPLAYKEYS")
+        {
+            int pause = replayPauseKey, point = replayPointKey, undo = replayUndoKey;
+            const auto validKey = [](int vk) { return vk > 0 && vk < 256 && vk != VK_ESCAPE ? vk : 0; };
+            if (ss >> pause >> point >> undo)
+            {
+                replayPauseKey = validKey(pause);
+                replayPointKey = validKey(point);
+                replayUndoKey = validKey(undo);
+            }
+        }
+        else if (key == L"CAPEVIS")
+        {
+            unsigned visibility = CapeVisibility::Default;
+            if (CapeVisibility::Read(ss, visibility)) capeVisibility.store(visibility);
         }
         else if (key == L"NICK")
         {
@@ -2254,7 +2528,8 @@ void LoadConfig()
                     hiveStatsAuto = autoGame;
                 hiveStatsEnabled = enabled;
                 hiveStatsHud = element;
-                hiveStatsGame = std::clamp(game, 0, HiveStats::kGameCount - 1);
+                hiveStatsGame = std::clamp(game, HiveStats::kHidden, HiveStats::kGameCount - 1);
+                if (!HiveStats::Pickable(hiveStatsGame)) hiveStatsGame = HiveStats::kAllGames;   // a game taken off the table (2026-11-20)
             }
         }
         else if (key == L"CLIENT")
@@ -2340,7 +2615,7 @@ void LoadConfig()
             pinnedFeatures.clear();
             int value = 0;
             while (ss >> value)
-                if (value > (int)DetailFeature::None && value <= (int)DetailFeature::JavaChat &&
+                if (value > (int)DetailFeature::None && value <= (int)DetailFeature::Combo &&
                     std::find(pinnedFeatures.begin(), pinnedFeatures.end(), (DetailFeature)value) == pinnedFeatures.end())
                     pinnedFeatures.push_back((DetailFeature)value);
         }
@@ -2358,6 +2633,7 @@ void LoadConfig()
 
 void ResetHudLayout()
 {
+    comboHud = {200, 305, 1.0f};
     keystrokesHud = {
         25,
         130,
@@ -2424,6 +2700,7 @@ void ResetHudLayout()
         1.0f
     };
     javaChatHud = {12, -1, 1.0f};
+    minimapHud = {-1,20,1.0f};
 
     blockDetailsHud = {
         810,
@@ -2495,6 +2772,21 @@ void HideMouseCursor()
     }
 
     ClipCursor(nullptr);
+}
+
+// While the menu is closed, the overlay lets the mouse through completely (WS_EX_TRANSPARENT). WM_NCHITTEST's
+// HTTRANSPARENT passes only to windows of the same thread, so over the overlay's painted parts (the home screen's
+// Replays button, the replay message under it) the mouse stayed on the overlay, whose thread keeps the cursor hidden
+// (HideMouseCursor): the cursor vanished there (2026-11-12). The home Replays button reads the mouse by polling, so
+// it still works.
+bool WorldMapOpen();   // the M world map takes the mouse too (defined after MapHud.h)
+void UpdateOverlayClickThrough()
+{
+    if (!overlayWindow) return;
+    const LONG_PTR style = GetWindowLongPtrW(overlayWindow, GWL_EXSTYLE);
+    const bool through = !menuOpen && !replayBarMode && !WorldMapOpen();
+    if (((style & WS_EX_TRANSPARENT) != 0) == through) return;
+    SetWindowLongPtrW(overlayWindow, GWL_EXSTYLE, through ? (style | WS_EX_TRANSPARENT) : (style & ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT)));
 }
 
 
@@ -3589,6 +3881,36 @@ void DrawKeystrokes(HDC hdc)
 }
 
 
+std::wstring ComboText()
+{
+    const auto state = MinecraftDataProvider::Combo();
+    return L"Combo " + (state.available ? std::to_wstring(state.combo) : std::wstring(L"---"));
+}
+
+bool ComboVisible()
+{
+    const auto state = MinecraftDataProvider::Combo();
+    return comboEnabled && (hudEditMode || !comboHideZero || !state.available || state.combo != 0);
+}
+
+int ComboHudWidth(HDC hdc)
+{
+    const float s = comboHud.scale;
+    return std::max((int)(165 * s), TextWidth(hdc, ComboText(), std::max(10, (int)(17 * s))) + (int)(24 * s));
+}
+
+void DrawCombo(HDC hdc)
+{
+    if (!ComboVisible()) return;
+    const float s = comboHud.scale;
+    const int x = comboHud.x, y = comboHud.y;
+    const int w = ComboHudWidth(hdc), h = std::max(20, (int)(32 * s));
+    DrawHudBox(hdc, HudElementId::Combo, x, y, w, h, HudRadius(s), RGB(20,20,20));
+    DrawHudText(hdc, HudElementId::Combo, x + (int)(12 * s), y + (int)(7 * s), ComboText(),
+        HudColor(HudElementId::Combo, HudText, RGB(255,255,255)), std::max(10, (int)(17 * s)));
+    if (hudEditMode && selectedHud == HudElementId::Combo) DrawOutline(hdc, x, y, w, h, RGB(80,180,255));
+}
+
 void DrawCPS(HDC hdc)
 {
     if (!cpsEnabled)
@@ -3809,11 +4131,12 @@ void DrawArmor(HDC hdc)
         const auto armor = MinecraftDataProvider::GetArmor(slot);
         std::string item = MinecraftDataProvider::GetArmorItem(slot);
         if (item.empty()) item = emptySlots[slot];
-        if (const ItemIcons::Icon* found = icons.Get(gameDir, activePacks, item))
+        // No word ("HEAD", ...) when the picture is missing (r57-test12 request): the slot just stays empty.
+        const ItemIcons::Icon* found = icons.Get(gameDir, activePacks, item);
+        HudIconDiag(gameDir, item, found != nullptr);
+        if (found)
             ItemIcons::Draw(hdc, *found, ix, iy, icon);
-        else
-            DrawShadowText(hdc, ix, iy + (icon - textSize) / 2, labels[slot], HudColor(HudElementId::Armor, HudText, RGB(230,230,230)),
-                           std::max(8, textSize - 2));
+        (void)labels;
 
         if (!armorShowDurability || armor.state != MyClientFeatures::Durable)
             continue;
@@ -3919,7 +4242,7 @@ bool OverlayAlphaWanted()
     // box is clear (HudSmoothBox), which needs per-pixel alpha.
     if (!hudEditMode && !MinecraftDataProvider::IsInWorld())
         return false;   // no HUD outside a world
-    return keystrokesEnabled || cpsEnabled || fpsEnabled || pingEnabled || armorHudEnabled || arrowCounterEnabled ||
+    return comboEnabled || keystrokesEnabled || cpsEnabled || fpsEnabled || pingEnabled || armorHudEnabled || arrowCounterEnabled ||
            resourceCounterEnabled || featureListEnabled || (tabListEnabled && tabListShown) || (hiveStatsEnabled && hiveEnabled) || dayTimerEnabled || blockDetailsEnabled || coordinatesEnabled || timerEnabled || packDisplayEnabled || javaChatEnabled ||
            (debugMenuEnabled && debugScreenShown) || healthWarningEnabled || GetTickCount64() < healthWarningPreviewUntil;
 }
@@ -4414,14 +4737,31 @@ struct HiveStatsRow
     std::wstring name;
     bool known = false;       // stats arrived
     bool missing = false;     // no stats in this game (never played it)
+    bool hasKdr = false, hasLevel = false;   // false: the column shows "-"
     double kdr = 0, win = 0, level = 0;
+    uint32_t played = 0;      // All Games: the Games column
     uint32_t prestige = 0;    // shown as a coin left of the level
 };
 
-std::vector<HiveStatsRow> HiveStatsRows(bool& haveData, int& total)
+std::wstring AsciiToWide(const char* text);   // defined with the settings pages
+
+// The game the table shows: the detected one, else the pick (kAllGames = totals over every game).
+int HiveStatsShownGame()
+{
+    return (hiveStatsAuto && hiveDetectedGame >= 0) ? hiveDetectedGame : hiveStatsGame;
+}
+
+std::wstring HiveStatsGameName(int game)
+{
+    return game >= 0 && game < HiveStats::kGameCount ? AsciiToWide(HiveStats::kGames[game].name)
+         : game == HiveStats::kHidden ? L"Hide" : L"All Games";
+}
+
+std::vector<HiveStatsRow> HiveStatsRows(bool& haveData, bool& onHive, int& total)
 {
     std::vector<HiveStatsRow> rows;
     total = 0;
+    onHive = false;
 
     MyClientTabList::Shared data{};
     haveData = MinecraftDataProvider::GetTabList(data);
@@ -4430,11 +4770,21 @@ std::vector<HiveStatsRow> HiveStatsRows(bool& haveData, int& total)
         return rows;
 
     total = (int)data.total;
+    onHive = data.hive != 0;
+    if (!onHive)
+        return rows;
 
     hiveDetectedTitle = data.title;
     hiveDetectedGame = HiveStats::DetectGame(hiveDetectedTitle);
-    const int gameIndex = (hiveStatsAuto && hiveDetectedGame >= 0) ? hiveDetectedGame : hiveStatsGame;
-    const HiveStats::Game& game = HiveStats::kGames[std::clamp(gameIndex, 0, HiveStats::kGameCount - 1)];
+    if (HiveStatsShownGame() == HiveStats::kHidden)
+        return rows;
+    const int gameIndex = std::clamp(HiveStatsShownGame(), HiveStats::kAllGames, HiveStats::kGameCount - 1);
+    static int lastGame = INT_MIN;
+    if (gameIndex != lastGame)
+    {
+        if (lastGame != INT_MIN) hiveFetcher.GameChanged();   // a new game: refresh everyone once
+        lastGame = gameIndex;
+    }
 
     for (uint32_t i = 0; i < data.count; i++)
     {
@@ -4446,17 +4796,24 @@ std::vector<HiveStatsRow> HiveStatsRows(bool& haveData, int& total)
         if (need > 1)
             MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), -1, &row.name[0], need);
 
-        const HiveStats::Entry e = hiveFetcher.Get(game.id, utf8);
+        const HiveStats::Entry e = hiveFetcher.Get(utf8);
 
-        if (e.state == HiveStats::State::Done)
+        if (e.state == HiveStats::State::Done && (gameIndex < 0 || e.profile.played[gameIndex]))
         {
+            const HiveStats::Stats st = gameIndex < 0 ? HiveStats::Total(e.profile) : e.profile.game[gameIndex];
             row.known = true;
-            row.kdr = HiveStats::Kdr(e.stats);
-            row.win = HiveStats::WinPercent(e.stats);
-            row.level = HiveStats::Level(game, e.stats.xp);
-            row.prestige = e.stats.prestige;
+            row.hasKdr = st.hasKd && (gameIndex < 0 || HiveStats::kGames[gameIndex].kdr);
+            row.hasLevel = gameIndex >= 0 && HiveStats::kGames[gameIndex].level;
+            row.kdr = HiveStats::Kdr(st);
+            row.win = HiveStats::WinPercent(st);
+            row.played = st.played;
+            if (row.hasLevel)
+            {
+                row.level = HiveStats::Level(HiveStats::kGames[gameIndex], st.xp);
+                row.prestige = st.prestige;
+            }
         }
-        else if (e.state == HiveStats::State::Missing)
+        else if (e.state == HiveStats::State::Done || e.state == HiveStats::State::Missing)
             row.missing = true;
 
         rows.push_back(row);
@@ -4467,8 +4824,10 @@ std::vector<HiveStatsRow> HiveStatsRows(bool& haveData, int& total)
     {
         if (a.known != b.known)
             return a.known;
-        if (a.known && (a.prestige != b.prestige || a.level != b.level))
+        if (a.known && a.hasLevel && b.hasLevel && (a.prestige != b.prestige || a.level != b.level))
             return HiveStats::Higher(a.prestige, a.level, b.prestige, b.level);
+        if (a.known && !a.hasLevel && a.played != b.played)
+            return a.played > b.played;
         return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0;
     });
 
@@ -4563,9 +4922,13 @@ void DrawHiveStats(HDC hdc)
     if (!hiveStatsEnabled || !hiveEnabled)
         return;
 
-    bool haveData = false;
+    bool haveData = false, onHive = false;
     int total = 0;
-    const auto rows = HiveStatsRows(haveData, total);
+    const auto rows = HiveStatsRows(haveData, onHive, total);
+    const int shownGame = HiveStatsShownGame();
+    if ((!onHive || shownGame == HiveStats::kHidden) && !hudEditMode)
+        return;   // only on The Hive, and not when "Hide" is picked for an unknown game (the HUD editor still shows the box)
+    const bool allGames = shownGame < 0;
 
     const float s = hiveStatsHud.scale;
     const int x = hiveStatsHud.x;
@@ -4577,26 +4940,29 @@ void DrawHiveStats(HDC hdc)
     const ThemeColors t = CurrentTheme();
     const auto ink = [](COLORREF c) { return HudColor(HudElementId::HiveStats, HudText, c); };
 
-    int lineCount = haveData ? 1 + std::max<int>(1, (int)rows.size()) : 2;
+    const bool listed = haveData && onHive;
+    int lineCount = 1 + (listed ? 1 + std::max<int>(1, (int)rows.size()) : 2);
     DrawHudBox(hdc, HudElementId::HiveStats, x, y, w, rowH * lineCount, HudRadius(s), RGB(20,20,20));
 
-    // header
-    DrawHudText(hdc, HudElementId::HiveStats, x + (int)(8 * s), y + (int)(3 * s), L"Player Name", ink(t.accentHi), fs);
-    DrawHudTextCentered(hdc, HudElementId::HiveStats, x + nameW, y, kdrW, rowH, L"KDR", ink(t.accentHi), fs);
-    DrawHudTextCentered(hdc, HudElementId::HiveStats, x + nameW + kdrW, y, winW, rowH, L"Win%", ink(t.accentHi), fs);
-    DrawHudTextCentered(hdc, HudElementId::HiveStats, x + nameW + kdrW + winW, y, lvlW, rowH, L"Lvl", ink(t.accentHi), fs);
+    // the game's name, then the column header
+    DrawHudText(hdc, HudElementId::HiveStats, x + (int)(8 * s), y + (int)(3 * s), HiveStatsGameName(shownGame), ink(t.text), fs);
+    const int hy = y + rowH;
+    DrawHudText(hdc, HudElementId::HiveStats, x + (int)(8 * s), hy + (int)(3 * s), L"Player Name", ink(t.accentHi), fs);
+    DrawHudTextCentered(hdc, HudElementId::HiveStats, x + nameW, hy, kdrW, rowH, L"KDR", ink(t.accentHi), fs);
+    DrawHudTextCentered(hdc, HudElementId::HiveStats, x + nameW + kdrW, hy, winW, rowH, L"Win%", ink(t.accentHi), fs);
+    DrawHudTextCentered(hdc, HudElementId::HiveStats, x + nameW + kdrW + winW, hy, lvlW, rowH, allGames ? L"Games" : L"Lvl", ink(t.accentHi), fs);
 
-    if (!haveData)
+    if (!listed)
     {
-        DrawHudText(hdc, HudElementId::HiveStats, x + (int)(8 * s), y + rowH + (int)(3 * s),
-                       L"no player list yet (needs the updated DLL)", ink(t.muted), fs);
+        DrawHudText(hdc, HudElementId::HiveStats, x + (int)(8 * s), hy + rowH + (int)(3 * s),
+                       haveData ? L"only shown on The Hive" : L"no player list yet (needs the updated DLL)", ink(t.muted), fs);
     }
     else
     {
         for (size_t i = 0; i < rows.size(); i++)
         {
             const HiveStatsRow& r = rows[i];
-            const int ry = y + (int)(i + 1) * rowH;
+            const int ry = hy + (int)(i + 1) * rowH;
 
             DrawHudText(hdc, HudElementId::HiveStats, x + (int)(8 * s), ry + (int)(3 * s), r.name, ink(t.text), fs);
 
@@ -4606,8 +4972,15 @@ void DrawHiveStats(HDC hdc)
                 const COLORREF winColor = r.win >= 50 ? RGB(100,220,130) : (r.win >= 25 ? RGB(200,235,200) : RGB(170,170,170));
                 const COLORREF lvlColor = r.level >= 50 ? RGB(190,120,255) : (r.level >= 20 ? RGB(255,205,70) : RGB(230,230,230));
 
-                DrawHudTextCentered(hdc, HudElementId::HiveStats, x + nameW, ry, kdrW, rowH, FormatDecimal(r.kdr, 2), ink(kdrColor), fs);
+                DrawHudTextCentered(hdc, HudElementId::HiveStats, x + nameW, ry, kdrW, rowH, r.hasKdr ? FormatDecimal(r.kdr, 2) : L"-",
+                                    ink(r.hasKdr ? kdrColor : t.muted), fs);
                 DrawHudTextCentered(hdc, HudElementId::HiveStats, x + nameW + kdrW, ry, winW, rowH, FormatDecimal(r.win, 2) + L"%", ink(winColor), fs);
+                if (allGames || !r.hasLevel)
+                {
+                    DrawHudTextCentered(hdc, HudElementId::HiveStats, x + nameW + kdrW + winW, ry, lvlW, rowH,
+                                        allGames ? std::to_wstring(r.played) : L"-", ink(allGames ? RGB(230,230,230) : t.muted), fs);
+                    continue;
+                }
                 const std::wstring lvl = FormatDecimal(std::floor(r.level), 0);
                 // the level stays centred like everyone else's; the coin sits small just left of it
                 DrawHudTextCentered(hdc, HudElementId::HiveStats, x + nameW + kdrW + winW, ry, lvlW, rowH, lvl, ink(lvlColor), fs);
@@ -4631,7 +5004,7 @@ void DrawHiveStats(HDC hdc)
 
         if (rows.empty())
         {
-            DrawHudText(hdc, HudElementId::HiveStats, x + (int)(8 * s), y + rowH + (int)(3 * s), L"(nobody)", ink(t.muted), fs);
+            DrawHudText(hdc, HudElementId::HiveStats, x + (int)(8 * s), hy + rowH + (int)(3 * s), L"(nobody)", ink(t.muted), fs);
         }
     }
 
@@ -5211,13 +5584,13 @@ void DrawFPS(HDC hdc)
     // The HUD position editor still shows it.
     if (!hudEditMode && (menuOpen || MinecraftDataProvider::IsGameMenuOpen()))
         return;
-    // With Frame Generation running: the frames shown, then the game's own in brackets.
+    // With Frame Generation running: only the frames shown (the game's own count is no longer added in brackets,
+    // user 2026-11-14).
     float shownFps = 0; uint32_t frameGen = 0;
     const bool generating = knownFps && MinecraftDataProvider::GetFrameGen(shownFps, frameGen) &&
                             frameGen == MyClientFeatures::FrameGenRunning && shownFps > 0;
     const std::wstring fpsLabel = !knownFps ? L"FPS: ---"
-        : generating ? L"FPS: " + std::to_wstring(std::lround(shownFps)) + L" (" + std::to_wstring(std::lround(gameFps)) + L")"
-                     : L"FPS: " + std::to_wstring(static_cast<int>(std::lround(gameFps)));
+        : L"FPS: " + std::to_wstring(std::lround(generating ? shownFps : gameFps));
 
     float s =
         fpsHud.scale;
@@ -5407,8 +5780,8 @@ constexpr int JavaChatWidth = 420, JavaChatHeight = 200;
 void DrawJavaChat(HDC hdc)
 {
     MyClientJavaChat::Snapshot snapshot{};
+    // The applied JSON profile can remain ON until title reload even after the requested toggle is OFF.
     const bool connected = MinecraftDataProvider::JavaChatSnapshot(javaChatEnabled, snapshot);
-    if (!javaChatEnabled) return;
     const float scale = javaChatHud.scale;
     if (javaChatHud.y < 0) {
         RECT client{};
@@ -5418,7 +5791,7 @@ void DrawJavaChat(HDC hdc)
     const int width = int(JavaChatWidth * scale), height = int(JavaChatHeight * scale);
     const int fontSize = std::max(10, int(15 * scale)), lineHeight = std::max(14, int(20 * scale));
     const bool ready = connected && snapshot.ready && MyClientJavaChat::Fresh(snapshot.at, GetTickCount64());
-    // No native-hide acknowledgment: show no replacement, so the two chats can never stack.
+    // No applied-profile acknowledgment: do not render the replacement. Actual JSON visibility is verified on the game.
     if (!ready && !hudEditMode) return;
     static MyClientJavaChat::Snapshot previous{};
     static int oldWidth = 0, oldFont = 0;
@@ -5452,7 +5825,7 @@ void DrawJavaChat(HDC hdc)
         }
     }
     std::vector<std::wstring> lines = ready ? wrapped : std::vector<std::wstring>{};
-    if (hudEditMode && lines.empty()) lines = {L"JAVAチャット", L"HUD調整でこの欄をドラッグして移動できます。", L"<Player> Hello, OriginX!"};
+    if (hudEditMode && lines.empty()) lines = {Lang::T(L"JAVAチャット", L"JAVA CHAT"), Lang::T(L"HUD調整でこの欄をドラッグして移動できます。", L"Drag this box in HUD Edit to move it."), L"<Player> Hello, OriginX!"};
     const size_t maxLines = std::max(1, (height - int(12 * scale)) / lineHeight);
     if (lines.size() > maxLines) lines.erase(lines.begin(), lines.end() - maxLines);
     if (!lines.empty()) {
@@ -5467,13 +5840,39 @@ void DrawJavaChat(HDC hdc)
         selectedHud == HudElementId::JavaChat ? RGB(80,180,255) : RGB(130,140,160));
 }
 
+#include "MapHud.h"
+bool WorldMapOpen() { return MinimapHud::open; }
+int MinimapDiameter(){return int((128+64*minimapSize)*minimapHud.scale);}
+void DrawMinimap(HDC dc){
+ if(!minimapEnabled)return;
+ RECT r{};GetClientRect(overlayWindow,&r);int size=MinimapDiameter();
+ if(minimapHud.x<0)minimapHud.x=std::max(8,int(r.right)-size-20);
+ if(!MinimapHud::ready){DrawTextSimple(dc,minimapHud.x,minimapHud.y,L"DLL update required / waiting for map",RGB(200,200,200),12);return;}
+ MyClientMap::View view{MinimapHud::snapshot.x,MinimapHud::snapshot.z,double(1<<minimapZoom),minimapRotate?MinimapHud::snapshot.yaw*3.141592653589793/180+3.141592653589793:0};
+ MinimapHud::Draw(dc,minimapHud.x,minimapHud.y,size,size,view,true,minimapMobs && minimapWorldMobs,minimapBorder,kMinimapBorders[minimapBorderIndex]);
+ if(minimapCoordinates){auto const& d=MinimapHud::snapshot;std::wstring coords=L"X "+std::to_wstring(int(d.x))+L" / Y "+std::to_wstring(int(d.y))+L" / Z "+std::to_wstring(int(d.z));DrawTextCentered(dc,minimapHud.x,minimapHud.y+size+4,size,20,coords,RGB(255,255,255),12);}
+}
+void DrawWorldMap(HDC dc,int w,int h){
+ if(!MinimapHud::open)return;
+ MinimapHud::Draw(dc,0,0,w,h,MinimapHud::worldView,false,false,false,0);
+ const auto at=MinimapHud::worldView.Unproject(MinimapHud::cursor.x-w/2,MinimapHud::cursor.y-h/2);
+ const auto name=MyClientMap::DimensionName(MinimapHud::snapshot.dimension);
+ DrawRoundBox(dc,0,0,w,34,0,RGB(14,14,18));DrawRoundBox(dc,0,h-34,w,34,0,RGB(14,14,18));
+ DrawTextSimple(dc,16,8,std::wstring(name.begin(),name.end())+L" — explored map",RGB(255,255,255),14);
+ DrawTextSimple(dc,std::max(16,w-300),8,L"Cursor X "+std::to_wstring(int(at.first))+L" / Z "+std::to_wstring(int(at.second)),RGB(255,255,255),13);
+ DrawTextSimple(dc,16,h-26,L"Drag: move   Wheel: zoom   Map key / Esc: close     You: X "+std::to_wstring(int(MinimapHud::snapshot.x))+L" / Z "+std::to_wstring(int(MinimapHud::snapshot.z)),RGB(255,255,255),13);
+}
+
 void DrawHud(HDC hdc)
 {
     // Show the HUD only inside a world/server. The position editor still shows it.
     if (!hudEditMode && (menuOpen || MinecraftDataProvider::IsGameMenuOpen() || !MinecraftDataProvider::IsInWorld())) return;
+    if(MinimapHud::open)return;
+    DrawMinimap(hdc);
     DrawBlockOutline(hdc);
     DrawKeystrokes(hdc);
     DrawCPS(hdc);
+    DrawCombo(hdc);
     DrawArmor(hdc);
     DrawArrows(hdc);
     DrawFPS(hdc);
@@ -5501,6 +5900,7 @@ HudElement* GetHudElement(
     case HudElementId::Keystrokes:
         return &keystrokesHud;
 
+    case HudElementId::Combo: return &comboHud;
     case HudElementId::CPS:
         return &cpsHud;
 
@@ -5530,6 +5930,7 @@ HudElement* GetHudElement(
 
     case HudElementId::PackDisplay:
         return &packDisplayHud;
+    case HudElementId::Minimap: return &minimapHud;
     case HudElementId::JavaChat:
         return &javaChatHud;
 
@@ -5623,6 +6024,16 @@ HudElementId GetHudAt(
         {
             return r;
         }
+    }
+
+    if (ComboVisible())
+    {
+        HDC dc = GetDC(overlayWindow);
+        const int width = dc ? ComboHudWidth(dc) : (int)(165 * comboHud.scale);
+        if (dc) ReleaseDC(overlayWindow, dc);
+        auto r = hit(HudElementId::Combo, comboHud, (int)std::ceil(width / comboHud.scale),
+            (int)std::ceil(std::max(20, (int)(32 * comboHud.scale)) / comboHud.scale));
+        if (r != HudElementId::None) return r;
     }
 
     if (cpsEnabled)
@@ -5782,6 +6193,7 @@ HudElementId GetHudAt(
             return r;
     }
 
+    if(minimapEnabled){auto r=hit(HudElementId::Minimap,minimapHud,128+64*minimapSize,156+64*minimapSize);if(r!=HudElementId::None)return r;}
     if (javaChatEnabled) {
         const auto r = hit(HudElementId::JavaChat, javaChatHud, JavaChatWidth, JavaChatHeight);
         if (r != HudElementId::None) return r;
@@ -5828,9 +6240,11 @@ std::wstring FeatureTitle(
 {
     switch (f)
     {
+    case DetailFeature::Minimap: return L"Minimap";
     case DetailFeature::Keystrokes:
         return L"Keystrokes";
 
+    case DetailFeature::Combo: return L"Combo Counter";
     case DetailFeature::CPS:
         return L"CPS Counter";
 
@@ -5945,7 +6359,7 @@ std::wstring FeatureTitle(
     case DetailFeature::PackDisplay:
         return L"Pack Display";
     case DetailFeature::JavaChat:
-        return L"JAVAチャット";
+        return Lang::T(L"JAVAチャット", L"JAVA CHAT");
 
     case DetailFeature::HiveStats:
         return L"Hive Statistic";
@@ -5961,9 +6375,11 @@ bool FeatureEnabled(
 {
     switch (f)
     {
+    case DetailFeature::Minimap: return minimapEnabled;
     case DetailFeature::Keystrokes:
         return keystrokesEnabled;
 
+    case DetailFeature::Combo: return comboEnabled;
     case DetailFeature::CPS:
         return cpsEnabled;
 
@@ -6070,7 +6486,7 @@ bool FeatureEnabled(
         return hiveStatsEnabled;
 
     case DetailFeature::HiveUtils:
-        return hiveEnabled && (partyAutoAcceptEnabled || autoRqEnabled);
+        return hiveEnabled;
 
     default:
         return false;
@@ -6279,10 +6695,13 @@ MyClientHudFrame::Channel hudFrame;
 bool inGameDrawing = false;   // the picture currently goes to the game, the window is blank
 
 // True when the game DLL is ready to draw the HUD into the game's frame and the HUD should hand it over.
-// Only while playing: the menu, the HUD editor and the home screen (clickable Replays button) stay in the window.
+// While playing, and on the home screen (r57-test12: the window showed nothing there, the Replays button and the
+// OriginX tag never appeared; the Replays button reads the mouse by polling, so it works either way). The menu and
+// the HUD editor stay in the window.
+bool OnHomeScreen();
 bool InGameDrawingUsable(int width, int height)
 {
-    if (menuOpen || hudEditMode || !MinecraftDataProvider::IsInWorld()) return false;
+    if (menuOpen || hudEditMode || !(MinecraftDataProvider::IsInWorld() || OnHomeScreen())) return false;
     if (width <= 0 || height <= 0 || (uint32_t)width > MyClientHudFrame::MaxWidth || (uint32_t)height > MyClientHudFrame::MaxHeight)
         return false;
     const DWORD pid = MinecraftDataProvider::GamePid();
@@ -6359,11 +6778,13 @@ void ToggleFeature(
 {
     switch (f)
     {
+    case DetailFeature::Minimap: minimapEnabled=!minimapEnabled; break;
     case DetailFeature::Keystrokes:
         keystrokesEnabled =
             !keystrokesEnabled;
         break;
 
+    case DetailFeature::Combo: comboEnabled = !comboEnabled; break;
     case DetailFeature::CPS:
         cpsEnabled =
             !cpsEnabled;
@@ -6484,19 +6905,19 @@ void ToggleFeature(
     case DetailFeature::Lite:
         liteEnabled =
             !liteEnabled;
-        ApplyLite();
+        if (deferLiteApply) liteApplyPending = true; else ApplyLite();
         RequestRenderDistance();   // ON with the Render Distance row already on: apply it now (OFF: nothing)
         break;
 
     case DetailFeature::FastInventory:
         fastInventoryEnabled =
             !fastInventoryEnabled;
-        ApplyLite();   // same generated pack
+        if (deferLiteApply) liteApplyPending = true; else ApplyLite();   // same generated pack
         break;
 
     case DetailFeature::HitEffect:
         hitEffectEnabled = !hitEffectEnabled;
-        if (hitEffectMagic) ApplyLite();   // the pack carries the enchanted-hit particle
+        if (hitEffectMagic) { if (deferLiteApply) liteApplyPending = true; else ApplyLite(); }   // the pack carries the enchanted-hit particle
         break;
 
     case DetailFeature::FrameGen:
@@ -6536,6 +6957,7 @@ void ToggleFeature(
         break;
     case DetailFeature::JavaChat:
         javaChatEnabled = !javaChatEnabled;
+        if (deferLiteApply) liteApplyPending = true; else ApplyLite();   // session-only chat profile; in-world changes wait for title reload
         break;
 
     case DetailFeature::DebugMenu:
@@ -6550,7 +6972,7 @@ void ToggleFeature(
     case DetailFeature::LeftHand:
         leftHandEnabled =
             !leftHandEnabled;
-        ApplyLite();   // same generated pack
+        if (deferLiteApply) liteApplyPending = true; else ApplyLite();   // same generated pack
         break;
 
     case DetailFeature::HiveStats:
@@ -6559,16 +6981,8 @@ void ToggleFeature(
         break;
 
     case DetailFeature::HiveUtils:
-        // ON -> pause the whole group. OFF -> resume it; with nothing switched on inside yet,
-        // open the details so the sub-features can be chosen.
-        if (hiveEnabled && (partyAutoAcceptEnabled || autoRqEnabled))
-            hiveEnabled = false;
-        else
-        {
-            hiveEnabled = true;
-            if (!partyAutoAcceptEnabled && !autoRqEnabled)
-                detailFeature = DetailFeature::HiveUtils;
-        }
+        // The master switch is independent of which child modules are selected.
+        hiveEnabled = !hiveEnabled;
         break;
 
     default:
@@ -6588,6 +7002,7 @@ void ToggleFeature(
 // has never been seen hidden on this PC, the detection is not usable and keys work as before.
 bool GameOwnsKeyboard()
 {
+    if(MinimapHud::open)return false;
     static bool everHidden = false;
 
     CURSORINFO info{};
@@ -6967,7 +7382,9 @@ const DetailFeature kFeatureList[] =
     DetailFeature::CpsLimiter,
     DetailFeature::ItemCounter,
     DetailFeature::PackDisplay,
-    DetailFeature::JavaChat
+    DetailFeature::Minimap,
+    DetailFeature::JavaChat,
+    DetailFeature::Combo
 };
 
 const int kFeatureCount = sizeof(kFeatureList) / sizeof(kFeatureList[0]);
@@ -7023,6 +7440,7 @@ bool FeatureIsHud(DetailFeature f)
 {
     switch (f)
     {
+    case DetailFeature::Combo:
     case DetailFeature::Keystrokes:
     case DetailFeature::CPS:
     case DetailFeature::Armor:
@@ -7039,6 +7457,7 @@ bool FeatureIsHud(DetailFeature f)
     case DetailFeature::Timer:
     case DetailFeature::PackDisplay:
     case DetailFeature::JavaChat:
+    case DetailFeature::Minimap:
         return true;
 
     default:
@@ -7252,7 +7671,9 @@ const wchar_t* FeatureGlyph(DetailFeature f)
 {
     switch (f)
     {
+    case DetailFeature::Minimap: return L"◉";
     case DetailFeature::Keystrokes:      return L"\u2328";
+    case DetailFeature::Combo:           return L"\u00D7";
     case DetailFeature::CPS:             return L"\u26A1";
     case DetailFeature::Armor:           return L"\u25C6";
     case DetailFeature::Arrows:          return L"\u27A4";
@@ -7302,7 +7723,9 @@ const wchar_t* FeatureDescription(DetailFeature f)
 {
     switch (f)
     {
+    case DetailFeature::Minimap: return L"Terrain and mob faces|M opens the explored map";
     case DetailFeature::Keystrokes:      return L"Shows WASD, jump and mouse|inputs on screen";
+    case DetailFeature::Combo:           return L"Consecutive confirmed hits|Resets when you are hit";
     case DetailFeature::CPS:             return L"Displays your left and right|clicks per second";
     case DetailFeature::Armor:           return L"Your armor as icons, with|durability (optional)";
     case DetailFeature::Arrows:          return L"Arrows left in your|inventory";
@@ -7341,7 +7764,7 @@ const wchar_t* FeatureDescription(DetailFeature f)
     case DetailFeature::CpsLimiter:      return L"Clicks over your CPS limit|never reach the game";
     case DetailFeature::ItemCounter:     return L"Hold Alt over an item to|count all of it you have";
     case DetailFeature::PackDisplay:     return L"The texture packs you|have on, on the HUD";
-    case DetailFeature::JavaChat:        return L"チャットを左下に表示|HUD調整で位置を変更";
+    case DetailFeature::JavaChat:        return Lang::T(L"チャットを左下に表示|HUD調整で位置を変更", L"Shows chat at the bottom left|Move it in HUD Edit");
     default:                             return L"|";
     }
 }
@@ -8115,8 +8538,7 @@ void SaveReplayMeta()
 {
     const std::wstring path = ReplayMetaPath();
     if (path.empty()) return;
-    std::ofstream out(std::filesystem::path(path), std::ios::binary | std::ios::trunc);
-    out << ReplayLibrary::SerializeMeta(replayMeta);
+    ReplaceFileBytes(path, ReplayLibrary::SerializeMeta(replayMeta));   // a failed save keeps the old list (2026-11-20)
 }
 
 long ReplayToday()
@@ -8433,9 +8855,9 @@ bool HandleReplayControlsClick(int mx, int my)
 
 // ---- The replay bar at the bottom of the game while a recording plays (2026-11-11) ----
 // Like a video player: progress (click to jump), pause, 15 s / 5 s back and on, the time, the speed, the camera and
-// Exit. The keys work at any time (K pause, Left/Right 5 s, with Shift 15 s, Up/Down speed); the mouse while the
+// Exit. The keys work at any time (replayPauseKey, K by default: pause, Left/Right 5 s, with Shift 15 s, Up/Down speed); the mouse while the
 // HUD menu is open (G), which is when the game lets go of the cursor.
-struct ReplayBarLayout { RECT bar, track, pause, back15, back5, time, fwd5, fwd15, speed, camera, exit; };
+struct ReplayBarLayout { RECT bar, track, pause, back15, back5, time, fwd5, fwd15, speed, camera, edit, exit; };
 ReplayBarLayout ReplayBarRects(int w, int h)
 {
     ReplayBarLayout l{};
@@ -8447,8 +8869,8 @@ ReplayBarLayout ReplayBarRects(int w, int h)
     const int top = y + 26, bottom = y + 62;
     auto next = [&](int width) { RECT r{cx, top, cx + width, bottom}; cx += width + 8; return r; };
     l.pause = next(48); l.back15 = next(48); l.back5 = next(48);
-    l.time = next(std::max(140, bw - 12 - 8 * 10 - 48 * 5 - 64 - 92 - 76));
-    l.fwd5 = next(48); l.fwd15 = next(48); l.speed = next(64); l.camera = next(92); l.exit = next(76);
+    l.time = next(std::max(120, bw - 12 - 8 * 11 - 48 * 5 - 64 - 92 - 56 - 76));
+    l.fwd5 = next(48); l.fwd15 = next(48); l.speed = next(64); l.camera = next(92); l.edit = next(56); l.exit = next(76);
     return l;
 }
 
@@ -8471,9 +8893,10 @@ void JumpReplay(int64_t deltaMs)
     ReplayPlayer::SeekTo((uint64_t)to);
 }
 
+bool ReplayEditorShown();
 void DrawReplayTimeline(HDC hdc, int w, int h)
 {
-    if (!ReplayPlayer::Active()) return;
+    if (!ReplayPlayer::Active() || ReplayEditorShown()) return;
     const ReplayPlayer::Status st = ReplayPlayer::Get();
     const ReplayBarLayout l = ReplayBarRects(w, h);
     DrawRoundBox(hdc, l.bar.left, l.bar.top, l.bar.right - l.bar.left, l.bar.bottom - l.bar.top, 14, RGB(28,26,32));
@@ -8496,10 +8919,13 @@ void DrawReplayTimeline(HDC hdc, int w, int h)
     button(l.fwd5, L"+5", false); button(l.fwd15, L"+15", false);
     button(l.speed, ReplaySpeedText(st.speed), false);
     button(l.camera, st.freeCamera ? L"Free cam" : L"Eyes view", false);
+    button(l.edit, L"Edit", false);
     button(l.exit, L"Exit", true);
     DrawTextSimple(hdc, l.bar.left + 16, l.bar.bottom + 4,
-                   menuOpen ? L"Click the bar. Fly with the game's keys (spectator). G closes the menu."
-                            : L"K pause   Left/Right 5 s (Shift 15 s)   Up/Down speed   G: use the mouse",
+                   menuOpen ? L"Click the bar. G closes the menu."
+                            : st.freeCamera ? KeyName(replayPauseKey) + L" pause   " + KeyName(replayPointKey) + L" camera point (" +
+                                                  KeyName(replayUndoKey) + L" undo)   Left/Right 5 s   Up/Down speed   Hold Alt: mouse   F1 hides all"
+                                            : KeyName(replayPauseKey) + L" pause   Left/Right 5 s (Shift 15 s)   Up/Down speed   Click the bar   F1 hides all",
                    RGB(200,200,210), 11);
 }
 
@@ -8524,18 +8950,779 @@ bool HandleReplayTimelineClick(int mx, int my)
     else if (PtInRect(&l.fwd15, p)) JumpReplay(15000);
     else if (PtInRect(&l.speed, p)) StepReplaySpeed(st.speed >= 4.f ? -4 : +1);
     else if (PtInRect(&l.camera, p)) ReplayPlayer::SetFreeCamera(!st.freeCamera);
+    else if (PtInRect(&l.edit, p)) { void OpenReplayEditor(); OpenReplayEditor(); }
     else if (PtInRect(&l.exit, p)) { ReplayPlayer::Stop(); SetReplayNotice(L"Playback stopped."); }
     return true;
+}
+
+// ---- Replay camera points (docs/superpowers/specs/2026-11-12-replay-camera-editor-design.md, parts 1-2) ----
+// The points of the recording being played; loaded from (and saved to) <recording>.camera-default.json beside it.
+std::vector<MyClientReplayCamera::Keyframe> replayPath;
+std::vector<uint64_t> replayPathPlaced;    // times of the points placed with the key, newest last (the undo key)
+std::wstring replayPathFile;               // the recording the points belong to
+bool replayPathAuto = false;               // the camera follows the points (stops when you move yourself)
+MyClientReplayCamera::CameraFile replayCameraFile;   // never writes over a file it could not read
+
+void SaveReplayPath()
+{
+    if (replayPathFile.empty()) return;
+    std::string error;
+    if (!replayCameraFile.Save(replayPath, error))
+        SetReplayNotice(L"Camera points not saved: " + Utf8ToWide(error));
+}
+
+// A new recording plays: its saved points, if any. A file that cannot be read is reported and left as it is.
+void LoadReplayPathFor(const std::wstring& recording)
+{
+    replayPathFile = recording;
+    replayPath.clear();
+    replayPathPlaced.clear();
+    replayPathAuto = false;
+    if (recording.empty()) return;
+    std::string error;
+    if (!replayCameraFile.Load(std::filesystem::path(recording), replayPath, error))
+    {
+        SetReplayNotice(L"Camera points not loaded (" + Utf8ToWide(error) + L"): " + replayCameraFile.Path().filename().wstring());
+        return;
+    }
+    replayPathAuto = replayPath.size() >= 2;
+}
+
+// Once per HUD tick: the point keys (free camera only), moving yourself stops the camera path, resuming restarts it.
+void PollReplayCameraKeys(bool usable)
+{
+    const ReplayPlayer::Status st = ReplayPlayer::Get();
+    const bool playing = ReplayPlayer::Active() && (st.phase == ReplayPlayer::Phase::Playing || st.phase == ReplayPlayer::Phase::Finished);
+    if (!ReplayPlayer::Active()) { if (!replayPathFile.empty()) LoadReplayPathFor(L""); return; }
+    if (st.file != replayPathFile) LoadReplayPathFor(st.file);
+
+    static bool prevPoint = false, prevUndo = false, wasPaused = false;
+    const bool ready = usable && playing && st.freeCamera && !st.rewinding;
+    const bool point = ready && replayPointKey && IsKeyDown(replayPointKey);
+    const bool undo = ready && replayUndoKey && IsKeyDown(replayUndoKey);
+    if (point && !prevPoint)
+    {
+        MinecraftDataProvider::Camera cam{};
+        if (!MinecraftDataProvider::GetCamera(cam))
+            SetReplayNotice(L"Camera point not added: the camera is not known yet (needs the updated DLL)");
+        else
+        {
+            const MyClientReplayCamera::Keyframe k{st.positionMs, MyClientReplayCamera::Pose{cam.x, cam.y, cam.z, cam.pitch, cam.yaw},
+                                                   MyClientReplayCamera::Ease::InOut};
+            if (!MyClientReplayCamera::AddOrReplace(replayPath, k))
+                SetReplayNotice(L"Camera point not added: at most 64 points");
+            else
+            {
+                replayPathPlaced.push_back(k.t);
+                SaveReplayPath();
+                SetReplayNotice(L"Camera point " + std::to_wstring(replayPath.size()) + L" added at " + ReplayClock(k.t));
+            }
+        }
+    }
+    if (undo && !prevUndo)
+    {
+        bool removed = false;
+        while (!removed && !replayPathPlaced.empty())
+        {
+            const uint64_t t = replayPathPlaced.back();
+            replayPathPlaced.pop_back();
+            for (auto it = replayPath.begin(); it != replayPath.end(); ++it)
+                if ((it->t > t ? it->t - t : t - it->t) <= MyClientReplayCamera::ReplaceWithinMs) { replayPath.erase(it); removed = true; break; }
+        }
+        if (removed) { SaveReplayPath(); SetReplayNotice(L"Last camera point removed (" + std::to_wstring(replayPath.size()) + L" left)"); }
+        else SetReplayNotice(L"No camera point placed in this playback to remove");
+        if (replayPath.size() < 2) replayPathAuto = false;
+    }
+    prevPoint = point;
+    prevUndo = undo;
+
+    // Moving yourself (the game's movement keys) hands the camera back to you; resuming the playback gives it to the path.
+    if (ready && replayPathAuto)
+        for (int vk : {int('W'), int('A'), int('S'), int('D'), int(VK_SPACE), int(VK_LSHIFT)})
+            if (IsKeyDown(vk)) { replayPathAuto = false; break; }
+    if (wasPaused && !st.paused && replayPath.size() >= 2) replayPathAuto = true;
+    wasPaused = st.paused;
+}
+
+// Every HUD tick: the path and the replay clock for the DLL, which moves the free camera along it while active.
+void PublishReplayCameraPath()
+{
+    const ReplayPlayer::Status st = ReplayPlayer::Get();
+    const bool playing = ReplayPlayer::Active() && (st.phase == ReplayPlayer::Phase::Playing || st.phase == ReplayPlayer::Phase::Finished);
+    // Only in the replay's world: a game that left it without a word must not have its next server's player moved.
+    const bool active = playing && MinecraftDataProvider::IsInWorld() && replayPathAuto && st.freeCamera && !st.rewinding &&
+                        replayPath.size() >= 2;
+    // During an export the camera is put at the frame's exact time (positionMs is whole milliseconds: 16/17 ms steps).
+    double exportTime = -1.0;
+    bool ExportFrameTime(double& t);
+    const double timeMs = ExportFrameTime(exportTime) ? exportTime : static_cast<double>(st.positionMs);
+    MinecraftDataProvider::PublishReplayCamera(replayPath, active, timeMs, st.speed,
+                                               st.paused || st.phase == ReplayPlayer::Phase::Finished, st.positionAtMicros);
+}
+
+// The points as see-through heads (a 0.5 block cube at the eye position) with a line where each one looks.
+void DrawReplayMarkers(HDC hdc, int width, int height)
+{
+    if (ReplayEditorShown()) return;   // the editor covers the picture (the preview shows the game only)
+    if (replayPath.empty() || menuOpen || hideAllUi || width < 50 || height < 50 || !ReplayPlayer::Active()) return;
+    const ReplayPlayer::Status st = ReplayPlayer::Get();
+    if (!st.freeCamera) return;
+    MinecraftDataProvider::Camera cam{};
+    if (!MinecraftDataProvider::GetCamera(cam)) return;
+    const CamProjector proj(cam, width, height);
+    HPEN pen = CreatePen(PS_SOLID, 2, RGB(235, 235, 245));
+    HPEN look = CreatePen(PS_SOLID, 2, RGB(230, 64, 72));
+    const double rad = 3.14159265358979323846 / 180.0;
+    for (const auto& k : replayPath)
+    {
+        const double h = 0.25;
+        const CamV c[8] = {{k.pose.x - h, k.pose.y - h, k.pose.z - h}, {k.pose.x + h, k.pose.y - h, k.pose.z - h},
+                           {k.pose.x + h, k.pose.y - h, k.pose.z + h}, {k.pose.x - h, k.pose.y - h, k.pose.z + h},
+                           {k.pose.x - h, k.pose.y + h, k.pose.z - h}, {k.pose.x + h, k.pose.y + h, k.pose.z - h},
+                           {k.pose.x + h, k.pose.y + h, k.pose.z + h}, {k.pose.x - h, k.pose.y + h, k.pose.z + h}};
+        static const int edges[12][2] = {{0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},{0,4},{1,5},{2,6},{3,7}};
+        for (const auto& e : edges) proj.Line(hdc, c[e[0]], c[e[1]], pen);
+        const double yaw = k.pose.yaw * rad, pitch = k.pose.pitch * rad;
+        const CamV from{k.pose.x, k.pose.y, k.pose.z};
+        const CamV to{k.pose.x - std::sin(yaw) * std::cos(pitch), k.pose.y - std::sin(pitch), k.pose.z + std::cos(yaw) * std::cos(pitch)};
+        proj.Line(hdc, from, to, look);
+    }
+    DeleteObject(pen);
+    DeleteObject(look);
+}
+
+// ---- Replay editor and video export (spec parts 3 and 5; plan docs/superpowers/plans/2026-11-12-replay-editor-and-export.md) ----
+// "Edit" on the replay bar opens it: the game picture shrunk into the preview box (in-game drawing; otherwise the box
+// is left clear and the game shows through), the selected point's values on the right, the timeline at the bottom.
+// The preview is only for looking. Export runs the recording one frame at a time and the DLL writes the .mp4.
+bool replayEditorOpen = false;
+int editorPressX = 0;                    // where a point was pressed (a click without moving keeps its time)
+bool ExportRunning();
+bool ReplayEditorShown() { return replayEditorOpen && !menuOpen && !hideAllUi; }
+int editorSelected = -1;                 // index in replayPath
+bool editorDragging = false;
+uint64_t editorDragFrom = 0;             // the dragged point's time when the drag began
+bool editorHaveFreePose = false;         // where the free camera was when the editor opened
+MyClientReplayCamera::Pose editorFreePose{};
+enum class EditorPanel { Point, Export };
+EditorPanel editorPanel = EditorPanel::Point;
+std::wstring editorNotice;
+
+int exportResolution = 1;                // MyClientReplayExport::Resolution (1080p)
+int exportFps = 60;
+int exportQuality = 1;                   // MyClientReplayExport::Quality (medium)
+uint64_t exportStartMs = 0, exportEndMs = 0;
+bool exportRangeSet = false;
+
+struct ExportRun {
+    enum class Phase { Off, Seeking, Capturing, Stepping, Finishing, Done, Failed } phase = Phase::Off;
+    uint32_t id = 0;
+    bool sawRewind = false;           // the seek to the start reconnected (the world loads again)
+    ULONGLONG settledSince = 0;       // when the playback was first seen at the start, settled
+    MyClientReplayExport::Plan plan;
+    uint32_t frame = 0, total = 0;
+    ULONGLONG startedAt = 0, waitingSince = 0;
+    std::wstring path, message;
+} exportRun;
+
+struct EditorLayout {
+    RECT toolbar, preview, panel, timeline, track;
+    RECT play, back15, back5, fwd5, fwd15, saveCopy, open, exportButton, close;
+};
+EditorLayout EditorRects(int w, int h)
+{
+    EditorLayout l{};
+    l.toolbar = {16, 12, w - 16, 52};
+    int pw = (w - 48) * 2 / 3;
+    int ph = h > 0 ? pw * h / std::max(1, w) : 0;
+    const int maxH = std::max(120, h - 64 - 190);
+    if (ph > maxH) { ph = maxH; pw = ph * w / std::max(1, h); }
+    l.preview = {16, 64, 16 + pw, 64 + ph};
+    l.panel = {l.preview.right + 16, 64, w - 16, l.preview.bottom};
+    l.timeline = {16, l.preview.bottom + 16, w - 16, h - 16};
+    l.track = {l.timeline.left + 16, l.timeline.top + 60, l.timeline.right - 16, l.timeline.top + 72};
+    int x = 24;
+    const auto next = [&](int width) { RECT r{x, 18, x + width, 46}; x += width + 6; return r; };
+    l.play = next(56); l.back15 = next(44); l.back5 = next(44); l.fwd5 = next(44); l.fwd15 = next(44);
+    x += 12;
+    l.saveCopy = next(96); l.open = next(110); l.exportButton = next(80);
+    l.close = {w - 24 - 70, 18, w - 24, 46};
+    return l;
+}
+
+RECT ExportCancelRect(const EditorLayout& l) { return RECT{l.panel.left + 16, l.panel.top + 150, l.panel.left + 136, l.panel.top + 182}; }
+
+bool In(const RECT& r, int x, int y) { return x >= r.left && x < r.right && y >= r.top && y < r.bottom; }
+
+int TimelineX(const EditorLayout& l, uint64_t t, uint64_t length)
+{
+    if (!length) return l.track.left;
+    return l.track.left + static_cast<int>(static_cast<double>(std::min(t, length)) / static_cast<double>(length) * (l.track.right - l.track.left));
+}
+uint64_t TimelineTime(const EditorLayout& l, int x, uint64_t length)
+{
+    const double f = std::clamp(static_cast<double>(x - l.track.left) / std::max(1L, l.track.right - l.track.left), 0.0, 1.0);
+    return static_cast<uint64_t>(f * static_cast<double>(length));
+}
+
+const wchar_t* EaseLabel(MyClientReplayCamera::Ease e)
+{
+    switch (e)
+    {
+    case MyClientReplayCamera::Ease::Linear: return L"Constant";
+    case MyClientReplayCamera::Ease::In: return L"Speed up";
+    case MyClientReplayCamera::Ease::Out: return L"Slow down";
+    case MyClientReplayCamera::Ease::InOut: return L"Smooth";
+    case MyClientReplayCamera::Ease::Hold: return L"Hold";
+    case MyClientReplayCamera::Ease::Cut: return L"Cut";
+    }
+    return L"Smooth";
+}
+
+void OpenReplayEditor()
+{
+    if (!ReplayPlayer::Active()) return;
+    replayEditorOpen = true;
+    editorPanel = EditorPanel::Point;
+    editorSelected = replayPath.empty() ? -1 : 0;
+    editorNotice.clear();
+    MinecraftDataProvider::Camera cam{};
+    editorHaveFreePose = ReplayPlayer::Get().freeCamera && MinecraftDataProvider::GetCamera(cam);
+    if (editorHaveFreePose) editorFreePose = MyClientReplayCamera::Pose{cam.x, cam.y, cam.z, cam.pitch, cam.yaw};
+    if (!exportRangeSet && replayPath.size() >= 2) { exportStartMs = replayPath.front().t; exportEndMs = replayPath.back().t; }
+}
+
+void CloseReplayEditor()
+{
+    if (exportRun.phase != ExportRun::Phase::Off && exportRun.phase != ExportRun::Phase::Done && exportRun.phase != ExportRun::Phase::Failed)
+        return;   // an export runs: Cancel first
+    replayEditorOpen = false;
+    editorDragging = false;
+    exportRun.phase = ExportRun::Phase::Off;
+}
+
+// After a change to the points: keep them in time order, save, keep the selection on the same point.
+void EditorPointsChanged(uint64_t selectedTime)
+{
+    std::sort(replayPath.begin(), replayPath.end(), [](const auto& a, const auto& b) { return a.t < b.t; });
+    editorSelected = -1;
+    for (size_t i = 0; i < replayPath.size(); ++i)
+        if (replayPath[i].t == selectedTime) editorSelected = static_cast<int>(i);
+    SaveReplayPath();
+    if (replayPath.size() < 2) replayPathAuto = false;
+}
+
+// Moves the selected point to time t; refused when another point is within 50 ms (they would merge).
+bool EditorMovePoint(int index, uint64_t t)
+{
+    if (index < 0 || index >= static_cast<int>(replayPath.size())) return false;
+    for (size_t i = 0; i < replayPath.size(); ++i)
+        if (static_cast<int>(i) != index && (replayPath[i].t > t ? replayPath[i].t - t : t - replayPath[i].t) <= MyClientReplayCamera::ReplaceWithinMs)
+            return false;
+    replayPath[index].t = t;
+    EditorPointsChanged(t);
+    return true;
+}
+
+void EditorDeleteSelected()
+{
+    if (editorSelected < 0 || editorSelected >= static_cast<int>(replayPath.size())) return;
+    replayPath.erase(replayPath.begin() + editorSelected);
+    editorSelected = replayPath.empty() ? -1 : std::min(editorSelected, static_cast<int>(replayPath.size()) - 1);
+    SaveReplayPath();
+    if (replayPath.size() < 2) replayPathAuto = false;
+}
+
+// The camera files of the playing recording, one after another ("Open" cycles through them).
+void EditorOpenNextCamera()
+{
+    if (replayPathFile.empty()) return;
+    const std::filesystem::path recording(replayPathFile);
+    const auto names = MyClientReplayCamera::CameraNames(recording);
+    if (names.empty()) { editorNotice = L"No saved cameras for this recording yet"; return; }
+    size_t at = 0;
+    for (size_t i = 0; i < names.size(); ++i)
+        if (names[i] == replayCameraFile.Name()) at = (i + 1) % names.size();
+    std::string error;
+    std::vector<MyClientReplayCamera::Keyframe> loaded;
+    if (!replayCameraFile.Load(recording, names[at], loaded, error))
+        editorNotice = L"Camera \"" + Utf8ToWide(names[at]) + L"\" not opened: " + Utf8ToWide(error);
+    else
+    {
+        replayPath = std::move(loaded);
+        replayPathPlaced.clear();
+        editorSelected = replayPath.empty() ? -1 : 0;
+        replayPathAuto = replayPath.size() >= 2;
+        editorNotice = L"Opened camera \"" + Utf8ToWide(names[at]) + L"\" (" + std::to_wstring(replayPath.size()) + L" points)";
+    }
+}
+
+// "Save copy": the points as a new camera file with the next free number; editing goes on in the copy.
+void EditorSaveCopy()
+{
+    if (replayPathFile.empty()) return;
+    const std::filesystem::path recording(replayPathFile);
+    const std::string name = MyClientReplayCamera::NextCameraName(recording);
+    std::vector<MyClientReplayCamera::Keyframe> none;
+    std::string error;
+    MyClientReplayCamera::CameraFile copy;
+    if (!copy.Load(recording, name, none, error) || !copy.Save(replayPath, error))
+    {
+        editorNotice = L"Not saved: " + Utf8ToWide(error);
+        return;
+    }
+    replayCameraFile = copy;
+    editorNotice = L"Saved as camera \"" + Utf8ToWide(name) + L"\"";
+}
+
+std::filesystem::path DefaultVideoFolder()
+{
+    PWSTR videos = nullptr;
+    std::filesystem::path folder;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Videos, 0, nullptr, &videos)) && videos) folder = std::filesystem::path(videos) / L"OriginX";
+    if (videos) CoTaskMemFree(videos);
+    if (folder.empty())
+    {
+        wchar_t profile[MAX_PATH]{};
+        const DWORD n = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+        folder = std::filesystem::path(n && n < MAX_PATH ? profile : L".") / L"Videos" / L"OriginX";
+    }
+    return folder;
+}
+
+int ClientWidth() { RECT r{}; return overlayWindow && GetClientRect(overlayWindow, &r) ? r.right : 0; }
+int ClientHeight() { RECT r{}; return overlayWindow && GetClientRect(overlayWindow, &r) ? r.bottom : 0; }
+
+bool ExportRunning()
+{
+    return exportRun.phase != ExportRun::Phase::Off && exportRun.phase != ExportRun::Phase::Done && exportRun.phase != ExportRun::Phase::Failed;
+}
+
+// Stops the export: the DLL is told to cancel (again every tick while it still says Running, see TickExport), and the
+// half-written file goes (the DLL deletes it; if the DLL is gone, the HUD tries).
+void ExportFail(const std::wstring& why)
+{
+    exportRun.phase = ExportRun::Phase::Failed;
+    exportRun.message = why;
+    MinecraftDataProvider::ReplayVideo([](MyClientReplayVideo::Shared& s) { s.finish = MyClientReplayVideo::Cancel; });
+    std::error_code ec;
+    if (!exportRun.path.empty()) std::filesystem::remove(std::filesystem::path(exportRun.path), ec);   // fails while the DLL holds it: fine
+}
+
+void StartExport()
+{
+    const ReplayPlayer::Status st = ReplayPlayer::Get();
+    MyClientReplayExport::Plan plan{exportStartMs, std::min(exportEndMs, st.lengthMs), exportFps};
+    if (!plan.Valid()) { editorNotice = L"Choose an end after the start"; return; }
+    int width = 0, height = 0;
+    MyClientReplayExport::OutputSize(static_cast<MyClientReplayExport::Resolution>(exportResolution), ClientWidth(), ClientHeight(), width, height);
+    if (width < 16 || height < 16) { editorNotice = L"The game window size is not known"; return; }
+    std::filesystem::path recording(replayPathFile);
+    recording.replace_extension();
+    const std::filesystem::path path = MyClientReplayExport::UniqueVideoPath(DefaultVideoFolder(),
+        WideToUtf8(recording.filename().wstring()) + "_" + replayCameraFile.Name());
+    exportRun = ExportRun{};
+    exportRun.id = static_cast<uint32_t>(GetTickCount64() & 0x7FFFFFFF) | 1u;
+    exportRun.plan = plan;
+    exportRun.total = plan.FrameCount();
+    exportRun.path = path.wstring();
+    exportRun.startedAt = exportRun.waitingSince = GetTickCount64();
+    exportRun.phase = ExportRun::Phase::Seeking;
+    const uint32_t bitrate = MyClientReplayExport::Bitrate(static_cast<MyClientReplayExport::Quality>(exportQuality), width, height, exportFps);
+    MinecraftDataProvider::ReplayVideo([&](MyClientReplayVideo::Shared& s) {
+        s.exportId = exportRun.id;
+        s.exportWidth = static_cast<uint32_t>(width); s.exportHeight = static_cast<uint32_t>(height);
+        s.exportFps = static_cast<uint32_t>(exportFps); s.exportBitrate = bitrate;
+        s.requestFrame = MyClientReplayVideo::NoFrame;
+        s.waitFrames = 3;
+        s.finish = MyClientReplayVideo::KeepGoing;
+        MyClientReplayVideo::SetPath(s, exportRun.path);
+    });
+    ReplayPlayer::SetPaused(true);
+    if (!st.freeCamera) ReplayPlayer::SetFreeCamera(true);   // the path moves the free camera
+    replayPathAuto = replayPath.size() >= 2;
+    ReplayPlayer::SeekTo(plan.startMs);
+}
+
+// Once per HUD tick while an export runs: seek to the start, then frame by frame: ask the DLL, wait for it, step.
+void TickExport()
+{
+    using Phase = ExportRun::Phase;
+    if (exportRun.phase == Phase::Failed && exportRun.id)
+    {
+        // until the DLL has let go of the file (a cancel can be missed when the lock is busy)
+        MinecraftDataProvider::ReplayVideo([](MyClientReplayVideo::Shared& s) {
+            if (s.dllExportId == s.exportId && s.state == MyClientReplayVideo::Running) s.finish = MyClientReplayVideo::Cancel;
+            s.hudAt = GetTickCount64();
+        });
+        return;
+    }
+    if (exportRun.phase == Phase::Off || exportRun.phase == Phase::Done || exportRun.phase == Phase::Failed) return;
+    const ReplayPlayer::Status st = ReplayPlayer::Get();
+    if (!ReplayPlayer::Active()) { ExportFail(L"the playback stopped"); return; }
+    MyClientReplayVideo::Shared s{};
+    if (!MinecraftDataProvider::ReplayVideo([&](MyClientReplayVideo::Shared& live) { live.hudAt = GetTickCount64(); s = live; })) return;
+    const ULONGLONG now = GetTickCount64();
+    if (s.dllExportId == exportRun.id && s.state == MyClientReplayVideo::Failed) { ExportFail(Utf8ToWide(s.error)); return; }
+    if (now - exportRun.waitingSince > 15000) { ExportFail(L"the game did not answer for 15 s"); return; }
+    if (!st.paused) ReplayPlayer::SetPaused(true);
+    const bool settled = !st.rewinding && (st.phase == ReplayPlayer::Phase::Playing || st.phase == ReplayPlayer::Phase::Finished) &&
+                         st.freeCamera;
+    switch (exportRun.phase)
+    {
+    case Phase::Seeking:
+    {
+        if (st.rewinding) { exportRun.sawRewind = true; exportRun.settledSince = 0; exportRun.waitingSince = now; return; }
+        const bool atStart = settled && (st.positionMs > exportRun.plan.startMs ? st.positionMs - exportRun.plan.startMs
+                                                                                 : exportRun.plan.startMs - st.positionMs) <= 1;
+        if (!atStart) { exportRun.settledSince = 0; return; }
+        if (!exportRun.settledSince) exportRun.settledSince = now;
+        // After a reconnect the world loads again: give it time before the first frame (review 2026-11-12).
+        if (now - exportRun.settledSince < (exportRun.sawRewind ? 3000u : 200u)) { exportRun.waitingSince = now; return; }
+        if (s.dllExportId != exportRun.id || s.state != MyClientReplayVideo::Running) return;   // the DLL has not opened the file yet
+    }
+        exportRun.phase = Phase::Capturing;
+        exportRun.waitingSince = now;
+        MinecraftDataProvider::ReplayVideo([&](MyClientReplayVideo::Shared& live) { live.requestFrame = 0; });
+        return;
+    case Phase::Capturing:
+        if (s.doneFrame != exportRun.frame) return;
+        if (exportRun.frame + 1 >= exportRun.total)
+        {
+            exportRun.phase = Phase::Finishing;
+            exportRun.waitingSince = now;
+            MinecraftDataProvider::ReplayVideo([](MyClientReplayVideo::Shared& live) { live.finish = MyClientReplayVideo::Close; });
+            return;
+        }
+        ++exportRun.frame;
+        exportRun.phase = Phase::Stepping;
+        exportRun.waitingSince = now;
+        ReplayPlayer::Step(exportRun.plan.StepMs());
+        return;
+    case Phase::Stepping:
+        if (static_cast<double>(st.positionMs) > exportRun.plan.TimeOf(exportRun.frame) + exportRun.plan.StepMs() + 1.0 || st.rewinding)
+        {
+            ExportFail(L"the playback jumped during the export");
+            return;
+        }
+        if (static_cast<double>(st.positionMs) + 1.0 < std::floor(exportRun.plan.TimeOf(exportRun.frame))) return;
+        exportRun.phase = Phase::Capturing;
+        exportRun.waitingSince = now;
+        MinecraftDataProvider::ReplayVideo([&](MyClientReplayVideo::Shared& live) { live.requestFrame = exportRun.frame; });
+        return;
+    case Phase::Finishing:
+        if (s.dllExportId == exportRun.id && s.state == MyClientReplayVideo::Done)
+        {
+            exportRun.phase = Phase::Done;
+            exportRun.message = L"Saved: " + exportRun.path;
+        }
+        return;
+    default:
+        return;
+    }
+}
+
+// The time the frame being exported shows (false when no export is capturing).
+bool ExportFrameTime(double& t)
+{
+    if (exportRun.phase != ExportRun::Phase::Capturing && exportRun.phase != ExportRun::Phase::Stepping && exportRun.phase != ExportRun::Phase::Seeking)
+        return false;
+    t = exportRun.plan.TimeOf(exportRun.phase == ExportRun::Phase::Seeking ? 0 : exportRun.frame);
+    return true;
+}
+
+void CancelExport()
+{
+    if (exportRun.phase == ExportRun::Phase::Off || exportRun.phase == ExportRun::Phase::Done || exportRun.phase == ExportRun::Phase::Failed) return;
+    ExportFail(L"cancelled");
+}
+
+// Every HUD tick: the preview box for the DLL (only with in-game drawing; the box is then clear in this picture).
+void PublishEditorPreview()
+{
+    const int w = ClientWidth(), h = ClientHeight();
+    const bool on = replayEditorOpen && inGameDrawing && w > 0 && h > 0 && !hideAllUi && !menuOpen;
+    const EditorLayout l = EditorRects(w, h);
+    MinecraftDataProvider::ReplayVideo([&](MyClientReplayVideo::Shared& s) {
+        s.hudAt = GetTickCount64();
+        s.previewW = on ? static_cast<float>(l.preview.right - l.preview.left) / w : 0.f;
+        s.previewH = on ? static_cast<float>(l.preview.bottom - l.preview.top) / h : 0.f;
+        s.previewX = on ? static_cast<float>(l.preview.left) / w : 0.f;
+        s.previewY = on ? static_cast<float>(l.preview.top) / h : 0.f;
+    });
+}
+
+// The point drag: polled (the button may be let go anywhere).
+void PollEditorDrag()
+{
+    if (!editorDragging) return;
+    const ReplayPlayer::Status st = ReplayPlayer::Get();
+    if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) return;
+    editorDragging = false;
+    POINT cursor{};
+    if (!GetCursorPos(&cursor) || !ScreenToClient(overlayWindow, &cursor)) return;
+    const EditorLayout l = EditorRects(ClientWidth(), ClientHeight());
+    if (std::abs(cursor.x - editorPressX) < 3) return;   // a click: select only, the time stays
+    const uint64_t t = TimelineTime(l, cursor.x, st.lengthMs);
+    if (editorSelected >= 0 && t != editorDragFrom && !EditorMovePoint(editorSelected, t))
+        editorNotice = L"Too close to another point";
+}
+
+void TickReplayEditor()
+{
+    if (!ReplayPlayer::Active())
+    {
+        if (ExportRunning()) ExportFail(L"the playback stopped");
+        replayEditorOpen = false;
+        editorDragging = false;
+    }
+    PollEditorDrag();
+    TickExport();
+    PublishEditorPreview();
+}
+
+// A click in the editor (overlay coordinates). Always taken while it is open.
+void HandleEditorClickAt(int mx, int my)
+{
+    const ReplayPlayer::Status st = ReplayPlayer::Get();
+    const EditorLayout l = EditorRects(ClientWidth(), ClientHeight());
+    const bool shift = IsKeyDown(VK_SHIFT);
+    editorNotice.clear();
+    const bool running = exportRun.phase != ExportRun::Phase::Off && exportRun.phase != ExportRun::Phase::Done &&
+                         exportRun.phase != ExportRun::Phase::Failed;
+    // toolbar
+    if (In(l.close, mx, my)) { if (running) CancelExport(); else CloseReplayEditor(); return; }
+    if (running)
+    {
+        if (In(ExportCancelRect(l), mx, my)) CancelExport();
+        return;
+    }
+    if (In(l.play, mx, my)) { ReplayPlayer::SetPaused(!st.paused); if (st.paused && replayPath.size() >= 2) replayPathAuto = true; return; }
+    if (In(l.back15, mx, my)) { JumpReplay(-15000); return; }
+    if (In(l.back5, mx, my)) { JumpReplay(-5000); return; }
+    if (In(l.fwd5, mx, my)) { JumpReplay(5000); return; }
+    if (In(l.fwd15, mx, my)) { JumpReplay(15000); return; }
+    if (In(l.saveCopy, mx, my)) { EditorSaveCopy(); return; }
+    if (In(l.open, mx, my)) { EditorOpenNextCamera(); return; }
+    if (In(l.exportButton, mx, my))
+    {
+        if (exportRun.phase == ExportRun::Phase::Done || exportRun.phase == ExportRun::Phase::Failed)
+        { exportRun.phase = ExportRun::Phase::Off; editorPanel = EditorPanel::Export; return; }   // back to the settings
+        editorPanel = editorPanel == EditorPanel::Export ? EditorPanel::Point : EditorPanel::Export;
+        return;
+    }
+    if (exportRun.phase == ExportRun::Phase::Done || exportRun.phase == ExportRun::Phase::Failed)
+    {
+        if (In(l.panel, mx, my)) return;   // the panel shows the result only (Export goes back to the settings)
+    }
+
+    // timeline: a point (select / drag), or a time (jump there)
+    RECT band = l.track; InflateRect(&band, 0, 14);
+    if (In(band, mx, my) && st.lengthMs)
+    {
+        for (size_t i = 0; i < replayPath.size(); ++i)
+            if (std::abs(TimelineX(l, replayPath[i].t, st.lengthMs) - mx) <= 7)
+            {
+                editorSelected = static_cast<int>(i);
+                editorDragging = true;
+                editorDragFrom = replayPath[i].t;
+                editorPressX = mx;
+                editorPanel = EditorPanel::Point;
+                return;
+            }
+        ReplayPlayer::SeekTo(TimelineTime(l, mx, st.lengthMs));
+        return;
+    }
+
+    // right panel
+    const int x = l.panel.left + 16;
+    const auto row = [&](int i) { return l.panel.top + 44 + i * 34; };
+    const auto minus = [&](int i) { return RECT{l.panel.right - 92, row(i), l.panel.right - 56, row(i) + 28}; };
+    const auto plus = [&](int i) { return RECT{l.panel.right - 50, row(i), l.panel.right - 14, row(i) + 28}; };
+    if (editorPanel == EditorPanel::Export)
+    {
+        const uint64_t second = shift ? 10000 : 1000;
+        if (In(minus(0), mx, my)) { exportStartMs = exportStartMs > second ? exportStartMs - second : 0; exportRangeSet = true; }
+        else if (In(plus(0), mx, my)) { exportStartMs = std::min(st.lengthMs, exportStartMs + second); exportRangeSet = true; }
+        else if (In(minus(1), mx, my)) { exportEndMs = exportEndMs > second ? exportEndMs - second : 0; exportRangeSet = true; }
+        else if (In(plus(1), mx, my)) { exportEndMs = std::min(st.lengthMs, exportEndMs + second); exportRangeSet = true; }
+        for (int i = 0; i < 4; ++i) if (In(RECT{x + i * 70, row(2), x + i * 70 + 64, row(2) + 28}, mx, my)) exportResolution = i;
+        for (int i = 0; i < 2; ++i) if (In(RECT{x + i * 70, row(3), x + i * 70 + 64, row(3) + 28}, mx, my)) exportFps = i ? 60 : 30;
+        for (int i = 0; i < 3; ++i) if (In(RECT{x + i * 70, row(4), x + i * 70 + 64, row(4) + 28}, mx, my)) exportQuality = i;
+        if (In(RECT{x, row(6), x + 120, row(6) + 32}, mx, my)) StartExport();
+        if (In(RECT{x + 130, row(6), x + 260, row(6) + 32}, mx, my)) ShellExecuteW(nullptr, L"open", DefaultVideoFolder().wstring().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    if (editorSelected < 0 || editorSelected >= static_cast<int>(replayPath.size())) return;
+    auto& k = replayPath[editorSelected];
+    const float block = shift ? 1.f : 0.1f, degree = shift ? 10.f : 1.f;
+    const int64_t ms = shift ? 1000 : 100;
+    if (In(minus(0), mx, my)) { EditorMovePoint(editorSelected, k.t > static_cast<uint64_t>(ms) ? k.t - ms : 0) || (editorNotice = L"Too close to another point", true); return; }
+    if (In(plus(0), mx, my)) { EditorMovePoint(editorSelected, std::min(st.lengthMs, k.t + ms)) || (editorNotice = L"Too close to another point", true); return; }
+    float* values[5] = {&k.pose.x, &k.pose.y, &k.pose.z, &k.pose.yaw, &k.pose.pitch};
+    for (int i = 0; i < 5; ++i)
+    {
+        const float step = i < 3 ? block : degree;
+        if (In(minus(i + 1), mx, my)) { *values[i] -= step; break; }
+        if (In(plus(i + 1), mx, my)) { *values[i] += step; break; }
+    }
+    k.pose.pitch = std::clamp(k.pose.pitch, -90.f, 90.f);
+    for (int i = 0; i < 6; ++i)
+        if (In(RECT{x + (i % 3) * 96, row(7) + (i / 3) * 34, x + (i % 3) * 96 + 90, row(7) + (i / 3) * 34 + 28}, mx, my))
+            k.ease = static_cast<MyClientReplayCamera::Ease>(i);
+    if (editorHaveFreePose && In(RECT{x, row(9) + 4, x + 260, row(9) + 34}, mx, my)) k.pose = editorFreePose;
+    SaveReplayPath();
+}
+
+void DrawReplayEditor(HDC hdc, int w, int h)
+{
+    if (!replayEditorOpen || w < 400 || h < 300) return;
+    const ReplayPlayer::Status st = ReplayPlayer::Get();
+    const EditorLayout l = EditorRects(w, h);
+    const COLORREF bg = RGB(24, 22, 28), panel = RGB(34, 32, 40), button = RGB(52, 50, 58), accent = RGB(230, 64, 72), text = RGB(235, 235, 240),
+                   dim = RGB(160, 160, 170);
+    // background everywhere but the preview box (left clear: the DLL draws the shrunk picture there)
+    const auto fill = [&](int x0, int y0, int x1, int y1) { if (x1 > x0 && y1 > y0) DrawRoundBox(hdc, x0, y0, x1 - x0, y1 - y0, 0, bg); };
+    fill(0, 0, w, l.preview.top);
+    fill(0, l.preview.top, l.preview.left, l.preview.bottom);
+    fill(l.preview.right, l.preview.top, w, l.preview.bottom);
+    fill(0, l.preview.bottom, w, h);
+    const auto button_ = [&](const RECT& r, const std::wstring& label, bool on) {
+        DrawRoundBox(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top, 8, on ? accent : button);
+        DrawTextCentered(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top, label, text, 12);
+    };
+    // toolbar
+    button_(l.play, st.paused ? L"▶" : L"II", true);
+    button_(l.back15, L"-15", false); button_(l.back5, L"-5", false); button_(l.fwd5, L"+5", false); button_(l.fwd15, L"+15", false);
+    button_(l.saveCopy, L"Save copy", false);
+    button_(l.open, L"Open (" + Utf8ToWide(replayCameraFile.Name()) + L")", false);
+    button_(l.exportButton, L"Export", editorPanel == EditorPanel::Export);
+    button_(l.close, L"Close", false);
+    DrawTextSimple(hdc, l.exportButton.right + 16, 24, ReplayClock(st.positionMs) + L" / " + ReplayClock(st.lengthMs) +
+                   (st.freeCamera ? L"" : L"   (eyes view: the points move the free camera)"), dim, 13);
+    // preview frame
+    HBRUSH frame = CreateSolidBrush(RGB(90, 90, 100));
+    RECT outline = l.preview; InflateRect(&outline, 2, 2);
+    FrameRect(hdc, &outline, frame);
+    DeleteObject(frame);
+    if (!inGameDrawing) DrawTextSimple(hdc, l.preview.left + 8, l.preview.top + 8, L"Preview: the game shows through (in-game drawing is off)", dim, 12);
+
+    // right panel
+    DrawRoundBox(hdc, l.panel.left, l.panel.top, l.panel.right - l.panel.left, l.panel.bottom - l.panel.top, 10, panel);
+    const int x = l.panel.left + 16;
+    const auto row = [&](int i) { return l.panel.top + 44 + i * 34; };
+    const auto stepper = [&](int i, const std::wstring& label, const std::wstring& value) {
+        DrawTextSimple(hdc, x, row(i) + 6, label, dim, 13);
+        DrawTextSimple(hdc, x + 90, row(i) + 6, value, text, 13);
+        button_(RECT{l.panel.right - 92, row(i), l.panel.right - 56, row(i) + 28}, L"-", false);
+        button_(RECT{l.panel.right - 50, row(i), l.panel.right - 14, row(i) + 28}, L"+", false);
+    };
+    const bool running = exportRun.phase != ExportRun::Phase::Off && exportRun.phase != ExportRun::Phase::Done &&
+                         exportRun.phase != ExportRun::Phase::Failed;
+    wchar_t buf[160];
+    if (running || exportRun.phase == ExportRun::Phase::Done || exportRun.phase == ExportRun::Phase::Failed)
+    {
+        DrawTextSimple(hdc, x, l.panel.top + 14, L"Export", text, 15);
+        const double elapsed = (GetTickCount64() - exportRun.startedAt) / 1000.0;
+        const uint32_t done = exportRun.phase == ExportRun::Phase::Done ? exportRun.total : exportRun.frame;
+        const double left = MyClientReplayExport::RemainingSeconds(done, exportRun.total, elapsed);
+        const int bw = l.panel.right - l.panel.left - 32;
+        DrawRoundBox(hdc, x, l.panel.top + 50, bw, 10, 4, RGB(70, 70, 80));
+        if (exportRun.total) DrawRoundBox(hdc, x, l.panel.top + 50, std::max(8, static_cast<int>(bw * static_cast<double>(done) / exportRun.total)), 10, 4, accent);
+        swprintf(buf, 160, L"Frame %u / %u    %.0f s so far    %ls", done, exportRun.total, elapsed,
+                 left < 0 ? L"time left: ..." : (L"about " + std::to_wstring(static_cast<int>(left + 0.5)) + L" s left").c_str());
+        DrawTextSimple(hdc, x, l.panel.top + 72, buf, text, 13);
+        if (running)
+        {
+            DrawTextSimple(hdc, x, l.panel.top + 100, exportRun.phase == ExportRun::Phase::Seeking ? L"Going to the start..." : L"Writing the video (the game runs frame by frame)", dim, 12);
+            button_(ExportCancelRect(l), L"Cancel", true);
+        }
+        else
+            DrawTextSimple(hdc, x, l.panel.top + 100, (exportRun.phase == ExportRun::Phase::Done ? L"" : L"Stopped: ") + exportRun.message,
+                           exportRun.phase == ExportRun::Phase::Done ? RGB(150, 230, 150) : RGB(255, 150, 150), 12);
+        if (!running) { DrawTextSimple(hdc, x, l.panel.top + 124, L"Export: back to the settings.  Close: leave the editor.", dim, 12); }
+    }
+    if (!running && editorPanel == EditorPanel::Export && exportRun.phase != ExportRun::Phase::Done && exportRun.phase != ExportRun::Phase::Failed)
+    {
+        DrawTextSimple(hdc, x, l.panel.top + 14, L"Export a video (picture only, .mp4)", text, 15);
+        stepper(0, L"From", ReplayClock(exportStartMs));
+        stepper(1, L"To", ReplayClock(exportEndMs));
+        const wchar_t* res[4] = {L"720p", L"1080p", L"1440p", L"Window"};
+        for (int i = 0; i < 4; ++i) button_(RECT{x + i * 70, row(2), x + i * 70 + 64, row(2) + 28}, res[i], exportResolution == i);
+        button_(RECT{x, row(3), x + 64, row(3) + 28}, L"30 fps", exportFps == 30);
+        button_(RECT{x + 70, row(3), x + 134, row(3) + 28}, L"60 fps", exportFps == 60);
+        const wchar_t* quality[3] = {L"Low", L"Medium", L"High"};
+        for (int i = 0; i < 3; ++i) button_(RECT{x + i * 70, row(4), x + i * 70 + 64, row(4) + 28}, quality[i], exportQuality == i);
+        DrawTextSimple(hdc, x, row(5) + 6, L"To: " + DefaultVideoFolder().wstring(), dim, 12);
+        button_(RECT{x, row(6), x + 120, row(6) + 32}, L"Start", true);
+        button_(RECT{x + 130, row(6), x + 260, row(6) + 32}, L"Open folder", false);
+        DrawTextSimple(hdc, x, row(7) + 6, L"Frame Generation pauses during the export. Takes longer than the video.", dim, 11);
+    }
+    else if (!running && exportRun.phase != ExportRun::Phase::Done && exportRun.phase != ExportRun::Phase::Failed)
+    {
+        if (editorSelected < 0 || editorSelected >= static_cast<int>(replayPath.size()))
+            DrawTextSimple(hdc, x, l.panel.top + 14, replayPath.empty() ? L"No camera points: free camera + P adds one" : L"Click a point on the timeline", dim, 13);
+        else
+        {
+            const auto& k = replayPath[editorSelected];
+            DrawTextSimple(hdc, x, l.panel.top + 14, L"Point " + std::to_wstring(editorSelected + 1) + L" of " + std::to_wstring(replayPath.size()) +
+                           L"   (Shift: bigger steps, Delete: remove)", text, 13);
+            const auto f = [&](float v) { swprintf(buf, 160, L"%.2f", v); return std::wstring(buf); };
+            stepper(0, L"Time", ReplayClock(k.t));
+            stepper(1, L"X", f(k.pose.x)); stepper(2, L"Y", f(k.pose.y)); stepper(3, L"Z", f(k.pose.z));
+            stepper(4, L"Turn", f(k.pose.yaw)); stepper(5, L"Up/Down", f(k.pose.pitch));
+            DrawTextSimple(hdc, x, row(6) + 8, L"Movement to the next point", dim, 13);
+            for (int i = 0; i < 6; ++i)
+                button_(RECT{x + (i % 3) * 96, row(7) + (i / 3) * 34, x + (i % 3) * 96 + 90, row(7) + (i / 3) * 34 + 28},
+                        EaseLabel(static_cast<MyClientReplayCamera::Ease>(i)), static_cast<int>(k.ease) == i);
+            if (editorHaveFreePose) button_(RECT{x, row(9) + 4, x + 260, row(9) + 34}, L"Use the free camera's place", false);
+        }
+    }
+    if (!editorNotice.empty()) DrawTextSimple(hdc, l.panel.left + 16, l.panel.bottom - 24, editorNotice, RGB(255, 210, 120), 12);
+
+    // timeline
+    DrawRoundBox(hdc, l.timeline.left, l.timeline.top, l.timeline.right - l.timeline.left, l.timeline.bottom - l.timeline.top, 10, panel);
+    DrawTextSimple(hdc, l.timeline.left + 16, l.timeline.top + 12, L"Timeline   camera \"" + Utf8ToWide(replayCameraFile.Name()) + L"\"   " +
+                   std::to_wstring(replayPath.size()) + L" points", text, 13);
+    DrawRoundBox(hdc, l.track.left, l.track.top, l.track.right - l.track.left, l.track.bottom - l.track.top, 4, RGB(70, 70, 80));
+    if (st.lengthMs)
+    {
+        for (uint64_t s = 0; s <= st.lengthMs; s += st.lengthMs > 600000 ? 60000 : st.lengthMs > 120000 ? 15000 : 5000)
+        {
+            const int tx = TimelineX(l, s, st.lengthMs);
+            DrawRoundBox(hdc, tx, l.track.bottom + 4, 1, 6, 0, dim);
+            DrawTextSimple(hdc, tx + 3, l.track.bottom + 8, ReplayClock(s), dim, 10);
+        }
+        if (editorPanel == EditorPanel::Export && exportEndMs > exportStartMs)
+        {
+            const int a = TimelineX(l, exportStartMs, st.lengthMs), b = TimelineX(l, exportEndMs, st.lengthMs);
+            DrawRoundBox(hdc, a, l.track.top - 18, std::max(2, b - a), 6, 2, RGB(120, 160, 230));
+        }
+        for (size_t i = 0; i < replayPath.size(); ++i)
+        {
+            int px = TimelineX(l, replayPath[i].t, st.lengthMs);
+            if (editorDragging && static_cast<int>(i) == editorSelected)
+            {
+                POINT cursor{};
+                if (GetCursorPos(&cursor) && ScreenToClient(overlayWindow, &cursor)) px = std::clamp<int>(cursor.x, l.track.left, l.track.right);
+            }
+            const bool selected = static_cast<int>(i) == editorSelected;
+            DrawRoundBox(hdc, px - 6, l.track.top - 6, 12, 24, 4, selected ? RGB(255, 210, 120) : RGB(235, 235, 245));
+        }
+        const int now = TimelineX(l, st.positionMs, st.lengthMs);
+        DrawRoundBox(hdc, now - 1, l.track.top - 14, 3, 40, 0, accent);
+    }
 }
 
 // The bar's keys, once per HUD tick while a recording plays and the game has the focus.
 void PollReplayKeys(bool usable)
 {
+    // K, not Space (the free camera's fly-up key) and not Enter (opens the chat in the game).
     static bool prev[5] = {};
-    const int keys[5] = {'K', VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN};
+    const int keys[5] = {replayPauseKey, VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN};
     for (int i = 0; i < 5; ++i)
     {
-        const bool down = usable && ReplayPlayer::Active() && IsKeyDown(keys[i]);
+        const bool down = usable && ReplayPlayer::Active() && keys[i] != 0 && IsKeyDown(keys[i]);
         if (down && !prev[i])
         {
             const bool shift = IsKeyDown(VK_SHIFT);
@@ -8673,28 +9860,36 @@ void HandleReplaysClick(int mx, int my)
 }
 
 // Home screen (the game's title screen, no world loaded): a small "Replays" button at the top left.
-// Not on the Play / Settings / Marketplace screens opened from it. Older DLLs do not report the title screen:
-// then any screen outside a world counts. No world ticks there, so the frame channel goes stale; the DLL's
+// Not on the Play / Settings / Marketplace screens opened from it, and not while the DLL has not said yet (or an
+// older DLL cannot say) whether this is the title screen. No world ticks there, so the frame channel goes stale; the DLL's
 // per-frame heartbeat says the game runs.
 bool OnHomeScreen()
 {
     if (!MinecraftDataProvider::IsGameRunning() || MinecraftDataProvider::IsInWorld()) return false;
-    return MinecraftDataProvider::IsOnTitleScreen() != 0;
+    // -1 (not known yet, e.g. right after start) no longer counts as home: the button flashed there (test59).
+    return MinecraftDataProvider::IsOnTitleScreen() == 1;
 }
 
 // The button in overlay coordinates (the overlay covers the whole game window, title bar included).
 RECT HomeReplaysButtonRect()
 {
     POINT client{0, 0};
-    RECT window{};
-    if (minecraftWindow && GetWindowRect(minecraftWindow, &window) && ClientToScreen(minecraftWindow, &client))
-    {
-        client.x -= window.left;
-        client.y -= window.top;
-    }
-    else
-        client = {0, 0};
-    return RECT{client.x + 10, client.y + 10, client.x + 10 + 96, client.y + 10 + 28};
+    if (!minecraftWindow || !overlayWindow || !ClientToScreen(minecraftWindow, &client) ||
+        !ScreenToClient(overlayWindow, &client)) client = {0, 0};
+    return RECT{client.x + 4, client.y + 1, client.x + 4 + 96, client.y + 1 + 28};   // moved up (author 2026-11-19)
+}
+
+// Where a press counts. 2026-11-19 (test60, 125%): presses on the drawn button's top and middle mapped to y 52 and 58,
+// its bottom edge to 66, below the 31-59 rectangle, so the bottom of the button did nothing. Below 100% the hit area
+// keeps the drawn size; above it, it grows downward by the scale's extra share of the height, plus a few pixels.
+RECT HomeReplaysHitRect()
+{
+    RECT r = HomeReplaysButtonRect();
+    double scale = 1.0;
+    POINT ignored{};
+    if (!OverlayCursorClient(ignored, &scale) || !(scale > 1.0) || scale > 3.0) scale = 1.0;
+    r.bottom += LONG(std::lround((r.bottom - r.top) * (scale - 1.0))) + 6;
+    return r;
 }
 
 void DrawHomeReplaysButton(HDC hdc)
@@ -8705,6 +9900,41 @@ void DrawHomeReplaysButton(HDC hdc)
     DrawRoundBox(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top, 7, RGB(28,24,28));
     DrawReplayIconButton(hdc, RECT{r.left + 4, r.top + 4, r.left + 24, r.top + 24}, 5, RGB(60,48,56), RGB(200,190,200));
     DrawTextSimple(hdc, r.left + 30, r.top + 6, L"Replays", RGB(235,235,235), 13);
+}
+
+// Standalone branding lives in the game's JSON UI. Never add it for a loader session or an unknown process.
+// Recheck periodically: LeviLamina may finish loading after the HUD first sees the process.
+bool GameHasLeviLamina(DWORD pid)
+{
+    static DWORD checkedPid = 0;
+    static ULONGLONG checkedAt = 0;
+    static bool has = true;
+    if (!pid) return true;
+    const ULONGLONG now = GetTickCount64();
+    if (pid == checkedPid && now - checkedAt < 1000) return has;
+    checkedPid = pid;
+    checkedAt = now;
+    has = true; // failure to enumerate is unknown, so leave native/loader branding alone
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snapshot == INVALID_HANDLE_VALUE) return has;
+    MODULEENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (!Module32FirstW(snapshot, &entry)) { CloseHandle(snapshot); return has; }
+    has = false;
+    do {
+        if (_wcsicmp(entry.szModule, L"LeviLamina.dll") == 0) { has = true; break; }
+    } while (Module32NextW(snapshot, &entry));
+    if (!has && GetLastError() != ERROR_NO_MORE_FILES) has = true;
+    CloseHandle(snapshot);
+    return has;
+}
+
+// The title screen version text now comes from the DLL's bindString hook ("OriginX 26.51", 2026-11-18). The
+// OriginX_HomeBrand pack would wrap that text a second time ("OriginX Client OriginX 26.51"), so it is no
+// longer wanted: false also removes a pack an older HUD wrote and drops it from the pack stack.
+bool HomeBrandWanted()
+{
+    return false;
 }
 
 RECT MenuSoundRect(int index)
@@ -8741,6 +9971,7 @@ enum LiteKey
     LiteRender, LiteRenderDistance,
     LitePriority, LiteThrottle, LiteGpu,
     LiteNoSkyFull, LiteBehind, LiteBlockEntities, LiteBlockEntityDistance, LiteVertical, LiteVerticalRows,
+    LiteFpsLimit, LiteFpsLimitValue,
     LiteNone
 };
 struct LiteRow { LiteRowKind kind; int key; const wchar_t* label; };
@@ -8782,6 +10013,8 @@ const std::vector<LiteRow>& LiteRows()
         {LiteRowKind::Switch, LitePriority, L"High process priority"},
         {LiteRowKind::Switch, LiteThrottle, L"Disable CPU power throttling"},
         {LiteRowKind::Switch, LiteGpu, L"High GPU scheduling priority"},
+        {LiteRowKind::Switch, LiteFpsLimit, L"FPS limit"},
+        {LiteRowKind::Slider, LiteFpsLimitValue, L"Limit"},
         {LiteRowKind::Status, LiteNone, L""},
     };
     return rows;
@@ -8809,6 +10042,7 @@ bool* LiteSwitchPtr(int key)
     case LitePriority: return &liteHighPriority;
     case LiteThrottle: return &liteNoThrottle;
     case LiteGpu: return &liteGpuPriority;
+    case LiteFpsLimit: return &liteFpsLimit;
     case LiteNoSkyFull: return &liteNoSkyFull;
     case LiteBehind: return &liteCullBehind;
     case LiteBlockEntities: return &liteBlockEntityLimit;
@@ -8834,6 +10068,7 @@ bool LiteRowActive(int key)
     case LiteRenderDistance: return liteRenderEnabled;
     case LiteBlockEntityDistance: return liteBlockEntityLimit;
     case LiteVerticalRows: return liteVerticalLimit;
+    case LiteFpsLimitValue: return liteFpsLimit;
     default: return true;
     }
 }
@@ -8848,8 +10083,20 @@ LiteSliderInfo LiteSlider(int key)
     case LitePlayerDistance: return {&litePlayerDistance, 8, 128, 8, L" blocks"};
     case LiteBlockEntityDistance: return {&liteBlockEntityDistance, 8, 128, 8, L" blocks"};
     case LiteVerticalRows: return {&liteVerticalRows, 1, (int)MyClientFeatures::VerticalRowsMax, 1, L" x16 blocks"};
+    case LiteFpsLimitValue: return {&liteFpsLimitCode, 1, 6, 1, L""};
     default:                 return {&liteRenderDistance, 4, 48, 2, L" chunks"};
     }
+}
+
+// The slider's value as shown (the FPS limit shows its rate, not its code).
+std::wstring LiteSliderText(int key)
+{
+    const LiteSliderInfo i = LiteSlider(key);
+    if (key == LiteFpsLimitValue) {
+        static const wchar_t* names[] = {L"", L"60 FPS", L"120 FPS", L"144 FPS", L"165 FPS", L"240 FPS", L"Display"};
+        return names[std::clamp(*i.value, 1, 6)];
+    }
+    return std::to_wstring(*i.value) + i.unit;
 }
 
 int LiteRowHeight(LiteRowKind kind)
@@ -9167,7 +10414,7 @@ void DrawLitePage(HDC hdc)
             const RECT track = LiteTrackRect(r);
             DrawRoundBox(hdc, r.left + 8, r.top - 2, 3, r.bottom - r.top + 2, 1, th.muted);
             DrawTextSimple(hdc, r.left + 20, r.top + 2, row.label, active ? th.text : th.muted, 13);
-            const std::wstring value = std::to_wstring(*s.value) + s.unit;
+            const std::wstring value = LiteSliderText(row.key);
             DrawTextSimple(hdc, r.right - 14 - TextWidth(hdc, value, 13), r.top + 2, value, active ? th.text : th.muted, 13);
             const int trackW = track.right - track.left;
             const int knobX = track.left + trackW * ((*s.value - s.min) / s.step) / ((s.max - s.min) / s.step);
@@ -9435,7 +10682,7 @@ void DrawDetailList(HDC hdc)
             row.left += 16;
 
         const bool selected = DetailRowSelected(r);
-        const bool on = !group && DetailRowOn(r);
+        const bool on = group ? hiveEnabled : DetailRowOn(r);
 
         // The row colour is the switch: lit = ON, dark = OFF.
         DrawRoundBox(hdc, row.left, row.top, row.right - row.left, row.bottom - row.top, 8,
@@ -9507,7 +10754,9 @@ bool HandleDetailListClick(int mx, int my, bool openSettings = false)
 
         if (group)
         {
-            hiveExpanded = !hiveExpanded;   // the group header only folds / unfolds
+            if (mx >= row.right - kChevronW) hiveExpanded = !hiveExpanded;
+            else if (openSettings) { detailFeature = DetailFeature::HiveUtils; hiveSection = 0; }
+            else ToggleFeature(DetailFeature::HiveUtils);
             return true;
         }
 
@@ -10644,8 +11893,9 @@ void LoadPresets()
 
 void SavePresets()
 {
-    std::ofstream out(std::filesystem::path(PresetsPath()), std::ios::binary | std::ios::trunc);
-    for (const auto& preset : presets) out << Presets::Serialize(preset) << "\n";
+    std::string text;
+    for (const auto& preset : presets) text += Presets::Serialize(preset) + "\n";
+    ReplaceFileBytes(PresetsPath(), text);   // a failed save keeps the old presets (2026-11-20)
 }
 
 // What a preset remembers: every module's ON/OFF, and Hive Utils' own switches one by one.
@@ -10962,7 +12212,7 @@ RECT HiveStatsAutoRect()
 
 RECT HiveStatsGameRect(int index)
 {
-    const int top = 190 + (index + 1) * 31;   // row 0 of the list is the "Auto" switch
+    const int top = 190 + (HiveStats::PickRow(index) + 1) * 31;   // row 0 is the "Auto" switch, then Hide, All Games, the listed games
     return RECT{kPaneX, top, kPaneX + 400, top + 27};
 }
 
@@ -10982,13 +12232,10 @@ void DrawHiveStatsDetails(HDC hdc, int x, int y)
         DrawSwitchRow(hdc, HiveStatsAutoRect(), label, hiveStatsAuto, 13);
     }
 
-    for (int i = 0; i < HiveStats::kGameCount; i++)
-    {
-        const bool shown = hiveStatsAuto && hiveDetectedGame >= 0 ? i == hiveDetectedGame : i == hiveStatsGame;
-        DrawSwitchRow(hdc, HiveStatsGameRect(i), AsciiToWide(HiveStats::kGames[i].name), shown, 13);
-    }
+    for (int i = HiveStats::kHidden; i < HiveStats::kGameCount; i++)
+        if (HiveStats::Pickable(i)) DrawSwitchRow(hdc, HiveStatsGameRect(i), HiveStatsGameName(i), i == HiveStatsShownGame(), 13);
 
-    DrawTextSimple(hdc, x, 190 + (HiveStats::kGameCount + 1) * 31 + 4,
+    DrawTextSimple(hdc, x, 190 + (HiveStats::PickRow(HiveStats::kGameCount) + 1) * 31 + 4,
                    L"Needs the updated DLL for the player list. Move the table in the HUD editor.", t.muted, 11);
 }
 
@@ -11033,9 +12280,9 @@ std::string WideToUtf8(const std::wstring& text)
 void StripLitePack(TexturePacks::State& state)
 {
     auto& ac = state.active;
-    ac.erase(std::remove(ac.begin(), ac.end(), std::string(LitePack::kPackUuid)), ac.end());
+    ac.erase(std::remove_if(ac.begin(), ac.end(), [](const std::string& id) { return id == LitePack::kPackUuid || id == HomeBrandPack::Uuid || id == JavaChatPack::Uuid || id == MarksPack::Uuid; }), ac.end());
     auto& st = state.stack;
-    st.erase(std::remove_if(st.begin(), st.end(), [](const TexturePacks::Entry& e) { return e.uuid == LitePack::kPackUuid; }), st.end());
+    st.erase(std::remove_if(st.begin(), st.end(), [](const TexturePacks::Entry& e) { return e.uuid == LitePack::kPackUuid || e.uuid == HomeBrandPack::Uuid || e.uuid == JavaChatPack::Uuid || e.uuid == MarksPack::Uuid; }), st.end());
 }
 
 void RefreshTextures()
@@ -11049,7 +12296,7 @@ void RefreshTextures()
         // The generated Lite pack is not a pack the user picks: hide it from the list.
         auto& pk = texState.packs;
         pk.erase(std::remove_if(pk.begin(), pk.end(),
-                     [](const TexturePacks::Pack& q) { return q.uuid == LitePack::kPackUuid; }),
+                     [](const TexturePacks::Pack& q) { return q.uuid == LitePack::kPackUuid || q.uuid == HomeBrandPack::Uuid || q.uuid == JavaChatPack::Uuid || q.uuid == MarksPack::Uuid; }),
                  pk.end());
         StripLitePack(texState);
     }
@@ -11151,16 +12398,30 @@ void GameParticleIds(std::vector<std::string>& crit, std::vector<std::string>& p
 
 // Every module whose effect comes from the generated client pack (LitePack.h). Add new pack-based modules
 // here only: ApplyLite writes the pack from it and the DLL is told to reload packs from it.
+bool JavaChatPackWanted()
+{
+    // Do not hide native chat until this game DLL has opened its publication channel.
+    // Retain a known result while a minimized game stops telemetry, reset for another game process.
+    static DWORD owner = 0; static int backend = -1;
+    const DWORD pid = MinecraftDataProvider::GamePid();
+    if (pid != owner) { owner = pid; backend = -1; }
+    const int observed = MinecraftDataProvider::JavaChatJsonSupport();
+    if (observed >= 0) backend = observed;
+    return javaChatEnabled && backend == 1;
+}
+bool MarksPackWanted();
+
 bool ClientPackWanted()
 {
     // Left Hand is not here any more: the DLL mirrors the whole first-person pass (arm and item), and the pack's
     // mirrored arm animations would put the arm back on the right.
-    return liteEnabled || fastInventoryEnabled || (hitEffectEnabled && hitEffectMagic);
+    return MarksPackWanted() || HomeBrandWanted() || liteEnabled || fastInventoryEnabled || javaChatEnabled || (hitEffectEnabled && hitEffectMagic);
 }
 // The DLL reloads packs only while the HUD reports pack switching as wanted: switching the last pack-based
 // module OFF made it "not wanted" in the same moment, so that reload never ran and the game kept the
 // pack's effects. The request stays on for a few seconds after every client-pack rewrite.
 ULONGLONG clientPackReloadUntil = 0;
+bool clientPackRetryWanted = false;
 
 std::string VanillaCritParticle()
 {
@@ -11170,28 +12431,42 @@ std::string VanillaCritParticle()
 }
 
 // Writes / removes the generated Lite pack and puts it above the user's chosen pack.
-void ApplyLite()
+bool ApplyLite()
 {
+    ++liteApplyCount;
+    clientPackRetryWanted = true;
     if (!texState.found)
         RefreshTextures();
 
     if (!texState.found)
     {
         liteStatus = L"Minecraft's data folder was not found.";
-        return;
+        return false;
     }
 
     const std::vector<std::filesystem::path> folders = LitePackFolders();
+    auto legacyFolders = folders;
+    for (const auto& root : TexturePacks::CandidateRootsFromEnvironment())
+        legacyFolders.push_back(root / L"resource_packs" / L"OriginX_Lite");
+    if (!HomeBrandPack::CleanLegacy(legacyFolders) ||
+        !HomeBrandPack::Write(TexturePacks::EnvPath("LOCALAPPDATA", L"LOCALAPPDATA"), HomeBrandWanted()) ||
+        !MarksPack::Write(TexturePacks::EnvPath("LOCALAPPDATA", L"LOCALAPPDATA"), MarksPackWanted()) ||
+        !JavaChatPack::Write(TexturePacks::EnvPath("LOCALAPPDATA", L"LOCALAPPDATA"), JavaChatPackWanted())) {
+        liteStatus = L"Could not update session branding or remove old branding; retry pending.";
+        return false;
+    }
 
     // The pack carries Optimization and Fast Inventory; each part only while its module is ON.
     const bool packWanted = ClientPackWanted();
     if (packWanted)
     {
         LitePack::Options o;
+        o.homeBrand = false; // only HomeBrandPack in the explicitly registered source owns the label
         o.clouds = false;   // live game option; a transparent pack image would keep clouds hidden after OFF
         o.sky = liteEnabled && liteSky;
         o.fog = liteEnabled && liteFog; o.weather = liteEnabled && liteWeather;
         o.fastUi = fastInventoryEnabled;
+        o.javaChat = false; // shared Lite never carries chat hiding
         o.leftHand = false;   // see ClientPackWanted
         o.noCrit = liteEnabled && liteNoCrit;
         o.noPotion = liteEnabled && liteNoPotion;
@@ -11201,46 +12476,65 @@ void ApplyLite()
             GameParticleIds(o.critParticles, o.potionParticles, o.allParticles);
         if (hitEffectEnabled && hitEffectMagic)
             o.enchantedHit = LitePack::EnchantedHitParticle(VanillaCritParticle());
-        bool written = false;
+        bool written = !folders.empty();
         for (size_t i = 0; i < folders.size(); ++i) {
             const bool copyWritten = LitePack::Write(folders[i], o);
-            if (i == 0) written = copyWritten;   // the canonical source must succeed, even if a mirror can be written
+            written = copyWritten && written; // stale UI in any registered/mirrored copy must remain pending
         }
+        // r57-test54: the game reads global_resource_packs.json before the DLL attaches the generated-pack source,
+        // drops packs it cannot find and saves the list again: OriginX Marks, kept only in generated-packs, was
+        // dropped (Lite survived through its copies here). Mirror Marks next to those copies.
+        if (MarksPackWanted())
+            for (const auto& root : TexturePacks::PackRoots(texState))
+                written = MarksPack::WriteFolder(root / L"resource_packs" / L"OriginX_Marks") && written;
         if (!written)
         {
             liteStatus = L"Could not write the Lite pack.";
-            return;
+            return false;
         }
     }
     else
     {
         // Leaving the pack's files behind kept e.g. Left Hand's animations around after it was switched off.
-        std::error_code ec;
-        for (const auto& folder : folders)
-            if (std::filesystem::exists(folder, ec))
-                LitePack::Write(folder, LitePack::NothingOn());
+        bool cleaned = true;
+        for (const auto& folder : folders) {
+            std::error_code ec;
+            const bool exists = std::filesystem::exists(folder, ec);
+            if (ec || (exists && !LitePack::Write(folder, LitePack::NothingOn()))) cleaned = false;
+        }
+        if (!cleaned) {
+            liteStatus = L"Could not remove the previous client-pack settings; retry pending.";
+            return false;
+        }
     }
     TexturePacks::Pack ref;
     if (packWanted && !LitePackRef(ref)) {
         liteStatus = L"Could not read the Lite pack's version.";
-        return;
+        return false;
     }
 
     // The player's own packs stay exactly as they are (all of them, same order); Lite goes on top.
     std::string error;
-    const std::vector<TexturePacks::Entry> stack = texState.stack;
+    const auto stack = MarksPack::WithEntry(JavaChatPack::WithEntry(HomeBrandPack::WithEntry(texState.stack, HomeBrandWanted()), JavaChatPackWanted()), MarksPackWanted());
     if (!TexturePacks::WriteStack(texState, stack, error, packWanted ? &ref : nullptr))
     {
         liteStatus = L"Could not update the pack list: " + Utf8ToWide(error);
-        return;
+        return false;
+    }
+    if (!MarksPack::CommitRequest(TexturePacks::EnvPath("LOCALAPPDATA", L"LOCALAPPDATA"), MarksPackWanted()) ||
+        !JavaChatPack::CommitRequest(TexturePacks::EnvPath("LOCALAPPDATA", L"LOCALAPPDATA"), JavaChatPackWanted())) {
+        liteStatus = L"Could not record the chat profile request; retry pending.";
+        return false;
     }
     StripLitePack(texState);
     texFileTime = TexturePacks::WriteTime(texState.globalFile);
 
     texturesSeq++;
     clientPackReloadUntil = GetTickCount64() + 5000;
-    liteStatus = MinecraftDataProvider::IsInWorld() && !MinecraftDataProvider::IsLiveTexturesAvailable() ? L"Saved - leave the world to apply."
+    liteStatus = MinecraftDataProvider::IsInWorld() && !MinecraftDataProvider::IsLiveTexturesAvailable() ? Lang::T(L"タイトル画面で反映されます", L"Applied on the title screen")
                : packWanted ? L"Applied  (reload requested)" : L"Off  (reload requested)";
+    clientPackRetryWanted = false;
+    return true;
 }
 
 // Makes `stack` the active pack list (first = highest priority), with the Lite pack on top while it is needed.
@@ -11252,16 +12546,22 @@ bool WriteTextureStack(const std::vector<TexturePacks::Entry>& stack, std::strin
         error = "Could not read the Lite pack's version.";
         return false;
     }
-    if (!TexturePacks::WriteStack(texState, stack, error, packWanted ? &liteRef : nullptr))
+    const auto sessionStack = MarksPack::WithEntry(JavaChatPack::WithEntry(HomeBrandPack::WithEntry(stack, HomeBrandWanted()), JavaChatPackWanted()), MarksPackWanted());
+    if (!TexturePacks::WriteStack(texState, sessionStack, error, packWanted ? &liteRef : nullptr))
         return false;
     // Keep the exact Done request and the file read back immediately after writing. A later copy of the
     // game's list may already have been overwritten by its settings screen, hiding a subpack-only change.
     if (FILE* f = _wfopen((GetExecutableDirectory() + L"\\textures_apply.txt").c_str(), L"wb")) {
         const std::string note = "list: " + WideToUtf8(texState.globalFile.wstring()) +
-            "\r\nrequested:\r\n" + TexturePacks::BuildStack(stack, packWanted ? &liteRef : nullptr) +
+            "\r\nrequested:\r\n" + TexturePacks::BuildStack(sessionStack, packWanted ? &liteRef : nullptr) +
             "\r\nread back:\r\n" + TexturePacks::ReadFile(texState.globalFile);
         fwrite(note.data(), 1, note.size(), f);
         fclose(f);
+    }
+    if (!MarksPack::CommitRequest(TexturePacks::EnvPath("LOCALAPPDATA", L"LOCALAPPDATA"), MarksPackWanted()) ||
+        !JavaChatPack::CommitRequest(TexturePacks::EnvPath("LOCALAPPDATA", L"LOCALAPPDATA"), JavaChatPackWanted())) {
+        error = "Could not record the chat profile request.";
+        return false;
     }
     StripLitePack(texState);
     texFileTime = TexturePacks::WriteTime(texState.globalFile);
@@ -11380,7 +12680,7 @@ void ApplyPendingTextures()
     }
     texEditing = false;
     texPendingStack.clear();
-    texStatus = MinecraftDataProvider::IsInWorld() && !MinecraftDataProvider::IsLiveTexturesAvailable() ? L"Saved - leave the world to apply."
+    texStatus = MinecraftDataProvider::IsInWorld() && !MinecraftDataProvider::IsLiveTexturesAvailable() ? Lang::T(L"タイトル画面で反映されます", L"Applied on the title screen")
               : stack.empty() ? L"Switched to: Default textures  (reload requested)"
                               : L"Applied " + std::to_wstring(stack.size()) + (stack.size() == 1 ? L" pack" : L" packs") + L"  (reload requested)";
 }
@@ -11594,9 +12894,8 @@ void DrawTexturesDetails(HDC hdc, int x, int y)
 
     DrawTextSimple(
         hdc, x, y + 148,
-        texStatus.empty()
-            ? L"A server that forces its own pack can still override this."
-            : texStatus,
+        MyClientTexturePolicy::ShowTitleNotice(MinecraftDataProvider::IsInWorld(), MinecraftDataProvider::IsLiveTexturesAvailable(), texStatus)
+            ? Lang::T(L"タイトル画面で反映されます", L"Applied on the title screen") : !texStatus.empty() ? texStatus : L"A server that forces its own pack can still override this.",
         t.muted, 12
     );
 
@@ -12809,6 +14108,8 @@ void DrawModuleGlyph(HDC hdc, DetailFeature f, float cx, float cy, float u, COLO
         seg(-0.38f, -0.14f, 0.38f, -0.14f); P(-0.38f, -0.14f); P(-0.2f, -0.28f); P(-0.2f, 0.0f); fill();
         seg(-0.38f, 0.18f, 0.38f, 0.18f); P(0.38f, 0.18f); P(0.2f, 0.04f); P(0.2f, 0.32f); fill();
         break;
+    case DetailFeature::Combo: text(L"×", 0.8f); break;
+    case DetailFeature::Minimap: arc(0,0,0.42f,0,2*pi,26); line(true); seg(0,-0.3f,0,0.3f); seg(-0.3f,0,0.3f,0); break;
     case DetailFeature::HitEffect:    // burst
         for (int k = 0; k < 8; k++) { const float a = pi / 4 * k; seg(0.16f * std::cos(a), 0.16f * std::sin(a), (k % 2 ? 0.32f : 0.44f) * std::cos(a), (k % 2 ? 0.32f : 0.44f) * std::sin(a)); }
         break;
@@ -13510,6 +14811,7 @@ GlassSetting KeySetting(DetailFeature f)
              : f == DetailFeature::MenuOpen ? L"Opens and closes this menu. Right-click to reset to G"
              : f == DetailFeature::DebugMenu ? L"Shows / hides the debug screen in a world. Right-click to reset to F3"
                                             : L"Turns the module on / off. Right-click to reset";
+    if(f==DetailFeature::Minimap){s.label=L"World map key";s.note=L"Opens / closes the map. Esc also closes";}
     s.keyOf = f;
     return s;
 }
@@ -13626,14 +14928,15 @@ void HivePartRows(std::vector<GlassSetting>& rows, DetailFeature part)
         a.note = !hiveStatsAuto ? L"Uses the game picked below"
                  : hiveDetectedGame >= 0 ? L"Detected: " + AsciiToWide(HiveStats::kGames[hiveDetectedGame].name)
                                          : L"Not detected - using the pick below";
-        a.press = []() { hiveStatsAuto = !hiveStatsAuto; hiveFetcher.Clear(); SaveConfig(); };
+        a.press = []() { hiveStatsAuto = !hiveStatsAuto; SaveConfig(); };
         rows.push_back(a);
         rows.push_back(HeaderSetting(L"Game"));
-        for (int i = 0; i < HiveStats::kGameCount; i++)
-            rows.push_back(RadioSetting(AsciiToWide(HiveStats::kGames[i].name), L"",
-                                        [i]() { return hiveStatsAuto && hiveDetectedGame >= 0 ? i == hiveDetectedGame : i == hiveStatsGame; },
-                                        [i]() { hiveStatsGame = i; hiveStatsAuto = false; hiveFetcher.Clear(); SaveConfig(); }));
-        rows.push_back(InfoSetting(L"Data", L"The Hive's public API. Needs the updated DLL for the player list"));
+        for (int i = HiveStats::kHidden; i < HiveStats::kGameCount; i++)
+            if (HiveStats::Pickable(i)) rows.push_back(RadioSetting(HiveStatsGameName(i), i == HiveStats::kAllGames ? L"Every game added up (KDR / Win% / Games)"
+                                                            : i == HiveStats::kHidden ? L"No table while the game is not detected" : L"",
+                                        [i]() { return i == HiveStatsShownGame(); },
+                                        [i]() { hiveStatsGame = i; hiveStatsAuto = false; SaveConfig(); }));
+        rows.push_back(InfoSetting(L"Data", L"The Hive's public API. Shown only on The Hive; needs the updated DLL"));
         HudBoxSettings(rows, HudElementId::HiveStats, hiveStatsEnabled && hiveEnabled);
         HudColorRows(rows, HudElementId::HiveStats, L"Default: the stats colored by how high they are", HudBoxOn(HudElementId::HiveStats));
         break;
@@ -13643,13 +14946,272 @@ void HivePartRows(std::vector<GlassSetting>& rows, DetailFeature part)
     }
 }
 
+// ---- Settings > Share: config sharing codes (docs/config-sharing-design.md, stage A) ----
+#include "ConfigShare/Bind.h"
+#include "ConfigShare/Worker.h"
+
+namespace ShareUi {
+ConfigShare::Worker& TheWorker()
+{
+    static ConfigShare::Worker worker;
+    static bool hooked = false;
+    if (!hooked) { worker.SetOnDone([]() { if (overlayWindow) InvalidateRect(overlayWindow, nullptr, FALSE); }); hooked = true; }
+    return worker;
+}
+std::wstring status;
+bool statusBad = false;
+// The pasted code waiting on the confirm rows (only the Apply button leads to Apply()).
+bool pending = false;
+ConfigShare::DecodeResult incoming;
+ConfigShare::DiffResult diff;
+uint8_t chosen = 0;
+bool backingUp = false;
+// Undo of the last import (memory only; gone when the HUD closes).
+bool hasUndo = false;
+ConfigShare::Snapshot undo;
+uint8_t undoCategories = 0;
+
+void Say(const wchar_t* ja, const wchar_t* en, bool bad) { status = Lang::T(ja, en); statusBad = bad; }
+
+bool CopyToClipboard(const std::string& utf8)
+{
+    const std::wstring text = Utf8ToWide(utf8);
+    if (!OpenClipboard(overlayWindow)) return false;
+    bool ok = false;
+    EmptyClipboard();
+    if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, (text.size() + 1) * sizeof(wchar_t)))
+    {
+        if (void* p = GlobalLock(mem))
+        {
+            memcpy(p, text.c_str(), (text.size() + 1) * sizeof(wchar_t));
+            GlobalUnlock(mem);
+            ok = SetClipboardData(CF_UNICODETEXT, mem) != nullptr;
+        }
+        if (!ok) GlobalFree(mem);
+    }
+    CloseClipboard();
+    return ok;
+}
+
+// Copies at most 16KB + 1 characters, so an oversized paste is still seen as too large.
+bool ReadClipboard(std::string& out)
+{
+    out.clear();
+    if (!OpenClipboard(overlayWindow)) return false;
+    std::wstring text;
+    if (HANDLE data = GetClipboardData(CF_UNICODETEXT))
+        if (const wchar_t* p = static_cast<const wchar_t*>(GlobalLock(data)))
+        {
+            for (size_t i = 0; p[i] && i <= ConfigShare::MaxInputBytes; i++) text += p[i];
+            GlobalUnlock(data);
+        }
+    CloseClipboard();
+    out = WideToUtf8(text);
+    return true;
+}
+
+uint8_t Usable(uint8_t categories)
+{
+    if (!ConfigShare::HudAvailable()) categories &= uint8_t(~uint8_t(ConfigShare::Category::Hud));
+    return categories;
+}
+
+void CopyCode()
+{
+    using namespace ConfigShare;
+    const uint8_t cats = Usable(AllCategories);
+    const std::string code = EncodeCode(Capture(cats), cats, "", "");
+    if (!CopyToClipboard(code)) { Say(L"クリップボードを開けませんでした", L"Could not open the clipboard", true); return; }
+    if (cats & uint8_t(Category::Hud)) Say(L"今の設定をコピーしました", L"Copied the current settings", false);
+    else Say(L"コピーしました（ゲームが起動していないので HUD の位置は含めていません）", L"Copied (HUD positions left out: the game is not running)", false);
+}
+
+void PasteCode()
+{
+    std::string text;
+    if (!ReadClipboard(text)) { Say(L"クリップボードを開けませんでした", L"Could not open the clipboard", true); return; }
+    pending = false;
+    if (!TheWorker().Decode({std::move(text), ConfigShare::Capture(ConfigShare::AllCategories)}))
+        Say(L"処理中です。少し待ってからもう一度押してください", L"Busy. Try again in a moment", true);
+    else
+        Say(L"コードを確かめています…", L"Checking the code…", false);
+}
+
+void FinishApply()
+{
+    using namespace ConfigShare;
+    const uint8_t cats = Usable(chosen & incoming.categories);
+    const int before = liteApplyCount;
+    const ApplyReport rep = Apply(incoming.snapshot, cats, &undo);
+    hasUndo = true;
+    undoCategories = cats;
+    pending = false;
+    status = std::wstring(Lang::T(L"設定を読み込みました（", L"Loaded the settings (")) + std::to_wstring(rep.changed) +
+             Lang::T(L" 項目）。ApplyLite: ", L" changed). ApplyLite: ") + std::to_wstring(liteApplyCount - before);
+    statusBad = false;
+    if (overlayWindow) InvalidateRect(overlayWindow, nullptr, FALSE);
+}
+
+void UndoImport()
+{
+    if (!hasUndo) return;
+    // HUD positions cannot be put back without the game window: keep the undo for later
+    // instead of restoring only part of it and losing the rest.
+    if ((undoCategories & uint8_t(ConfigShare::Category::Hud)) && !ConfigShare::HudAvailable())
+    {
+        Say(L"HUD の位置を戻すにはゲームが必要です。ゲームを起動してからもう一度押してください",
+            L"Putting HUD positions back needs the game. Start the game, then press again", true);
+        return;
+    }
+    const int before = liteApplyCount;
+    ConfigShare::Snapshot discard;
+    const ConfigShare::ApplyReport rep = ConfigShare::Apply(undo, Usable(undoCategories), &discard);
+    hasUndo = false;
+    status = std::wstring(Lang::T(L"直前のインポートを元に戻しました（", L"Undid the last import (")) + std::to_wstring(rep.changed) +
+             Lang::T(L" 項目）。ApplyLite: ", L" changed). ApplyLite: ") + std::to_wstring(liteApplyCount - before);
+    statusBad = false;
+}
+
+const wchar_t* ErrorText(ConfigShare::DecodeError e)
+{
+    using E = ConfigShare::DecodeError;
+    switch (e)
+    {
+    case E::TooLarge: return Lang::T(L"コードが大きすぎます", L"The code is too large");
+    case E::NotACode: return Lang::T(L"クリップボードに共有コードがありません", L"No share code on the clipboard");
+    case E::SiteCode: return Lang::T(L"サイトのコードにはまだ対応していません", L"Site codes are not supported yet");
+    case E::BadBase64:
+    case E::BadCrc: return Lang::T(L"コードが途中で切れているか、書き換わっています", L"The code is cut short or was changed");
+    case E::NewerCodeVersion:
+    case E::NewerSchema: return Lang::T(L"新しいクライアントのコードです。クライアントを更新してください", L"Made by a newer client. Please update");
+    case E::TooManyItems: return Lang::T(L"項目が多すぎます", L"Too many items");
+    case E::DuplicateId: return Lang::T(L"同じ項目が 2 回入っているので読めません", L"An item appears twice");
+    default: return Lang::T(L"コードが壊れています", L"The code is broken");
+    }
+}
+
+// UI thread, every time the Settings rows are built: take a finished job.
+void PollOne(ConfigShare::WorkerResult* r);
+void Poll()
+{
+    while (auto r = TheWorker().TryTakeResult()) PollOne(&*r);
+}
+void PollOne(ConfigShare::WorkerResult* r)
+{
+    if (r->type == ConfigShare::WorkerResult::Type::Decode)
+    {
+        if (!r->decoded.ok()) { pending = false; status = ErrorText(r->decoded.error); statusBad = true; return; }
+        incoming = std::move(r->decoded);
+        diff = r->diff;
+        chosen = incoming.categories;
+        pending = true;
+        Say(L"内容を確かめて「適用」を押してください", L"Check the contents, then press Apply", false);
+        return;
+    }
+    backingUp = false;
+    if (!pending) return;
+    if (!r->backupOk) { Say(L"バックアップを作れなかったので、適用しませんでした", L"Could not make a backup, so nothing was applied", true); return; }
+    FinishApply();
+}
+
+void StartApply()
+{
+    if (!pending || backingUp) return;
+    if (!(Usable(chosen & incoming.categories))) { Say(L"適用するカテゴリを選んでください", L"Choose at least one category", true); return; }
+    const std::filesystem::path config(ConfigPath());
+    const std::filesystem::path dir = std::filesystem::path(GetExecutableDirectory()) / L"config_backups";
+    if (!TheWorker().Backup({config, dir})) { Say(L"処理中です。少し待ってからもう一度押してください", L"Busy. Try again in a moment", true); return; }
+    backingUp = true;
+}
+
+std::wstring NameList(const std::vector<uint16_t>& ids)
+{
+    std::wstring out;
+    for (uint16_t id : ids) { if (!out.empty()) out += L", "; out += ConfigShare::ModuleName(id); }
+    return out.empty() ? std::wstring(Lang::T(L"なし", L"None")) : out;
+}
+
+// At the top of Settings, right after an import (Q2): the undo button stands out there.
+void UndoRow(std::vector<GlassSetting>& rows)
+{
+    if (!hasUndo) return;
+    GlassSetting s = ButtonSetting(Lang::T(L"直前のインポートを元に戻す", L"Undo the last import"),
+                                   Lang::T(L"読み込む前の設定に戻します（HUD を閉じると消えます）", L"Back to the settings from before (gone when the HUD closes)"),
+                                   Lang::T(L"元に戻す", L"Undo"), []() { UndoImport(); });
+    s.lit = []() { return true; };
+    rows.push_back(s);
+}
+
+void Rows(std::vector<GlassSetting>& rows)
+{
+    using namespace ConfigShare;
+    rows.push_back(HeaderSetting(L"Share"));
+    rows.push_back(ButtonSetting(Lang::T(L"今の設定をコピー", L"Copy current settings"),
+                                 Lang::T(L"モジュール・HUD の位置・テーマ・Lite を共有コードにします", L"Modules, HUD positions, theme and Lite as a share code"),
+                                 Lang::T(L"コピー", L"Copy"), []() { CopyCode(); }));
+    rows.push_back(ButtonSetting(Lang::T(L"コードを貼り付け", L"Paste a code"),
+                                 Lang::T(L"クリップボードのコードを確かめます。適用する前に内容を見られます", L"Checks the code on the clipboard. You see it before anything changes"),
+                                 Lang::T(L"貼り付け", L"Paste"), []() { PasteCode(); }));
+    if (!status.empty())
+        rows.push_back(InfoSetting(Lang::T(L"状態", L"Status"), L"", []() { return status; }, []() { return statusBad ? 3 : 1; }));
+    if (!pending) return;
+
+    // ---- Confirm rows ----
+    rows.push_back(HeaderSetting(Lang::T(L"読み込む内容", L"What will be loaded")));
+    const std::wstring name = incoming.name.empty() ? std::wstring(Lang::T(L"（名前なし）", L"(no name)")) : Utf8ToWide(incoming.name);
+    const std::wstring author = incoming.author.empty() ? std::wstring(Lang::T(L"（不明）", L"(unknown)")) : Utf8ToWide(incoming.author);
+    rows.push_back(InfoSetting(name, std::wstring(Lang::T(L"作者：", L"Author: ")) + author + Lang::T(L"（自己申告）", L" (self-declared)")));
+    struct Cat { Category c; const wchar_t* ja; const wchar_t* en; };
+    static const Cat cats[4] = {{Category::Modules, L"モジュール", L"Modules"}, {Category::Hud, L"HUD の位置", L"HUD positions"},
+                                {Category::Theme, L"テーマ", L"Theme"}, {Category::Lite, L"Lite", L"Lite"}};
+    const bool hudOk = HudAvailable();
+    for (const Cat& k : cats)
+    {
+        const uint8_t bit = uint8_t(k.c);
+        const bool inCode = (incoming.categories & bit) != 0;
+        const bool usable = inCode && (k.c != Category::Hud || hudOk);
+        GlassSetting s;
+        s.kind = GlassRowKind::Switch;
+        s.label = Lang::T(k.ja, k.en);
+        s.note = !inCode ? std::wstring(Lang::T(L"このコードには入っていません", L"Not in this code"))
+                 : !usable ? std::wstring(Lang::T(L"ゲームを起動してから使えます", L"Available once the game is running"))
+                           : std::to_wstring(diff.changed[CategoryIndex(k.c)]) + Lang::T(L" 項目が変わります", L" will change");
+        s.on = [bit, usable]() { return usable && (chosen & bit) != 0; };
+        s.press = [bit, usable]() { if (usable) chosen ^= bit; };
+        s.dim = !usable;
+        rows.push_back(s);
+    }
+    if (chosen & incoming.categories & uint8_t(Category::Modules))
+    {
+        rows.push_back(InfoSetting(Lang::T(L"オンになるモジュール", L"Turned ON"), NameList(diff.turnedOn)));
+        rows.push_back(InfoSetting(Lang::T(L"オフになるモジュール", L"Turned OFF"), NameList(diff.turnedOff)));
+    }
+    if (incoming.warnings > 0)
+        rows.push_back(InfoSetting(Lang::T(L"警告", L"Warnings"),
+                                   std::to_wstring(incoming.warnings) + Lang::T(L" 項目を読み飛ばすか、範囲に丸めました", L" items skipped or clamped to range"),
+                                   nullptr, []() { return 2; }));
+    GlassSetting apply = ButtonSetting(Lang::T(L"適用", L"Apply"),
+                                       Lang::T(L"先に myclient_config.txt を config_backups にコピーします", L"Backs up myclient_config.txt to config_backups first"),
+                                       backingUp ? Lang::T(L"保存中…", L"Saving…") : Lang::T(L"適用", L"Apply"), []() { StartApply(); });
+    apply.lit = []() { return true; };
+    rows.push_back(apply);
+    rows.push_back(ButtonSetting(Lang::T(L"やめる", L"Cancel"), L"", Lang::T(L"やめる", L"Cancel"),
+                                 []() { pending = false; Say(L"読み込みをやめました", L"Cancelled", false); }));
+}
+} // namespace ShareUi
+
 std::vector<GlassSetting> GlassSettings()
 {
     std::vector<GlassSetting> rows;
     if (selectedCategory == MenuCategory::Settings)
     {
+        ShareUi::Poll();
+        ShareUi::UndoRow(rows);
         rows.push_back(HeaderSetting(L"General"));
         rows.push_back(KeySetting(DetailFeature::MenuOpen));   // the menu key lives here, not in Mods
+        rows.push_back(ChoiceSetting(L"Language", Lang::T(L"ランチャーと共通", L"Shared with the launcher"), {L"日本語", L"English"},
+                                     []() { return Lang::English() ? 1 : 0; },
+                                     [](int i) { Lang::Current() = i ? Lang::Id::En : Lang::Id::Ja; Lang::Save(Lang::Current()); }));
         rows.push_back(HeaderSetting(L"Appearance"));
         rows.push_back(SwitchSetting(L"Dark mode", L"Also the moon / sun button at the top", glassDark));
         PaletteWithPicker(rows, L"Accent color", kGlassAccents, kGlassAccentCount, glassAccentIndex, 0);
@@ -13660,6 +15222,7 @@ std::vector<GlassSetting> GlassSettings()
         rows.push_back(HeaderSetting(L"HUD"));
         rows.push_back(ButtonSetting(L"Edit HUD", L"Move and resize the in-game HUD", L"Open", []() { OpenHudEditor(); }));
         rows.push_back(ButtonSetting(L"Reset HUD layout", L"Every HUD element back to its first place", L"Reset", []() { ResetHudLayout(); }));
+        ShareUi::Rows(rows);
         return rows;
     }
     if (selectedCategory == MenuCategory::Presets)
@@ -13823,6 +15386,12 @@ std::vector<GlassSetting> GlassSettings()
             };
             rows.push_back(keys);
         }
+        break;
+    case DetailFeature::Combo:
+        rows.push_back(SwitchSetting(L"Hide zero", L"Hide the counter while the combo is zero", comboHideZero));
+        rows.push_back(InfoSetting(L"Status", L"Confirmed hits from the game", []() {
+            return MinecraftDataProvider::Combo().available ? ComboText() : std::wstring(L"この版では使えません");
+        }, []() { return MinecraftDataProvider::Combo().available ? 1 : 2; }));
         break;
     case DetailFeature::CPS:
         rows.push_back(InfoSetting(L"Counting", L"Left and right clicks are counted separately"));
@@ -14078,6 +15647,22 @@ std::vector<GlassSetting> GlassSettings()
         rows.push_back(s);
         break;
     }
+    case DetailFeature::Minimap:
+        rows.push_back(ChoiceSetting(L"Size",L"Minimap diameter",{L"Small",L"Medium",L"Large"},[](){return minimapSize;},[](int i){minimapSize=i;SaveConfig();}));
+        rows.push_back(ChoiceSetting(L"Zoom",L"Pixels per block",{L"1",L"2",L"4",L"8"},[](){return minimapZoom;},[](int i){minimapZoom=i;SaveConfig();}));
+        rows.push_back(SwitchSetting(L"Rotate with you",L"Off: north stays up",minimapRotate));
+        rows.push_back(SwitchSetting(L"Coordinates",L"Below the minimap",minimapCoordinates));
+        rows.push_back(SwitchSetting(L"Show mobs",L"Local worlds and confirmed Realms only",minimapMobs));
+        {
+            GlassSetting world=SwitchSetting(L"Show mobs in this world",L"Cannot override an unknown or external server",minimapWorldMobs);
+            world.press=[](){if(!MinimapHud::ready)return;minimapWorldMobs=!minimapWorldMobs;std::error_code ec;std::filesystem::create_directories(MinimapHud::Maps().WorldFolder(),ec);if(!ec){std::ofstream out(MinimapHud::Maps().WorldFolder()/L"mobs.flag");out<<minimapWorldMobs;}};rows.push_back(world);
+        }
+        rows.push_back(SwitchSetting(L"Hostile border",L"Outline hostile faces",minimapBorder));
+        rows.push_back(PaletteSetting(L"Border colour",kMinimapBorders,4,minimapBorderIndex));
+        rows.push_back(ButtonSetting(L"Clear this world's map",L"Deletes all dimensions after confirmation",L"Clear",[](){if(MinimapHud::ready && MessageBoxW(overlayWindow,L"Delete this world's explored map?",L"Minimap",MB_YESNO|MB_ICONQUESTION)==IDYES)MinimapHud::Maps().ClearWorld();}));
+        rows.push_back(ButtonSetting(L"Position and size",L"Move in the HUD editor",L"Edit HUD",[](){OpenHudEditor();}));
+        rows.push_back(InfoSetting(L"Map status",L"",[](){return MinimapHud::saveFailed?std::wstring(L"Map save failed"):MinimapHud::ready?std::wstring(L"Ready"):std::wstring(L"DLL update required / waiting");}));
+        break;
     case DetailFeature::Replay:
         rows.push_back(InfoSetting(L"Recording", L"Start any time: it also keeps the game from when you joined", []()
         {
@@ -14090,6 +15675,18 @@ std::vector<GlassSetting> GlassSettings()
         }, []() { MinecraftDataProvider::ReplayStatus st{}; return !replayEnabled ? 0 : MinecraftDataProvider::GetReplayStatus(st) ? 1 : 2; }));
         rows.push_back(ButtonSetting(L"Replays", L"Play, rename, favourite, download or delete recordings", L"Open Replays", []() { OpenReplays(false); }));
         rows.push_back(ButtonSetting(L"Replay folder", L"The .mcrec files", L"Open folder", []() { OpenReplayFolder(); }));
+        rows.push_back(HeaderSetting(L"Playback keys"));
+        for (int i = 0; i < 3; i++)
+        {
+            GlassSetting key;
+            key.kind = GlassRowKind::Key;
+            key.label = i == 0 ? L"Pause / Resume" : i == 1 ? L"Add camera point" : L"Remove last camera point";
+            key.note = i == 0 ? L"While a recording plays. Right-click to clear"
+                              : L"Free camera only: the camera moves through the points when playing. Right-click to clear";
+            key.keyOf = DetailFeature::Replay;
+            key.keySlot = i;
+            rows.push_back(key);
+        }
         break;
     case DetailFeature::MenuSounds:
         rows.push_back(HeaderSetting(L"Sound"));
@@ -14137,6 +15734,10 @@ std::vector<GlassSetting> GlassSettings()
         HudBoxSettings(rows, HudElementId::Keystrokes, keystrokesEnabled);
         HudColorRows(rows, HudElementId::Keystrokes, L"Default: white", HudBoxOn(HudElementId::Keystrokes));
         break;
+    case DetailFeature::Combo:
+        HudBoxSettings(rows, HudElementId::Combo, comboEnabled);
+        HudColorRows(rows, HudElementId::Combo, L"Default: white", HudBoxOn(HudElementId::Combo));
+        break;
     case DetailFeature::CPS:
         HudBoxSettings(rows, HudElementId::CPS, cpsEnabled);
         HudColorRows(rows, HudElementId::CPS, L"Default: white", HudBoxOn(HudElementId::CPS));
@@ -14150,9 +15751,11 @@ std::vector<GlassSetting> GlassSettings()
         HudColorRows(rows, HudElementId::DayTimer, L"Default: white (the second line grey)", HudBoxOn(HudElementId::DayTimer));
         break;
     case DetailFeature::JavaChat:
-        rows.push_back(InfoSetting(L"JAVAチャット", L"HUD調整で移動できます。標準の入力画面はそのまま使えます。", []() {
-            return !javaChatEnabled ? std::wstring(L"Off") : MinecraftDataProvider::JavaChatReady() ?
-                std::wstring(L"標準欄を置換") : std::wstring(L"準備待ち・標準表示を維持");
+        rows.push_back(InfoSetting(Lang::T(L"JAVAチャット", L"JAVA CHAT"), Lang::T(L"HUD調整で移動できます。ワールド内の変更はタイトル画面で反映されます。", L"Move it in HUD Edit. Changes made in a world apply on the title screen."), []() {
+            if (javaChatEnabled && MinecraftDataProvider::JavaChatAvailability() == 0)
+                return std::wstring(Lang::T(L"使用不可：この環境では利用できません。標準チャットを維持します。", L"Unavailable: cannot be used here. Keeping the standard chat."));
+            return !javaChatEnabled ? (MinecraftDataProvider::JavaChatReady() ? std::wstring(Lang::T(L"OFF要求済み・タイトル画面で反映", L"OFF requested, applies on the title screen")) : std::wstring(L"Off")) : MinecraftDataProvider::JavaChatReady() ?
+                std::wstring(Lang::T(L"標準欄を置換", L"Replacing the standard box")) : std::wstring(Lang::T(L"準備待ち・標準表示を維持", L"Waiting, keeping the standard display"));
         }));
         HudBoxSettings(rows, HudElementId::JavaChat, javaChatEnabled);
         HudColorRows(rows, HudElementId::JavaChat, L"Default: white", HudBoxOn(HudElementId::JavaChat));
@@ -14330,7 +15933,7 @@ void LiteSettings(std::vector<GlassSetting>& rows)
                 const int steps = (i.max - i.min) / i.step;
                 *i.value = i.min + (int)std::lround(t * steps) * i.step;
             };
-            s.text = [key]() { const LiteSliderInfo i = LiteSlider(key); return std::to_wstring(*i.value) + i.unit; };
+            s.text = [key]() { return LiteSliderText(key); };
             if (key == LiteRenderDistance) s.released = []() { RequestRenderDistance(); };   // applied when the knob is let go
             rows.push_back(s);
             break;
@@ -15435,7 +17038,7 @@ void HandleGlassRowsClick(HWND hwnd, int mx, int my, bool right)
             {
                 if (int* key = KeyTargetOf(s.keyOf, s.keySlot))
                 {
-                    *key = s.keySlot >= 0 ? 0 : s.keyOf == DetailFeature::MenuOpen ? 'G' : s.keyOf == DetailFeature::DebugMenu ? VK_F3 : 0;
+                    *key = s.keySlot >= 0 ? 0 : s.keyOf == DetailFeature::MenuOpen ? 'G' : s.keyOf == DetailFeature::DebugMenu ? VK_F3 : s.keyOf == DetailFeature::Minimap ? 'M' : 0;
                     SaveConfig();
                 }
                 waitingForShortcut = false;
@@ -15723,13 +17326,204 @@ int closetTab = 0; // Independent Closet sections: skins / capes.
 bool closetAskingCape = false;
 const std::vector<uint8_t>& ClosetCapePixels(uint32_t id)
 {
-    static std::vector<uint8_t> images[3];
-    static bool loaded[3] = {};
-    if (id > 0 && id <= 2 && !loaded[id]) {
+    static std::vector<uint8_t> images[7];
+    static bool loaded[7] = {};
+    static std::mutex loading;   // the Closet (UI thread) and CapeService (its own thread) both ask (review I4)
+    std::lock_guard lock(loading);
+    if (id > 0 && id <= 6 && !loaded[id]) {
         loaded[id] = true;
         CapeLibrary::Load(id, images[id]);
     }
-    return images[id <= 2 ? id : 0];
+    return images[id <= 6 ? id : 0];
+}
+
+// --- OriginX capes between OriginX users (docs/superpowers/specs/2026-11-12-capes-design.md) -----------------
+// A thread here talks to the Worker with the launcher's login key (account.json, kept in memory only): which capes
+// this account may wear (/launcher/status), which cape you wear (/capes/register) and the capes of the players in
+// your world (/capes/lookup). The game DLL lists the players and puts the capes on, in your game only (CapeChannel.h).
+// The cape pictures go to %LOCALAPPDATA%\MyClient\capes\<id>.rgba (512x256 RGBA) for the DLL.
+namespace CapeService {
+std::mutex mutex;
+std::vector<uint32_t> owned{2};   // capes this account may wear (Standard until the Worker says more)
+bool loggedIn = false;
+std::atomic<bool> marksDenied{false};   // the Worker said: not a member (or the login ended)
+
+std::filesystem::path Folder()
+{
+    wchar_t base[MAX_PATH]{};
+    const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+    return n && n < MAX_PATH ? std::filesystem::path(base) / L"MyClient" : std::filesystem::path();
+}
+bool Owns(uint32_t cape) { std::lock_guard g(mutex); return cape == 0 || std::find(owned.begin(), owned.end(), cape) != owned.end(); }
+
+void WritePictures()
+{
+    const auto folder = Folder() / L"capes";
+    std::error_code ec;
+    std::filesystem::create_directories(folder, ec);
+    for (uint32_t id = 1; id <= 6; ++id) {
+        const auto& pixels = ClosetCapePixels(id);
+        if (pixels.size() != MyClientSkin::CapeBytes) continue;
+        const auto file = folder / (std::to_wstring(id) + L".rgba");
+        if (std::filesystem::file_size(file, ec) == pixels.size() && !ec) continue;
+        const auto temp = folder / (std::to_wstring(id) + L".tmp");
+        { std::ofstream out(temp, std::ios::binary | std::ios::trunc); out.write(reinterpret_cast<const char*>(pixels.data()), pixels.size()); }
+        MoveFileExW(temp.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING);
+    }
+    // Cape HD (docs/superpowers/specs/2026-11-19-cape-hd-render-design.md): the original 2048x1024 PNGs, unchanged,
+    // for the DLL, which loads them as game textures (capes\hd\<id>.png).
+    const auto hd = folder / L"hd";
+    std::filesystem::create_directories(hd, ec);
+    for (uint32_t id = 1; id <= 6; ++id) {
+        HRSRC found = FindResourceW(nullptr, MAKEINTRESOURCEW(100 + id), MAKEINTRESOURCEW(10));   // RT_RCDATA
+        HGLOBAL loaded = found ? LoadResource(nullptr, found) : nullptr;
+        const void* bytes = loaded ? LockResource(loaded) : nullptr;
+        const DWORD size = found ? SizeofResource(nullptr, found) : 0;
+        if (!bytes || !size) continue;
+        const auto file = hd / (std::to_wstring(id) + L".png");
+        if (std::filesystem::file_size(file, ec) == size && !ec) continue;
+        const auto temp = hd / (std::to_wstring(id) + L".tmp");
+        { std::ofstream out(temp, std::ios::binary | std::ios::trunc); out.write(static_cast<const char*>(bytes), size); }
+        MoveFileExW(temp.c_str(), file.c_str(), MOVEFILE_REPLACE_EXISTING);
+    }
+}
+
+void Run()
+{
+    WritePictures();
+    MyClientCapes::Channel channel;
+    DWORD openedFor = 0;
+    std::map<std::string, uint64_t> askedAt;
+    std::map<std::string, uint32_t> known, knownMarks;
+    std::map<std::string, uint64_t> answeredAt;
+    std::string previousToken; // memory only; never logged
+    std::string registered;   // "<xuid>:<cape>" last sent
+    uint64_t statusAt = 0, registerFailedAt = 0, lookupFailedAt = 0;
+    const auto clearAnswer = [&] {
+        known.clear(); knownMarks.clear(); answeredAt.clear();
+        if (channel.Data() && channel.Lock()) {
+            auto& data = *channel.Data();
+            if (MyClientCapes::Valid(data, openedFor)) {
+                std::memset(data.flags, 0, sizeof data.flags);
+                std::memset(data.capes, 0, sizeof data.capes);
+                data.ownTier = 0;
+                data.hudAt = 0;
+            }
+            channel.Unlock();
+        }
+    };
+    const auto endLogin = [&](int status) {
+        if (!CapeClient::EndsLogin(status)) return false;
+        marksDenied.store(true);
+        clearAnswer();
+        std::lock_guard g(mutex); owned = {2}; loggedIn = false; return true;
+    };
+    for (;;) {
+        bool changed;
+        {
+            std::unique_lock lock(capeWakeMutex);
+            capeWake.wait_for(lock, std::chrono::seconds(2), [] { return capeSettingsPending; });
+            changed = capeSettingsPending; capeSettingsPending = false;
+        }
+        if (changed) { registered.clear(); registerFailedAt = 0; askedAt.clear(); }
+        const uint32_t visibility = capeVisibility.load();
+        const uint64_t now = GetTickCount64();
+        const std::string token = CapeClient::ReadToken(Folder() / L"account.json");
+        if (token != previousToken) {
+            marksDenied.store(false);
+            clearAnswer(); askedAt.clear(); registered.clear();
+            statusAt = registerFailedAt = lookupFailedAt = 0;
+            previousToken = token;
+            { std::lock_guard g(mutex); loggedIn = false; owned = {2}; }
+        }
+        if (token.empty()) { clearAnswer(); std::lock_guard g(mutex); owned = {2}; loggedIn = false; continue; }
+        if (!statusAt || now - statusAt > 5 * 60 * 1000) {
+            statusAt = now;
+            int status = 0; std::string answer; std::vector<uint32_t> capes;
+            if (CapeClient::Call(L"GET", L"/launcher/status", token, "", status, answer)) {
+                std::lock_guard g(mutex);
+                loggedIn = status == 200;
+                const auto profile = nlohmann::json::parse(answer, nullptr, false);
+                const bool verified = loggedIn && profile.is_object() && profile.contains("roles") &&
+                    profile["roles"].is_object() && profile["roles"].contains("verified") &&
+                    profile["roles"]["verified"] == true;
+                if (status == 200 || status == 401) marksDenied.store(!verified);
+                if (status == 200 && CapeClient::ParseOwned(answer, capes)) owned = capes.empty() ? std::vector<uint32_t>{2} : capes;
+                if (status == 401) { owned = {2}; clearAnswer(); }
+            }
+        }
+        if (!loggedIn) continue;
+        const DWORD pid = MinecraftDataProvider::GamePid();
+        if (!pid) { clearAnswer(); channel.Close(); openedFor = 0; continue; }
+        if (openedFor != pid || !channel.Data()) { clearAnswer(); if (!channel.Open(pid, false)) continue; openedFor = pid; known.clear(); knownMarks.clear(); answeredAt.clear(); askedAt.clear(); registered.clear(); }
+        if (!channel.Lock()) continue;
+        auto& shared = *channel.Data();
+        const bool fresh = MyClientCapes::Valid(shared, pid) && MyClientCapes::Fresh(shared.dllAt, now);
+        const std::string own = fresh ? std::string(shared.ownXuid) : std::string();
+        std::vector<std::string> present;
+        if (fresh) for (uint32_t i = 0; i < shared.count; ++i) if (shared.xuids[i][0]) present.push_back(shared.xuids[i]);
+        channel.Unlock();
+        if (!fresh) continue;
+        uint32_t chosen = MinecraftDataProvider::CapeChoice();
+        if (!Owns(chosen)) chosen = 0;
+        const std::string registration = CapeClient::RegisterBody(own, chosen, (visibility & 1) != 0, (visibility & 2) != 0);
+        if (!own.empty() && std::find(present.begin(), present.end(), own) == present.end()) present.insert(present.begin(), own);
+        if (!own.empty() && registered != registration && CapeClient::RetryDue(registerFailedAt, now)) {
+            int status = 0; std::string answer;
+            const bool answered = CapeClient::Call(L"POST", L"/capes/register", token, registration, status, answer);
+            if (answered && status == 200) { registered = registration; registerFailedAt = 0; }
+            else { registerFailedAt = now; if (endLogin(status)) continue; }
+        }
+        const auto due = CapeClient::DueForLookup(present, askedAt, now);
+        if (!due.empty() && CapeClient::RetryDue(lookupFailedAt, now)) {
+            int status = 0; std::string answer; std::map<std::string, uint32_t> capes, marks;
+            if (CapeClient::Call(L"POST", L"/capes/lookup", token, CapeClient::LookupBody(due), status, answer) && status == 200 &&
+                CapeClient::ParseLookup(answer, capes, marks)) {
+                lookupFailedAt = 0;
+                for (const auto& xuid : due) { askedAt[xuid] = now; known[xuid] = capes.count(xuid) ? capes[xuid] : 0; knownMarks[xuid] = marks.count(xuid) ? marks[xuid] : 0; answeredAt[xuid] = now; }
+            }
+            else { lookupFailedAt = now; if (endLogin(status)) continue; }
+        }
+        if (!channel.Lock()) continue;
+        if (MyClientCapes::Valid(shared, pid)) {
+            std::memset(shared.flags, 0, sizeof shared.flags);
+            for (uint32_t i = 0; i < shared.count; ++i) {
+                const auto it = known.find(shared.xuids[i]);
+                const bool freshAnswer = CapeClient::CachedAnswerFresh(answeredAt[shared.xuids[i]], GetTickCount64());
+                shared.capes[i] = static_cast<uint8_t>(freshAnswer && it != known.end() ? it->second : 0);
+                const auto mark = knownMarks.find(shared.xuids[i]);
+                if (freshAnswer && mark != knownMarks.end()) shared.flags[i] = static_cast<uint8_t>(mark->second & 0x0Fu);
+            }
+            const auto currentVisibility = capeVisibility.load();
+            shared.ownHideCape = (currentVisibility & 1) != 0;
+            shared.ownHideMark = (currentVisibility & 2) != 0;
+            shared.showMarks = (currentVisibility & 4) != 0;
+            const auto selfAnswer = answeredAt.find(own);
+            const auto selfMark = knownMarks.find(own);
+            shared.ownTier = own == shared.ownXuid && selfAnswer != answeredAt.end() &&
+                selfMark != knownMarks.end() && CapeClient::CachedAnswerFresh(selfAnswer->second, GetTickCount64())
+                ? selfMark->second : 0;
+            shared.ownCape = chosen;
+            shared.hudAt = GetTickCount64();
+        }
+        channel.Unlock();
+    }
+}
+void Start() { static bool started = false; if (started) return; started = true; std::thread(Run).detach(); }
+} // namespace CapeService
+// r57-test53: the pack waited for /launcher/status, which answered after the title-screen pack reload, so the game
+// never had OriginX Marks on its stack (the name colour showed, the icon did not). The launcher's MemberGate only
+// starts the game for a logged-in member (spec §1), so a saved login is enough to want the pack from the start.
+// A status answer that says "not a member" (or a 401) still turns it off.
+bool MarksPackWanted() {
+    static ULONGLONG checkedAt = 0;
+    static bool haveToken = false;
+    const ULONGLONG now = GetTickCount64();
+    if (!checkedAt || now - checkedAt >= 5000) {
+        checkedAt = now;
+        haveToken = !CapeClient::ReadToken(CapeService::Folder() / L"account.json").empty();
+    }
+    return haveToken && !CapeService::marksDenied.load();
 }
 bool closetScanned = false;
 int closetScroll = 0;                   // in rows
@@ -15751,16 +17545,25 @@ RECT ClosetRefreshRect(const GlassLayout& g) { return g.R(kMainR - 110 - 8 - 84,
 // Takes the Closet's skin off: the game's own skin again, and it is no longer put back on in every world.
 RECT ClosetOwnRect(const GlassLayout& g) { return g.R(kMainR - 110 - 8 - 84 - 8 - 96, kChipY - 2, 96, 34); }
 RECT ClosetTabRect(const GlassLayout& g, int tab) { return g.R(kMainX + tab * 94, 114, 86, 30); }
-RECT ClosetCapeRect(const GlassLayout& g, int cape) { return g.R(kMainX + 40 + (cape - 1) * 300, 160, 270, 330); }
+// Left to right: None (0, your own cape), Standard (2), Founding (1), Supporter (3), Creator (4), Moderator (5),
+// Nebula (6). Drawing and hit testing use the same row constrained to the panel's content area.
+RECT ClosetCapeRect(const GlassLayout& g, int cape)
+{
+    const auto card = ClosetLayout::CapeCard(kMainX, kMainR, cape);
+    return g.R(card.x, 160, card.width, 250);
+}
+RECT ClosetVisibilityRect(const GlassLayout& g, int row) {
+    return g.R(kMainX + 40, 424 + row * 36, kMainR - kMainX - 80, 30);
+}
 void DrawClosetTabs(HDC hdc, const GlassLayout& g, const GlassColors& c)
 {
     for (int i = 0; i < 2; ++i) {
         const RECT r = ClosetTabRect(g, i);
         GlassBox(hdc, r, g.L(5), closetTab == i ? GlassAccent() : c.chip, closetTab == i ? kGlassAccentAlpha : c.chipA);
         DrawTextCentered(hdc, r.left, r.top, r.right - r.left, r.bottom - r.top,
-            i ? L"マント" : L"スキン", closetTab == i ? RGB(255,255,255) : c.text, std::max(12, g.L(12)));
+            i ? Lang::T(L"マント", L"Cape") : Lang::T(L"スキン", L"Skin"), closetTab == i ? RGB(255,255,255) : c.text, std::max(12, g.L(12)));
     }
-    const std::wstring note = closetStatus.empty() ? (closetTab ? L"マントを選んで試着できます。" : L"スキンを選んで着替えられます。") : closetStatus;
+    const std::wstring note = closetStatus.empty() ? (closetTab ? Lang::T(L"マントを選んで試着できます。", L"Choose a cape to try it on.") : Lang::T(L"スキンを選んで着替えられます。", L"Choose a skin to change into it.")) : closetStatus;
     const RECT area = g.R(kMainX + 202, 114, kMainR - kMainX - 202, 30);
     const int saved = SaveDC(hdc);
     if (saved) {
@@ -16028,7 +17831,7 @@ bool PollClosetAnswer()
     switch (state)
     {
     case State::Unsupported:
-        text = L"マントはクラシックスキンで試着できます。スキンを読み込んでから選び直してください。";
+        text = Lang::T(L"マントはクラシックスキンで試着できます。スキンを読み込んでから選び直してください。", L"Capes can be tried on with a classic skin. Load the skin, then choose again.");
         closetAskedAt = 0;
         break;
     case State::Saved:
@@ -16055,10 +17858,10 @@ bool PollClosetAnswer()
     default: closetAskedAt = 0; return false;
     }
     if (closetAskingCape) {
-        if (state == State::Saved) text = L"マントの選択を保存しました。モデルの反映を待っています。";
-        else if (state == State::Sent) text = L"マントの変更を適用しました。サーバー側の設定により他の人からの見え方は異なります。";
-        else if (state == State::Failed) text = L"マントを変更できませんでした。OriginXのログを確認してください。";
-        else if (state == State::Waiting) text = L"マントの反映を待っています…";
+        if (state == State::Saved) text = Lang::T(L"マントの選択を保存しました。モデルの反映を待っています。", L"Saved the cape choice. Waiting for the model to update.");
+        else if (state == State::Sent) text = Lang::T(L"マントの変更を適用しました。サーバー側の設定により他の人からの見え方は異なります。", L"Applied the cape. How others see it depends on the server's settings.");
+        else if (state == State::Failed) text = Lang::T(L"マントを変更できませんでした。OriginXのログを確認してください。", L"Could not change the cape. Check the OriginX log.");
+        else if (state == State::Waiting) text = Lang::T(L"マントの反映を待っています…", L"Waiting for the cape to apply…");
     }
     closetShown = state;
     if (text == closetStatus) return false;
@@ -16073,31 +17876,78 @@ void DrawClosetCapes(HDC hdc)
     DrawGlassFrame(hdc, g, c, GlassRail::Closet);
     DrawGlassTitle(hdc, g, c, L"Closet", L"");
     DrawClosetTabs(hdc, g, c);
-    const RECT own = ClosetFolderRect(g);
-    GlassBox(hdc, own, g.L(5), c.chip, c.chipA);
-    DrawTextCentered(hdc, own.left, own.top, own.right - own.left, own.bottom - own.top, L"元のマント", c.text, std::max(12, g.L(11)));
     const uint32_t selectedCape = MinecraftDataProvider::CapeChoice();
-    for (uint32_t id = 1; id <= 2; ++id) {
+    {
+        // "None": no OriginX cape (your account's own cape, if it has one). A cape-shaped outline with a soft cross,
+        // in the cards' own colours, where the others show their cape.
+        const RECT r = ClosetCapeRect(g, 0);
+        const bool selected = selectedCape == 0;
+        GlassRingBox(hdc, r, g.L(12), c.fill, c.fillA, selected ? GlassAccent() : c.line,
+            selected ? kGlassAccentAlpha : 255, std::max(1, g.L(1)));
+        const int cell = std::max(1, g.L(7));
+        const int w = cell * 10, h = cell * 16;
+        const int x = (r.left + r.right) / 2 - w / 2, y = r.top + g.L(28);
+        const COLORREF ink = selected ? GlassAccent() : c.muted;
+        HPEN outline = CreatePen(PS_DOT, 1, ink);
+        HGDIOBJ oldPen = SelectObject(hdc, outline);
+        HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        RoundRect(hdc, x, y, x + w, y + h, cell, cell);
+        HPEN cross = CreatePen(PS_SOLID, std::max(2, cell / 3), ink);
+        SelectObject(hdc, cross);
+        const int mx = cell * 3, my = cell * 5, cx = x + w / 2, cy = y + h / 2;   // a tall cross, like the cape's shape
+        MoveToEx(hdc, cx - mx, cy - my, nullptr); LineTo(hdc, cx + mx, cy + my);
+        MoveToEx(hdc, cx + mx, cy - my, nullptr); LineTo(hdc, cx - mx, cy + my);
+        SelectObject(hdc, oldBrush);
+        SelectObject(hdc, oldPen);
+        DeleteObject(cross);
+        DeleteObject(outline);
+        DrawTextCentered(hdc, r.left, r.top + g.L(180), r.right - r.left, g.L(28), Lang::T(L"なし", L"no"), c.text, std::max(14, g.L(18)));
+        DrawTextCentered(hdc, r.left, r.top + g.L(215), r.right - r.left, g.L(24), selected ? Lang::T(L"選択中", L"Selected") : Lang::T(L"マントを外す", L"Remove cape"),
+                         selected ? GlassAccent() : c.muted, std::max(12, g.L(12)));
+    }
+    for (uint32_t id = 1; id <= 6; ++id) {
         const RECT r = ClosetCapeRect(g, id);
+        const bool locked = !CapeService::Owns(id);
         const bool selected = id == selectedCape;
         GlassRingBox(hdc, r, g.L(12), c.fill, c.fillA, selected ? GlassAccent() : c.line,
             selected ? kGlassAccentAlpha : 255, std::max(1, g.L(1)));
         const auto& pixels = ClosetCapePixels(id);
-        const int cell = std::max(1, g.L(10));
+        const int cell = std::max(1, g.L(7));
         const int x = (r.left + r.right) / 2 - cell * 5, y = r.top + g.L(28);
         if (pixels.size() == MyClientSkin::CapeBytes) {
             std::vector<uint32_t> doll(16 * 32);
             for (int py = 0; py < 16; ++py)
                 for (int px = 0; px < 10; ++px) {
-                    const auto* p = &pixels[((py + 1) * 64 + px + 12) * 4];
+                    // The cape is MyClientSkin::CapeWidth wide (HD since v3): the middle of each classic pixel.
+                    const uint32_t f = MyClientSkin::CapeWidth / MyClientSkin::ClassicCapeWidth;
+                    const auto* p = &pixels[(((py + 1) * f + f / 2) * MyClientSkin::CapeWidth + (px + 12) * f + f / 2) * 4];
                     if (p[3] >= 128) doll[(py + 1) * 16 + px + 3] = 0xff000000u | (uint32_t(p[0]) << 16) | (uint32_t(p[1]) << 8) | p[2];
                 }
             DrawSkinDoll(hdc, doll, x - cell * 3, y - cell, cell);
-        } else DrawTextCentered(hdc, r.left, y, r.right - r.left, g.L(160), L"画像を読み込めませんでした", c.muted, std::max(12, g.L(11)));
-        DrawTextCentered(hdc, r.left, r.top + g.L(220), r.right - r.left, g.L(28), CapeLibrary::Name(id), c.text, std::max(14, g.L(18)));
-        DrawTextCentered(hdc, r.left, r.top + g.L(268), r.right - r.left, g.L(24), selected ? L"選択中" : L"クリックして試着", selected ? GlassAccent() : c.muted, std::max(12, g.L(12)));
+            if (locked) {
+                // Not owned: the same tall cross as the None card, over the cape.
+                HPEN cross = CreatePen(PS_SOLID, std::max(2, cell / 3), c.muted);
+                HGDIOBJ oldPen = SelectObject(hdc, cross);
+                const int mx = cell * 3, my = cell * 5, cx = x + cell * 5, cy = y + cell * 8;
+                MoveToEx(hdc, cx - mx, cy - my, nullptr); LineTo(hdc, cx + mx, cy + my);
+                MoveToEx(hdc, cx + mx, cy - my, nullptr); LineTo(hdc, cx - mx, cy + my);
+                SelectObject(hdc, oldPen);
+                DeleteObject(cross);
+            }
+        } else DrawTextCentered(hdc, r.left, y, r.right - r.left, g.L(160), Lang::T(L"画像を読み込めませんでした", L"Could not load the image"), c.muted, std::max(12, g.L(11)));
+        DrawTextCentered(hdc, r.left, r.top + g.L(180), r.right - r.left, g.L(28), CapeLibrary::Name(id), c.text, std::max(14, g.L(18)));
+        DrawTextCentered(hdc, r.left, r.top + g.L(215), r.right - r.left, g.L(24),
+                         locked ? Lang::T(L"未所持", L"Not owned") : selected ? Lang::T(L"選択中", L"Selected") : Lang::T(L"クリックして着る", L"Click to wear"), selected && !locked ? GlassAccent() : c.muted, std::max(12, g.L(12)));
     }
-    DrawTextSimple(hdc, g.x + g.L(kMainX + 40), g.y + g.L(524), L"試着用の2種類です。クラシックスキンに対応しています。", c.muted, std::max(12, g.L(12)));
+    const wchar_t* labels[] = { Lang::T(L"自分のマントを見せない", L"Hide my cape"), Lang::T(L"自分のアイコンを見せない", L"Hide my icon"), Lang::T(L"他の人のアイコンを表示", L"Show others' icons") };
+    const uint32_t visibility = capeVisibility.load();
+    for (int row = 0; row < 3; ++row) {
+        const RECT r = ClosetVisibilityRect(g, row);
+        DrawTextSimple(hdc, r.left, r.top + g.L(4), labels[row], c.text, std::max(12, g.L(13)));
+        const RECT toggle{r.right - g.L(42), r.top + g.L(3), r.right, r.top + g.L(25)};
+        DrawGlassSwitch(hdc, toggle, (visibility & (1u << row)) != 0, c, false);
+    }
+    DrawTextSimple(hdc, g.x + g.L(kMainX + 40), g.y + g.L(548), Lang::T(L"OriginX のマントは、OriginX を使っている人どうしにだけ見えます。", L"OriginX capes are only visible between people using OriginX."), c.muted, std::max(12, g.L(12)));
 }
 
 void DrawCloset(HDC hdc)
@@ -16231,20 +18081,33 @@ void HandleClosetClick(int mx, int my)
     for (int tab = 0; tab < 2; ++tab)
         if (ContainsPoint(ClosetTabRect(g, tab), mx, my)) { closetTab = tab; closetStatus.clear(); return; }
     if (closetTab == 1) {
-        uint32_t cape = 3;
-        if (ContainsPoint(ClosetFolderRect(g), mx, my)) cape = 0;
-        for (uint32_t id = 1; id <= 2; ++id) if (ContainsPoint(ClosetCapeRect(g, id), mx, my)) cape = id;
-        if (cape <= 2) {
+        for (int row = 0; row < 3; ++row) {
+            if (!ContainsPoint(ClosetVisibilityRect(g, row), mx, my)) continue;
+            capeVisibility.fetch_xor(1u << row);
+            NotifyCapeSettings();
+            SaveConfig();
+            return;
+        }
+        uint32_t cape = 99;   // nothing clicked
+        for (uint32_t id = 0; id <= 6; ++id) if (ContainsPoint(ClosetCapeRect(g, id), mx, my)) cape = id;
+        if (cape >= 1 && cape <= 6 && !CapeService::Owns(cape)) {
+            closetStatus = cape >= 5 ? Lang::T(L"このマントは、moderator の人だけのマントです。", L"This cape is for moderators only.") :
+                cape == 4 ? Lang::T(L"Creator のマントは、クリエイターの人だけのマントです。", L"The Creator cape is for creators only.") :
+                Lang::T(L"このマントは、supporter として支援すると手に入ります（サイトのサポートのページ）。", L"This cape comes with supporting as a supporter (see the Support page on the site).");
+            ShellExecuteW(nullptr, L"open", L"https://originx.originx-client.workers.dev/support/", nullptr, nullptr, SW_SHOWNORMAL);
+            return;
+        }
+        if (cape <= 6) {
             const auto& pixels = ClosetCapePixels(cape);
-            if (cape && pixels.empty()) { closetStatus = L"マントの画像を読み込めませんでした。"; return; }
+            if (cape && pixels.empty()) { closetStatus = Lang::T(L"マントの画像を読み込めませんでした。", L"Could not load the cape image."); return; }
             using State = MinecraftDataProvider::SkinRequestState;
             const State answer = MinecraftDataProvider::RequestCape(cape, pixels);
             closetAskingCape = true;
             closetWearing = CapeLibrary::Name(cape);
             closetShown = answer;
             closetAskedAt = answer == State::Waiting ? GetTickCount64() : 0;
-            closetStatus = answer == State::Waiting ? L"マントを変更しています…" : answer == State::OldDll ?
-                L"マント対応版のOriginXへ更新してください。" : answer == State::NoGame ? L"Minecraftを起動してください。" : L"マントを変更できませんでした。";
+            closetStatus = answer == State::Waiting ? Lang::T(L"マントを変更しています…", L"Changing the cape…") : answer == State::OldDll ?
+                Lang::T(L"マント対応版のOriginXへ更新してください。", L"Update to an OriginX version that supports capes.") : answer == State::NoGame ? Lang::T(L"Minecraftを起動してください。", L"Start Minecraft.") : Lang::T(L"マントを変更できませんでした。", L"Could not change the cape.");
         }
         return;
     }
@@ -16692,6 +18555,127 @@ void CloseMenu(bool backToGame)
 }
 
 
+// F1 toggles hideAllUi, like the game's own F1 (pressed in play, not in a game screen or this menu). Pressed while
+// the replay bar had the keyboard (replayBarMode), the game did not see it: it gets an F1 of its own once it is in
+// front again, so its HUD goes too. That F1 is not counted here (a short quiet time).
+void PollHideAllUi(bool usable)
+{
+    static bool previous = false, forward = false;
+    static ULONGLONG quietUntil = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (forward && minecraftWindow && GetForegroundWindow() == minecraftWindow)
+    {
+        forward = false;
+        INPUT keys[2]{};
+        keys[0].type = keys[1].type = INPUT_KEYBOARD;
+        keys[0].ki.wVk = keys[1].ki.wVk = VK_F1;
+        keys[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(2, keys, sizeof(INPUT));
+        quietUntil = now + 400;
+    }
+    const bool down = usable && now >= quietUntil && IsKeyDown(VK_F1);
+    if (down && !previous)
+    {
+        hideAllUi = !hideAllUi;
+        if (replayBarMode) forward = true;
+        if (overlayWindow) InvalidateRect(overlayWindow, nullptr, FALSE);
+    }
+    previous = down;
+}
+
+
+// The replay bar's own mouse (replayBarMode): the overlay takes the mouse the way the menu does (the DLL is told the
+// HUD menu is open, so the game neither pauses nor turns the camera), but only the bar is drawn and clickable.
+// The keys the replay bar reads itself (by polling); every other key goes to the game.
+bool IsReplayBarOwnKey(int vk)
+{
+    switch (vk)
+    {
+    case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN: case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT:
+    case VK_MENU: case VK_LMENU: case VK_RMENU: case VK_CONTROL: case VK_F1:
+        return true;
+    default:
+        return vk == replayPauseKey || vk == replayPointKey || vk == replayUndoKey || vk == shortcuts.menuKey;
+    }
+}
+
+// Overlay window, a key press while the bar has the keyboard.
+void ForwardKeyFromReplayBar(int vk)
+{
+    if (vk <= 0 || vk > 254 || IsReplayBarOwnKey(vk)) return;
+    replayBarForwardKey = vk;
+    replayBarSuspendUntil = GetTickCount64() + 400;
+}
+
+void CloseWorldMap(bool focus=true){if(!MinimapHud::open)return;MinimapHud::open=false;MinimapHud::dragging=false;ReleaseCapture();if(!menuOpen){DeactivateOverlay(focus);MinecraftDataProvider::SetHudMenuOpen(false);}InvalidateRect(overlayWindow,nullptr,FALSE);}
+// usable: the game is in front and free; blocked: something in the game takes over (a game screen, typing, an
+// export). Going to another app does not close the map: it stays open, and the game is not paused meanwhile
+// (the HUD menu flag stays set), until M or Esc (r57-test11 request).
+void PollWorldMap(bool usable,bool blocked){
+ static bool previous=false;bool down=shortcuts.minimap>0 && IsKeyDown(shortcuts.minimap);
+ if(MinimapHud::open && (!minimapEnabled || !MinimapHud::ready || blocked || menuOpen || hideAllUi))CloseWorldMap(usable);
+ if(usable && !menuOpen && !waitingForShortcut && down && !previous && minimapEnabled && MinimapHud::ready){
+  if(MinimapHud::open)CloseWorldMap();else{MinimapHud::open=true;MinimapHud::worldView={MinimapHud::snapshot.x,MinimapHud::snapshot.z,2,0};replayBarMode=false;MinecraftDataProvider::SetHudMenuOpen(true);ActivateOverlay();}
+ }
+ previous=down;
+ // Drag and wheel (r57 request: only the area around you could be seen). Read here, not from window messages,
+ // which do not always reach the overlay while the game has the mouse (the replay bar had the same problem).
+ static bool held=false; static POINT last{};
+ const int wheel=worldMapWheelDelta.exchange(0);
+ if(!MinimapHud::open || !overlayWindow){held=false;return;}
+ POINT p{};RECT area{};
+ if(!GetCursorPos(&p) || !ScreenToClient(overlayWindow,&p) || !GetClientRect(overlayWindow,&area))return;
+ const bool left=(GetAsyncKeyState(VK_LBUTTON)&0x8000)!=0 && usable;
+ bool changed=false;
+ if(left && held && (p.x!=last.x || p.y!=last.y)){MinimapHud::worldView=MyClientMap::PanBy(MinimapHud::worldView,p.x-last.x,p.y-last.y);changed=true;}
+ held=left;last=p;
+ if(wheel){
+  MinimapHud::worldView=MyClientMap::ZoomAt(MinimapHud::worldView,p.x-area.right/2.0,p.y-area.bottom/2.0,std::pow(1.25,wheel/120.0),0.25,16);
+  changed=true;
+ }
+ if(changed || MinimapHud::cursor.x!=p.x || MinimapHud::cursor.y!=p.y){MinimapHud::cursor=p;InvalidateRect(overlayWindow,nullptr,FALSE);}
+}
+
+void UpdateReplayBarMode(bool usable)
+{
+    if (replayBarForwardKey && minecraftWindow && GetForegroundWindow() == minecraftWindow)
+    {
+        INPUT keys[2]{};
+        keys[0].type = keys[1].type = INPUT_KEYBOARD;
+        keys[0].ki.wVk = keys[1].ki.wVk = static_cast<WORD>(replayBarForwardKey);
+        keys[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(2, keys, sizeof(INPUT));
+        replayBarForwardKey = 0;
+    }
+    if (replayBarForwardKey && GetTickCount64() > replayBarSuspendUntil + 2000) replayBarForwardKey = 0;   // the game never came back
+    if(MinimapHud::open)return;
+    bool want = false;
+    if (usable && !menuOpen && !hideAllUi && GetTickCount64() >= replayBarSuspendUntil && !replayBarForwardKey &&
+        ReplayPlayer::Active() && MinecraftDataProvider::IsInWorld())
+    {
+        const ReplayPlayer::Status st = ReplayPlayer::Get();
+        const bool shown = st.phase == ReplayPlayer::Phase::Playing || st.phase == ReplayPlayer::Phase::Finished;
+        want = shown && !st.rewinding && (!st.freeCamera || IsKeyDown(VK_LMENU) || replayEditorOpen);
+    }
+    if (want == replayBarMode) return;
+    replayBarMode = want;
+    if (menuOpen) return;   // the G menu took over: it keeps the overlay and the mouse
+    if (want)
+    {
+        MinecraftDataProvider::SetHudMenuOpen(true);   // before the focus moves, as OpenMenu
+        ActivateOverlay();
+    }
+    else
+    {
+        // Another app in front (Alt+Tab, a click elsewhere): leave it there; give the game the focus back only
+        // when the game or this HUD is in front (the G menu does the same, review 2026-11-12).
+        DeactivateOverlay(usable);
+        MinecraftDataProvider::SetHudMenuOpen(false);
+    }
+    if (overlayWindow) InvalidateRect(overlayWindow, nullptr, FALSE);
+}
+
+
 // ------------------------- Window Procedure -----------------
 
 // HUD editor toolbar click. Returns true when the click was on the toolbar (and so is consumed).
@@ -16896,6 +18880,12 @@ LRESULT CALLBACK WindowProc(
             glassShapes.clear();
             textInks.clear();
 
+            if (hideAllUi && !menuOpen)
+            {
+                // F1: nothing of this HUD on the screen (the magenta fill above is the transparent colour).
+            }
+            else
+            {
             if (hudEditMode || (!menuOpen && !MinecraftDataProvider::IsGameMenuOpen()))
             {
                 DrawChunkBorders(back, w, h);
@@ -16909,6 +18899,7 @@ LRESULT CALLBACK WindowProc(
                 DrawShulkerHover(back, w, h);
                 DrawItemCounter(back, w, h);
             }
+            DrawReplayMarkers(back, w, h);
             DrawHomeReplaysButton(back);
             DrawReplayPlaybackBar(back);
 
@@ -16916,7 +18907,10 @@ LRESULT CALLBACK WindowProc(
             {
                 DrawMenu(back);
             }
+            DrawWorldMap(back,w,h);
             DrawReplayTimeline(back, w, h);   // above the menu: the menu is how the mouse reaches it
+            if (!menuOpen) DrawReplayEditor(back, w, h);
+            }
             UpdateGlassBlur(menuOpen && !menuParked && (GlassPageShown() || (selectedCategory == MenuCategory::Home && !replaysOpen && !hudEditMode)));
 
             GdiFlush();
@@ -17096,14 +19090,30 @@ LRESULT CALLBACK WindowProc(
     }
 
 
+    case WM_SYSKEYDOWN:
+    case WM_SYSKEYUP:
+        // Alt held for the replay bar: letting go of it must not put this window into its (empty) menu mode.
+        if (replayBarMode && (wParam == VK_MENU || wParam == VK_LMENU))
+            return 0;
+        break;
+
+
     case WM_NCHITTEST:
-        if (!menuOpen)
+        if (!menuOpen && !replayBarMode && !MinimapHud::open)
             return HTTRANSPARENT;
 
         return HTCLIENT;
 
 
     case WM_KEYDOWN:
+        if(MinimapHud::open){if(wParam==VK_ESCAPE && !(lParam&(1<<30)))CloseWorldMap();return 0;}
+        if (!menuOpen && replayBarMode)
+        {
+            if (replayEditorOpen && wParam == VK_DELETE && !ExportRunning()) { EditorDeleteSelected(); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+            if (replayEditorOpen && wParam == VK_ESCAPE) { CloseReplayEditor(); InvalidateRect(hwnd, nullptr, FALSE); return 0; }
+            if (!(lParam & (1 << 30))) ForwardKeyFromReplayBar((int)wParam);   // first press only, not the repeats
+            return 0;
+        }
         if (menuOpen &&
             hudEditMode)
         {
@@ -17440,9 +19450,21 @@ LRESULT CALLBACK WindowProc(
 
 
     case WM_LBUTTONDOWN:
+        if(MinimapHud::open)return 0;   // dragging is read in PollWorldMap
+
     {
         if (!menuOpen)
+        {
+            replayBarClickSeenAt = GetTickCount64();
+            if (replayBarMode && replayEditorOpen)
+            {
+                HandleEditorClickAt(static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam)));
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            else if (replayBarMode && HandleReplayTimelineClick(LOWORD(lParam), HIWORD(lParam)))
+                InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
+        }
 
         presetEditing = false;   // a click anywhere ends typing; the name box turns it back on
         StopCommandHotkeyEditing();   // ...the same for a Command Hotkeys line (its box turns it back on)
@@ -18115,22 +20137,21 @@ LRESULT CALLBACK WindowProc(
                         if (IsInside(mx, my, r.left, r.top, r.right - r.left, r.bottom - r.top))
                         {
                             hiveStatsAuto = !hiveStatsAuto;
-                            hiveFetcher.Clear();
                             SaveConfig();
                             InvalidateRect(hwnd, nullptr, FALSE);
                             return 0;
                         }
                     }
 
-                    for (int i = 0; i < HiveStats::kGameCount; i++)
+                    for (int i = HiveStats::kHidden; i < HiveStats::kGameCount; i++)
                     {
+                        if (!HiveStats::Pickable(i)) continue;
                         const RECT r = HiveStatsGameRect(i);
 
                         if (IsInside(mx, my, r.left, r.top, r.right - r.left, r.bottom - r.top))
                         {
                             hiveStatsGame = i;
                             hiveStatsAuto = false;   // picking a game by hand turns auto off
-                            hiveFetcher.Clear();   // stats differ per game
                             SaveConfig();
                             InvalidateRect(hwnd, nullptr, FALSE);
                             return 0;
@@ -18506,6 +20527,8 @@ LRESULT CALLBACK WindowProc(
 
 
     case WM_MOUSEMOVE:
+        if(MinimapHud::open)return 0;   // the cursor and dragging are read in PollWorldMap
+
     {
         if (menuOpen && !hudEditMode && !replaysOpen && selectedCategory == MenuCategory::Home)
         {
@@ -18599,6 +20622,8 @@ LRESULT CALLBACK WindowProc(
 
 
     case WM_LBUTTONUP:
+        if(MinimapHud::open){MinimapHud::dragging=false;ReleaseCapture();return 0;}
+
         if (closetSpinning)
         {
             ClosetSpin((short)LOWORD(lParam), (short)HIWORD(lParam), true);
@@ -18641,6 +20666,8 @@ LRESULT CALLBACK WindowProc(
 
 
     case WM_MOUSEWHEEL:
+        if(MinimapHud::open){MinimapHud::worldView.zoom=std::clamp(MinimapHud::worldView.zoom*(GET_WHEEL_DELTA_WPARAM(wParam)>0?2.0:0.5),1.0,8.0);InvalidateRect(hwnd,nullptr,FALSE);return 0;}
+
     {
         if (menuOpen && !hudEditMode && replaysOpen)
         {
@@ -18799,6 +20826,9 @@ LRESULT CALLBACK WindowProc(
 
 
     case WM_DESTROY:
+        MinimapHud::Maps().Flush();
+        hiveFetcher.Stop();   // its worker is joined before the HUD goes (2026-11-20)
+
         ApplyProcessTweaks(true);   // the game's process gets Windows' defaults back
         PostQuitMessage(0);
         return 0;
@@ -18898,6 +20928,7 @@ void CreateOverlay()
     );
 
     CreateBlurWindow(instance);
+    CapeService::Start();   // OriginX capes between OriginX users (Worker + CapeChannel)
 
 
     WNDCLASSW cc{};
@@ -18972,6 +21003,7 @@ int WINAPI WinMain(
     // 1 ms timer resolution: the loop's Sleep(16) otherwise lasts 15.6 or 31.2 ms at random, so
     // animations (toast bars) step unevenly.
     timeBeginPeriod(1);
+    Lang::Load();   // the launcher's choice (language.txt), else Windows' display language
     HANDLE sessionMutex = nullptr;
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -18995,8 +21027,13 @@ int WINAPI WinMain(
         ~SessionGuard() { if (handle) CloseHandle(handle); }
     } sessionGuard{sessionMutex};
     LoadConfig();
-    // The pack folders follow the game's data layout (TexturePacks::PackRoots): bring an ON pack up to date there.
-    if (ClientPackWanted()) ApplyLite();
+    // Refresh standalone branding even with optimization off, and remove a previous session's JSON for a loader.
+    LitePack::HomeBrandRetry homeBrandRetry;
+    const bool initialHomeBrand = HomeBrandWanted();
+    bool previousMarksPackWanted = MarksPackWanted();
+    bool previousChatPackWanted = JavaChatPackWanted();
+    const bool initialPackOk = ApplyLite(); // also migrates legacy copies in inactive data roots
+    homeBrandRetry.Finished(initialHomeBrand, initialPackOk, GetTickCount64());
 
     CreateOverlay();
 
@@ -19014,7 +21051,7 @@ int WINAPI WinMain(
     bool prevArrows = false;
     bool prevFPS = false;
     bool prevBlockOutline = false;
-    bool prevExtra[32] = {};
+    bool prevExtra[33] = {};
 
 
     bool previousLeft = false;
@@ -19052,6 +21089,21 @@ int WINAPI WinMain(
 
         minecraftWindow =
             FindMinecraft();
+
+        const bool nextHomeBrand = HomeBrandWanted();
+        const ULONGLONG brandNow = GetTickCount64();
+        const bool nextChatPackWanted = JavaChatPackWanted();
+        const bool nextMarksPackWanted = MarksPackWanted();
+        if (nextChatPackWanted != previousChatPackWanted || nextMarksPackWanted != previousMarksPackWanted) {
+            previousMarksPackWanted = nextMarksPackWanted;
+            previousChatPackWanted = nextChatPackWanted;
+            homeBrandRetry.settled = false; homeBrandRetry.attempted = false;
+        }
+        if (clientPackRetryWanted && homeBrandRetry.settled) homeBrandRetry.settled = false;
+        if (homeBrandRetry.Due(nextHomeBrand, brandNow)) {
+            // Failed initialization/writes stay pending; a newly seen loader removes stale branding immediately.
+            homeBrandRetry.Finished(nextHomeBrand, ApplyLite(), brandNow);
+        }
 
         if (minecraftWindow && !providerInitialized)
         {
@@ -19275,7 +21327,19 @@ int WINAPI WinMain(
         }
 
 
-        PollReplayKeys(minecraftActive && !typingText && !gameScreenOpen && !menuOpen);
+        PollReplayKeys(minecraftActive && !typingText && !gameScreenOpen && !menuOpen && !MinimapHud::open && !ExportRunning());
+        PollHideAllUi(minecraftActive && !typingText && !gameScreenOpen && !menuOpen && !MinimapHud::open);
+        PollReplayCameraKeys(minecraftActive && !typingText && !gameScreenOpen && !menuOpen && !MinimapHud::open && !ExportRunning());
+        PublishReplayCameraPath();
+        TickReplayEditor();
+        bool wasMapOpen=MinimapHud::open;
+        MinimapHud::Tick(minimapEnabled,minimapMobs && minimapWorldMobs);
+        if(wasMapOpen && !MinimapHud::open){MinimapHud::open=true;CloseWorldMap(minecraftActive);}
+        static std::filesystem::path mapWorld;
+        if(mapWorld!=MinimapHud::Maps().WorldFolder()){mapWorld=MinimapHud::Maps().WorldFolder();minimapWorldMobs=true;std::ifstream in(mapWorld/L"mobs.flag");bool value;if(in>>value)minimapWorldMobs=value;}
+        PollWorldMap(minecraftActive && !typingText && !gameScreenOpen && !ExportRunning(),
+                     typingText || gameScreenOpen || ExportRunning());
+        UpdateReplayBarMode(minecraftActive && !typingText && !gameScreenOpen);
 
         // A G still held when the game screen closes (e.g. the last letter typed in chat) must not open the menu.
         previousGState =
@@ -19304,6 +21368,29 @@ int WINAPI WinMain(
                 }
             }
 
+            UpdateOverlayClickThrough();
+
+            // Replay bar: when the click message never reaches the overlay (the game kept the mouse: r57-test8, the
+            // bar's buttons did nothing while the keys worked), the button state read here does the same on release.
+            {
+                static bool barPressed = false;
+                static uint64_t barPressedAt = 0;
+                const bool barLeft = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+                if (barLeft && !barPressed) barPressedAt = GetTickCount64();
+                if (!barLeft && barPressed && replayBarMode && !menuOpen && overlayWindow &&
+                    replayBarClickSeenAt < barPressedAt)
+                {
+                    POINT cursor;
+                    if (GetCursorPos(&cursor) && ScreenToClient(overlayWindow, &cursor))
+                    {
+                        if (replayEditorOpen) HandleEditorClickAt(cursor.x, cursor.y);
+                        else HandleReplayTimelineClick(cursor.x, cursor.y);
+                        InvalidateRect(overlayWindow, nullptr, FALSE);
+                    }
+                }
+                barPressed = barLeft;
+            }
+
             // Home screen: the top-left "Replays" button opens the Replays panel when the button is let go.
             // Taking the focus while the game still held the press left its title screen drawn shrunk
             // (with black edges) until a world was started.
@@ -19311,17 +21398,53 @@ int WINAPI WinMain(
                 static bool replaysPressed = false;
                 const auto overButton = [&] {
                     POINT cursor;
-                    const RECT b = HomeReplaysButtonRect();
-                    return GetCursorPos(&cursor) && ScreenToClient(overlayWindow, &cursor) && PtInRect(&b, cursor);
+                    const RECT b = HomeReplaysHitRect();
+                    return OverlayCursorClient(cursor) && PtInRect(&b, cursor);
                 };
                 const bool usable = !menuOpen && overlayWindow && minecraftActive && OnHomeScreen();
+                if (homeReplayInput.Take()) {
+                    HomeReplayDiag("Replays button: hook click (usable=%d)%s", usable ? 1 : 0, usable ? ", opening" : "");
+                    if (usable) { replaysPressed = false; OpenReplays(true); }
+                }
+                if (left && !previousLeft && !menuOpen && OnHomeScreen()) {
+                    POINT screen{}, overlay{};
+                    const bool cursor = GetCursorPos(&screen) != FALSE;
+                    overlay = screen;
+                    if (overlayWindow) ScreenToClient(overlayWindow, &overlay);
+                    POINT mapped{}; double scale = 0;
+                    const bool mappedOk = OverlayCursorClient(mapped, &scale);
+                    HomeReplayDiag("Replays button: mapped (%ld,%ld) ok=%d scale=%.3f", mapped.x, mapped.y, mappedOk ? 1 : 0, scale);
+                    const RECT b = HomeReplaysButtonRect();
+                    HomeReplayDiag("Replays button: press at screen (%ld,%ld) overlay (%ld,%ld)%s; button (%ld,%ld)-(%ld,%ld) screen "
+                                   "(%ld,%ld)-(%ld,%ld); over=%d usable=%d minecraftActive=%d overlay=%d hookWanted=%d hook=%d "
+                                   "hookDowns=%u hookInside=%u",
+                                   screen.x, screen.y, overlay.x, overlay.y, cursor ? "" : " (no cursor)", b.left, b.top, b.right,
+                                   b.bottom, homeReplayScreenRect.left, homeReplayScreenRect.top, homeReplayScreenRect.right,
+                                   homeReplayScreenRect.bottom, overButton() ? 1 : 0, usable ? 1 : 0, minecraftActive ? 1 : 0,
+                                   overlayWindow ? 1 : 0, homeReplayHookWanted ? 1 : 0, wheelHook ? 1 : 0, homeReplayHookDowns,
+                                   homeReplayHookInside);
+                }
                 if (left && !previousLeft)
                     replaysPressed = usable && overButton();
                 else if (!left && previousLeft)
                 {
+                    if (replaysPressed) HomeReplayDiag("Replays button: release (over=%d usable=%d)%s", overButton() ? 1 : 0,
+                                                       usable ? 1 : 0, usable && overButton() ? ", opening" : "");
                     if (replaysPressed && usable && overButton())
                         OpenReplays(true);
                     replaysPressed = false;
+                }
+            }
+            // r57-test53: after Replays was closed the button did not come back. Log what decides it on every change.
+            {
+                static int lastShown = -1;
+                const int running = MinecraftDataProvider::IsGameRunning() ? 1 : 0, world = MinecraftDataProvider::IsInWorld() ? 1 : 0;
+                const int title = MinecraftDataProvider::IsOnTitleScreen();
+                const int shown = !menuOpen && running && !world && title == 1 ? 1 : 0;   // as OnHomeScreen
+                if (shown != lastShown) {
+                    HomeReplayDiag("Replays button: shown=%d (menuOpen=%d replaysOpen=%d fromHome=%d running=%d inWorld=%d title=%d hideAllUi=%d)",
+                                   shown, menuOpen ? 1 : 0, replaysOpen ? 1 : 0, replaysFromHome ? 1 : 0, running, world, title, hideAllUi ? 1 : 0);
+                    lastShown = shown;
                 }
             }
             // Opened from the home screen: closes by itself once a world starts (or the game is gone).
@@ -19418,6 +21541,7 @@ int WINAPI WinMain(
         CheckShortcut(shortcuts.cpsLimiter, prevExtra[29], DetailFeature::CpsLimiter);
         CheckShortcut(shortcuts.itemCounter, prevExtra[30], DetailFeature::ItemCounter);
         CheckShortcut(shortcuts.packDisplay, prevExtra[31], DetailFeature::PackDisplay);
+        CheckShortcut(shortcuts.combo, prevExtra[32], DetailFeature::Combo);
         MinecraftDataProvider::SetItemCounterWanted(itemCounterEnabled);
         PollTimerKeys(gameActive);
         UpdateCpsLimiter(gameActive);
@@ -19446,9 +21570,14 @@ int WINAPI WinMain(
         // The wheel hook (zoom factor) is a low-level hook: every mouse event on the PC passes through this
         // process while it is installed, so other apps lag whenever this loop is busy. It is installed only
         // while the Zoom key is held and removed as soon as it is released.
-        if (zoomActive && !wheelHook)
+        worldMapWheel = WorldMapOpen();
+        homeReplayHookWanted = !menuOpen && minecraftActive && overlayWindow && OnHomeScreen();
+        if (homeReplayHookWanted) {
+            homeReplayScreenRect = HomeReplaysHitRect();   // overlay client pixels, as the hook maps the cursor
+        } else homeReplayInput.Reset();
+        if ((zoomActive || worldMapWheel || homeReplayHookWanted) && !wheelHook)
             wheelHook = SetWindowsHookExW(WH_MOUSE_LL, ZoomWheelHook, GetModuleHandleW(nullptr), 0);
-        else if (!zoomActive && wheelHook)
+        else if (!zoomActive && !worldMapWheel && !homeReplayHookWanted && wheelHook)
         {
             UnhookWindowsHookEx(wheelHook);
             wheelHook = nullptr;
@@ -19473,10 +21602,12 @@ int WINAPI WinMain(
         const bool replayPlaying = ReplayPlayer::Active();
         MinecraftDataProvider::SetReplayBuffer(!replayPlaying);
         MinecraftDataProvider::SetHitEffect(hitEffectEnabled, hitEffectCrit, hitEffectMagic);
-        MinecraftDataProvider::SetFrameGen(liteEnabled && frameGenEnabled, frameGenMultiplier, frameGenMethod, frameGenPacing);
+        // A replay export reads the real game frames: Frame Generation pauses while it runs and comes back by itself
+        // afterwards (the setting itself is not changed; 2026-11-12 user request).
+        MinecraftDataProvider::SetFrameGen(liteEnabled && frameGenEnabled && !ExportRunning(), frameGenMultiplier, frameGenMethod, frameGenPacing);
         MinecraftDataProvider::SetLeftHand(leftHandEnabled);
         MinecraftDataProvider::SetShulkerHover(shulkerEnabled);
-        MinecraftDataProvider::SetHudMenuOpen(menuOpen);
+        MinecraftDataProvider::SetHudMenuOpen(menuOpen || MinimapHud::open || replayBarMode);
         TrackPlayingRates(!menuOpen && !hudEditMode && minecraftActive && MinecraftDataProvider::IsInWorld());
         MinecraftDataProvider::SetReplayRequested(replayEnabled && !replayPlaying);
         MinecraftDataProvider::SetRenderDistance(
@@ -19492,7 +21623,8 @@ int WINAPI WinMain(
             MinecraftDataProvider::SetOptimize(liteCullMobs, liteCullItems, liteCullMisc, liteEnabled && liteNoNameTags,
                                                liteEnabled && litePlayerLimit ? (uint32_t)litePlayerDistance : 0u,
                                                liteEnabled,   // legacy optimization bit; native V-Sync OFF is honored independently
-                                               MyClientFeatures::EncodeOptimizeExtras(extras));
+                                               MyClientFeatures::EncodeOptimizeExtras(extras) |
+                                               (liteEnabled && liteFpsLimit ? MyClientFeatures::EncodeFpsLimit((uint32_t)liteFpsLimitCode) : 0u));
         }
         {
             static ULONGLONG lastTweak = 0;   // Windows settings on the game's process: about once a second

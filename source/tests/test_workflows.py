@@ -19,5 +19,40 @@ class BuildDllChannelTest(unittest.TestCase):
         self.assertIn("inputs.publish && inputs.channel != 'test'", self.text)
 
 
+
+class AgentWorkflowTest(unittest.TestCase):
+    """ci.yml / build-release.yml (docs/release.md, docs/branch-and-deploy.md)."""
+
+    def read(self, name):
+        return (WORKFLOWS / name).read_text(encoding="utf-8")
+
+    def test_ci_never_publishes(self):
+        ci = self.read("ci.yml")
+        self.assertIn("publish: false", ci)
+        self.assertNotIn("publish: true", ci)
+        self.assertNotIn("publish_r2.py", ci)
+
+    def test_the_release_workflow_publishes_one_game_after_the_other_from_the_plan(self):
+        release = self.read("build-release.yml")
+        self.assertIn("max-parallel: 1", release)
+        self.assertIn("needs.plan.outputs.publish == 'true'", release)
+        self.assertTrue(release.startswith("#") and "name: build-release" in release)   # build-* : the Worker's OIDC rule
+
+    def test_publishers_share_one_concurrency_group(self):
+        for name in ("build-dll.yml", "build-launcher.yml", "promote-build.yml"):
+            self.assertIn("originx-publish", self.read(name), name)
+
+    def test_a_stable_publish_starts_from_the_branch_head(self):
+        dll = self.read("build-dll.yml")
+        self.assertIn('git merge -q --ff-only FETCH_HEAD', dll)
+        # the new stable list is built on the live one, never on a branch's possibly old copy
+        self.assertIn('--catalog "$RUNNER_TEMP/live-stable.json"', dll)
+        self.assertNotIn("--catalog launcher/catalog.json", dll)
+
+    def test_the_worker_lists_the_release_branches(self):
+        wrangler = (WORKFLOWS.parents[1] / "wrangler.jsonc").read_text(encoding="utf-8")
+        self.assertIn('"RELEASE_REFS": "refs/heads/main"', wrangler)   # main only (docs/branch-and-deploy.md)
+
+
 if __name__ == "__main__":
     unittest.main()

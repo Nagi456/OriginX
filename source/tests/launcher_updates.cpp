@@ -20,6 +20,9 @@ std::string Hash(const fs::path& path) {
     std::ostringstream out; out << std::hex << std::setw(64) << std::setfill('0') << value; return out.str();
 }
 Catalog Parse(const Json& value) { return ParseCatalog(Json::parse(value.dump())); }
+// A file every release of the (standalone) catalog has; the catalog tests change its entry.
+const std::string Sample = "mods/MyClientData/manifest.json";
+
 int main() {
     const auto catalog = ParseCatalog(ReadJson("launcher/catalog.json"));
     assert(catalog.releases.size() >= 2);   // (was == 2; the list has grown, the entries checked below are still its first two)
@@ -34,13 +37,13 @@ int main() {
     assert(!Parse(changed).releases[0].available);
     changed = catalog.document; changed["versions"][0]["id"] = "../escape"; Reject([&] { Parse(changed); });
     changed = catalog.document; changed["versions"][1]["id"] = "26.51.1"; Reject([&] { Parse(changed); });
-    for (const auto& path : {"../escape.dll", "mods/MyClientData/other.dll", "runtime.lock.json/other", "mods/MyClientData/licenses/a/evil.dll"}) {
+    for (const auto& path : {"../escape.dll", "mods/MyClientData/other.dll", "mods/MyClientData/manifest.json/other", "mods/MyClientData/licenses/a/evil.dll"}) {
         changed = catalog.document;
-        changed["versions"][0]["files"][path] = changed["versions"][0]["files"]["runtime.lock.json"];
+        changed["versions"][0]["files"][path] = changed["versions"][0]["files"][Sample];
         Reject([&] { Parse(changed); });
     }
     for (const auto& url : {"http://github.com/Nagi456/MyClient/releases/download/a/a", "https://github.com/other/repo/releases/download/a/a", "https://github.com/Nagi456/MyClient/releases/download/../a"}) {
-        changed = catalog.document; changed["versions"][0]["files"]["runtime.lock.json"]["url"] = url;
+        changed = catalog.document; changed["versions"][0]["files"][Sample]["url"] = url;
         Reject([&] { Parse(changed); });
     }
     // OriginX's public R2 downloads are allowed too, with the same character rules.
@@ -50,13 +53,13 @@ int main() {
                             "https://evil.example/dl/stable/x", "http://originx.originx-client.workers.dev/dl/stable/x"})
         assert(!ReleaseUrl(url));
     // The HUD may ride along with the DLL.
-    changed = catalog.document; changed["versions"][0]["files"][HudFile] = changed["versions"][0]["files"]["runtime.lock.json"];
+    changed = catalog.document; changed["versions"][0]["files"][HudFile] = changed["versions"][0]["files"][Sample];
     assert(Parse(changed).releases[0].files.contains(HudFile));
-    changed = catalog.document; changed["versions"][0]["files"]["MyClient.exe"] = changed["versions"][0]["files"]["runtime.lock.json"];
+    changed = catalog.document; changed["versions"][0]["files"]["MyClient.exe"] = changed["versions"][0]["files"][Sample];
     Reject([&] { Parse(changed); });
-    changed = catalog.document; changed["versions"][0]["files"]["runtime.lock.json"]["bytes"] = -1;
+    changed = catalog.document; changed["versions"][0]["files"][Sample]["bytes"] = -1;
     Reject([&] { Parse(changed); });
-    changed = catalog.document; changed["versions"][0]["files"]["runtime.lock.json"]["sha256"] = "bad";
+    changed = catalog.document; changed["versions"][0]["files"][Sample]["sha256"] = "bad";
     Reject([&] { Parse(changed); });
     changed = catalog.document; changed["sequence"] = catalog.sequence + 1; changed["versions"][0]["revision"] = catalog.releases[0].revision + 1;
     auto newer = Parse(changed); CheckAdvance(catalog, newer); Reject([&] { CheckAdvance(newer, catalog); });
@@ -70,13 +73,12 @@ int main() {
     struct Cleanup { fs::path root; ~Cleanup() { std::error_code ec; fs::remove_all(root, ec); } } cleanup{root};
     const auto source = root / "source";
     fs::create_directories(source / "mods/MyClientData");
-    fs::copy_file("build/client/MyClientData.dll", source / "mods/MyClientData/MyClientData.dll");
-    fs::copy_file("build/client/manifest.json", source / "mods/MyClientData/manifest.json");
-    fs::copy_file("launcher/runtime.lock.json", source / "runtime.lock.json");
+    fs::copy_file("build/client-standalone/MyClientData.dll", source / "mods/MyClientData/MyClientData.dll");
+    fs::copy_file("build/client-standalone/manifest.json", source / "mods/MyClientData/manifest.json");
     Release release = catalog.releases[0];
     for (auto it = release.files.begin(); it != release.files.end();) {
         if (!fs::is_regular_file(source / it.key())) it = release.files.erase(it);
-        else { (*it)["sha256"] = Hash(source / it.key()); ++it; }
+        else { (*it)["sha256"] = Hash(source / it.key()); (*it)["bytes"] = fs::file_size(source / it.key()); ++it; }
     }
     int downloads = 0;
     const auto copy = [&](const std::string& url, const fs::path& destination, uint64_t) {
@@ -87,8 +89,18 @@ int main() {
     };
     const auto cache = root / "packages";
     const auto installed = AcquirePackage(cache, release, Hash, copy);
-    assert(downloads == 3);
-    assert(AcquirePackage(cache, release, Hash, copy) == installed && downloads == 3);
+    const int fileCount = static_cast<int>(release.files.size());   // the standalone DLL and its manifest
+    assert(downloads == fileCount);
+    assert(AcquirePackage(cache, release, Hash, copy) == installed && downloads == fileCount);
+    // A damaged saved copy (report #3): a failed fetch keeps it untouched; a good fetch replaces it and
+    // the bad copy is renamed aside.
+    Write(installed / "mods/MyClientData/MyClientData.dll", "damaged");
+    Reject([&] { AcquirePackage(cache, release, Hash, [](const auto&, const auto& path, uint64_t) { Write(path, "corrupt"); }); });
+    assert(fs::is_directory(installed) && !fs::exists(fs::path(installed.string() + ".broken")));
+    assert(AcquirePackage(cache, release, Hash, copy) == installed && downloads == 2 * fileCount);
+    VerifyPackage(installed, release, Hash);
+    assert(fs::is_directory(fs::path(installed.string() + ".broken")));
+    fs::remove_all(fs::path(installed.string() + ".broken"));
     auto next = release; ++next.revision;
     Reject([&] { AcquirePackage(cache, next, Hash, [](const auto&, const auto& path, uint64_t) { Write(path, "corrupt"); }); });
     assert(fs::is_directory(installed) && !fs::exists(cache / release.target.id / std::to_string(next.revision)));

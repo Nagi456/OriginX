@@ -126,7 +126,7 @@ inline bool RebuildAllChunks(LevelRenderer& renderer)
     bool requested = false;
     for (auto& [dimension, coordinator] : renderer.mRenderChunkCoordinators.get())
         if (coordinator) {
-            setAllDirty(coordinator.get(), false, false);
+            setAllDirty(coordinator.get(), true, false);   // immediate: the old meshes point into the old atlas
             requested = true;
         }
     return requested;

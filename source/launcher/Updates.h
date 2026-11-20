@@ -1,4 +1,5 @@
 #pragma once
+#include "../Lang.h"
 #include "Install.h"
 #include <cstdio>
 #include <functional>
@@ -9,6 +10,8 @@ namespace MyClientLauncher {
 inline constexpr const char* PublicDownloads = "https://originx.originx-client.workers.dev/dl/stable/";
 inline constexpr const char* CatalogUrl = "https://originx.originx-client.workers.dev/dl/stable/catalog.json";
 inline constexpr const char* HudFile = "hud/MyClient.exe";
+// The game images the package's DLL was made for (tools/package_update.py, GameImageCheck.h).
+inline constexpr const char* SupportedFile = "mods/MyClientData/supported.json";
 using HashFile = std::function<std::string(const fs::path&)>;
 using DownloadFile = std::function<void(const std::string&, const fs::path&, uint64_t)>;
 struct Release {
@@ -36,7 +39,8 @@ inline bool ReleaseUrl(const std::string& url)
 inline bool PackagePath(const std::string& name)
 {
     if (name == "runtime.lock.json" || name == "mods/MyClientData/MyClientData.dll" ||
-        name == "mods/MyClientData/manifest.json" || name == "mods/MyClientData/THIRD_PARTY_NOTICES.md" || name == HudFile) return true;
+        name == "mods/MyClientData/manifest.json" || name == "mods/MyClientData/THIRD_PARTY_NOTICES.md" || name == HudFile ||
+        name == SupportedFile) return true;
     const std::string prefix = "mods/MyClientData/licenses/";
     if (name.compare(0, prefix.size(), prefix) != 0) return false;
     // License files only; do not let an update introduce a second loadable DLL.
@@ -45,7 +49,7 @@ inline bool PackagePath(const std::string& name)
 inline uint64_t PositiveNumber(const Json& value)
 {
     if (!value.is_number_unsigned() || value.get<uint64_t>() == 0 || value.get<uint64_t>() > 1000000000)
-        throw std::runtime_error("更新情報の番号が不正です。");
+        throw std::runtime_error(Lang::T("更新情報の番号が不正です。", "Invalid update number."));
     return value.get<uint64_t>();
 }
 inline Target ParseTarget(const Json& item)
@@ -53,13 +57,13 @@ inline Target ParseTarget(const Json& item)
     Target target;
     target.id = item.at("id").get<std::string>();
     if (!std::regex_match(target.id, std::regex("[1-9][0-9]?\\.[0-9]{1,2}\\.[0-9]{1,2}")))
-        throw std::runtime_error("ゲーム版番号が不正です。");
+        throw std::runtime_error(Lang::T("ゲーム版番号が不正です。", "Invalid game version number."));
     const auto first = target.id.find('.'), second = target.id.find('.', first + 1);
     const auto major = target.id.substr(0, first);
     const auto minor = target.id.substr(first + 1, second - first - 1);
     const auto patch = target.id.substr(second + 1);
     const auto normalized = std::to_string(std::stoi(major)) + "." + std::to_string(std::stoi(minor)) + "." + std::to_string(std::stoi(patch));
-    if (normalized != target.id) throw std::runtime_error("ゲーム版番号の表記が不正です。");
+    if (normalized != target.id) throw std::runtime_error(Lang::T("ゲーム版番号の表記が不正です。", "Invalid game version notation."));
     const auto prefix = "1." + major + "." + minor + ".";
     target.runtimeGame = prefix + (patch.size() == 1 ? "0" : "") + patch;
     target.versions = {target.runtimeGame, prefix + patch, target.id + ".0",
@@ -73,16 +77,16 @@ using UrlCheck = std::function<bool(const std::string&)>;
 inline Catalog ParseCatalog(const Json& doc, const UrlCheck& urlOk = [](const std::string& url) { return ReleaseUrl(url); })
 {
     if (doc.at("schemaVersion") != 1 || !doc.at("versions").is_array() || doc.at("versions").size() > 128)
-        throw std::runtime_error("このランチャーでは更新一覧を読み込めません。");
+        throw std::runtime_error(Lang::T("このランチャーでは更新一覧を読み込めません。", "This launcher cannot read the update list."));
     Catalog catalog{PositiveNumber(doc.at("sequence")), {}, doc};
     std::set<std::string> ids;
     for (const auto& item : doc.at("versions"))
     {
         Release release;
         release.target = ParseTarget(item);
-        if (!ids.insert(release.target.id).second) throw std::runtime_error("ゲーム版が重複しています。");
-        release.reason = item.value("reason", "対応DLLは未公開です。");
-        if (release.reason.size() > 1024) throw std::runtime_error("更新説明が長すぎます。");
+        if (!ids.insert(release.target.id).second) throw std::runtime_error(Lang::T("ゲーム版が重複しています。", "Duplicate game version."));
+        release.reason = item.value("reason", Lang::T("対応DLLは未公開です。", "No DLL is published for it yet."));
+        if (release.reason.size() > 1024) throw std::runtime_error(Lang::T("更新説明が長すぎます。", "The update description is too long."));
         release.available = item.at("available").get<bool>();
         if (release.available)
         {
@@ -92,21 +96,21 @@ inline Catalog ParseCatalog(const Json& doc, const UrlCheck& urlOk = [](const st
             if ((item.at("launcherApi") != 1 && !standalone) || item.at("bridgeAbi") != 2 || item.at("platform") != "gdk-release-x64")
             {
                 release.available = false;
-                release.reason = "新しいランチャーが必要です。使い方をご確認ください。";
+                release.reason = Lang::T("新しいランチャーが必要です。使い方をご確認ください。", "A newer launcher is required. See the guide.");
             }
             else
             {
                 if (standalone ? release.target.loader != "standalone"
                                : !std::regex_match(release.target.loader, std::regex("[0-9]+\\.[0-9]+\\.[0-9]+")))
-                    throw std::runtime_error("ローダー版が不正です。");
+                    throw std::runtime_error(Lang::T("ローダー版が不正です。", "Invalid loader version."));
                 release.target.standalone = standalone;
                 release.revision = PositiveNumber(item.at("revision"));
                 release.files = item.at("files");
-                if (!release.files.is_object() || release.files.size() > 128) throw std::runtime_error("更新ファイル一覧が不正です。");
+                if (!release.files.is_object() || release.files.size() > 128) throw std::runtime_error(Lang::T("更新ファイル一覧が不正です。", "Invalid update file list."));
                 for (const char* required : {"runtime.lock.json", "mods/MyClientData/MyClientData.dll", "mods/MyClientData/manifest.json"})
                     if (!release.files.contains(required) && !(standalone && std::string(required) == "runtime.lock.json"))
-                        throw std::runtime_error("更新ファイルが不足しています。");
-                if (standalone && release.files.contains("runtime.lock.json")) throw std::runtime_error("更新ファイル一覧が不正です。");
+                        throw std::runtime_error(Lang::T("更新ファイルが不足しています。", "Update files are missing."));
+                if (standalone && release.files.contains("runtime.lock.json")) throw std::runtime_error(Lang::T("更新ファイル一覧が不正です。", "Invalid update file list."));
                 uint64_t total = 0;
                 std::set<std::string> names;
                 for (const auto& file : release.files.items())
@@ -114,27 +118,27 @@ inline Catalog ParseCatalog(const Json& doc, const UrlCheck& urlOk = [](const st
                     const auto size = PositiveNumber(file.value().at("bytes"));
                     if (!PackagePath(file.key()) || !names.insert(Lower(file.key())).second ||
                         !IsDigest(file.value().at("sha256")) || !urlOk(file.value().at("url")) || size > 128 * 1024 * 1024)
-                        throw std::runtime_error("更新ファイルの配布情報が不正です。");
+                        throw std::runtime_error(Lang::T("更新ファイルの配布情報が不正です。", "Invalid update file information."));
                     total += size;
                 }
-                if (total > 256 * 1024 * 1024) throw std::runtime_error("更新サイズが上限を超えています。");
+                if (total > 256 * 1024 * 1024) throw std::runtime_error(Lang::T("更新サイズが上限を超えています。", "The update is larger than allowed."));
             }
         }
         catalog.releases.push_back(std::move(release));
     }
-    if (catalog.releases.empty()) throw std::runtime_error("更新一覧が空です。");
+    if (catalog.releases.empty()) throw std::runtime_error(Lang::T("更新一覧が空です。", "The update list is empty."));
     return catalog;
 }
 inline void CheckAdvance(const Catalog& old, const Catalog& next)
 {
     if (next.sequence < old.sequence || (next.sequence == old.sequence && next.document != old.document))
-        throw std::runtime_error("古い更新一覧または同じ番号の変更を拒否しました。");
+        throw std::runtime_error(Lang::T("古い更新一覧または同じ番号の変更を拒否しました。", "Refused an older update list or a change with the same number."));
     for (const auto& previous : old.releases)
         for (const auto& current : next.releases)
             if (previous.target.id == current.target.id && previous.available && current.available &&
                 (current.revision < previous.revision || (current.revision == previous.revision &&
                  (current.files != previous.files || current.target.loader != previous.target.loader))))
-                throw std::runtime_error("DLLの更新番号が逆行または再利用されています。");
+                throw std::runtime_error(Lang::T("DLLの更新番号が逆行または再利用されています。", "The DLL update number went backwards or was reused."));
 }
 inline void VerifyPackage(const fs::path& root, const Release& release, const HashFile& hash)
 {
@@ -145,7 +149,7 @@ inline void VerifyPackage(const fs::path& root, const Release& release, const Ha
         const auto path = SafeChild(root, file.key());
         if (!fs::is_regular_file(path) || fs::file_size(path) != file.value().at("bytes").get<uint64_t>() ||
             hash(path) != file.value().at("sha256").get<std::string>())
-            throw std::runtime_error("更新ファイルの検査に失敗しました: " + file.key());
+            throw std::runtime_error(Lang::T("更新ファイルの検査に失敗しました: ", "Update file check failed: ") + file.key());
     }
     RequireMod(root / "mods/MyClientData", release.target);
     if (release.files.contains(HudFile)) RequireX64Pe(root / HudFile);
@@ -154,18 +158,18 @@ inline void VerifyPackage(const fs::path& root, const Release& release, const Ha
         // No loader, so no lock to compare: the DLL itself must not need LeviLamina (it checks the game build when it starts).
         const auto imports = ImportedDlls(root / "mods/MyClientData/MyClientData.dll");
         if (imports.count("levilamina.dll") || imports.count("preloader.dll"))
-            throw std::runtime_error("単独版のはずのDLLがLeviLaminaを必要としています。");
+            throw std::runtime_error(Lang::T("単独版のはずのDLLがLeviLaminaを必要としています。", "A DLL meant to be standalone requires LeviLamina."));
     }
     else
     {
         const auto lock = ReadJson(root / "runtime.lock.json");
         if (lock.at("schemaVersion") != 1 || lock.at("gameVersion") != release.target.runtimeGame || lock.at("loaderVersion") != release.target.loader)
-            throw std::runtime_error("DLLとローダーの対応版が一致しません。");
+            throw std::runtime_error(Lang::T("DLLとローダーの対応版が一致しません。", "The DLL and loader versions do not match."));
     }
     // Extra code must never hitchhike into the mod installation from a cache.
     for (const auto& entry : fs::recursive_directory_iterator(root))
         if (entry.is_regular_file() && !release.files.contains(entry.path().lexically_relative(root).generic_u8string()))
-            throw std::runtime_error("更新キャッシュに未登録ファイルがあります。");
+            throw std::runtime_error(Lang::T("更新キャッシュに未登録ファイルがあります。", "The update cache contains unregistered files."));
 }
 // `folder` names the cache folder (default: the revision number).
 // Files shipped next to the launcher (nothing downloaded). The catalog's hashes describe the published
@@ -180,7 +184,7 @@ inline Release LocalRelease(Release release, const std::function<fs::path(const 
     for (auto& file : release.files.items())
     {
         const auto path = source(file.key());
-        if (!fs::is_regular_file(path)) throw std::runtime_error("同梱更新ファイルが見つかりません: " + file.key());
+        if (!fs::is_regular_file(path)) throw std::runtime_error(Lang::T("同梱更新ファイルが見つかりません: ", "Bundled update file not found: ") + file.key());
         const std::string sha = hash(path);
         file.value()["sha256"] = sha;
         file.value()["bytes"] = static_cast<uint64_t>(fs::file_size(path));
@@ -200,9 +204,19 @@ inline fs::path AcquirePackage(const fs::path& cache, const Release& release,
     const auto destination = cache / release.target.id / (folder.empty() ? std::to_string(release.revision) : folder);
     fs::create_directories(destination.parent_path());
     RequirePlainTree(cache);
-    if (fs::exists(destination)) { VerifyPackage(destination, release, hash); return destination; }
+    // A saved copy that fails its check (a file changed, missing or added: 2026-11-20 report #3) is fetched
+    // again into a fresh folder; only once that copy passes every check is the bad one renamed aside
+    // (`<folder>.broken`, the latest one kept for a look) and the new one put in its place. Errors reading
+    // the disk (filesystem_error: access denied, file in use) are not damage: they stop here and keep the copy.
+    bool damaged = false;
+    if (fs::exists(destination))
+    {
+        try { VerifyPackage(destination, release, hash); return destination; }
+        catch (const fs::filesystem_error&) { throw; }
+        catch (const std::runtime_error&) { damaged = true; }
+    }
     const auto stage = cache / (".download-" + std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
-    if (!fs::create_directory(stage)) throw std::runtime_error("更新用フォルダーを作成できません。");
+    if (!fs::create_directory(stage)) throw std::runtime_error(Lang::T("更新用フォルダーを作成できません。", "Cannot create the update folder."));
     try
     {
         for (const auto& file : release.files.items())
@@ -210,9 +224,16 @@ inline fs::path AcquirePackage(const fs::path& cache, const Release& release,
             const auto path = SafeChild(stage, file.key());
             fs::create_directories(path.parent_path());
             download(file.value().at("url"), path, file.value().at("bytes"));
-            if (hash(path) != file.value().at("sha256")) throw std::runtime_error("ダウンロードしたファイルのSHA256が一致しません。");
+            if (hash(path) != file.value().at("sha256")) throw std::runtime_error(Lang::T("ダウンロードしたファイルのSHA256が一致しません。", "The SHA256 of the downloaded file does not match."));
         }
         VerifyPackage(stage, release, hash);
+        if (damaged)
+        {
+            auto aside = destination; aside += ".broken";
+            std::error_code ignored;
+            fs::remove_all(aside, ignored);
+            fs::rename(destination, aside);   // fails (and keeps everything) if a file in it is still in use
+        }
         fs::rename(stage, destination);
     }
     catch (...) { std::error_code ignored; fs::remove_all(stage, ignored); throw; }
@@ -239,7 +260,7 @@ inline fs::path PlaceHud(const fs::path& package, const fs::path& managed, const
             if (ec)
             {
                 fs::remove(stage, ec);
-                throw std::runtime_error("HUD（MyClient.exe）を更新できません。起動中の MyClient.exe を終了してからもう一度お試しください。");
+                throw std::runtime_error(Lang::T("HUD（MyClient.exe）を更新できません。起動中の MyClient.exe を終了してからもう一度お試しください。", "Cannot update the HUD (MyClient.exe). Close the running MyClient.exe and try again."));
             }
         }
         if (!fs::exists(managed / "myclient_config.txt") && fs::is_regular_file(bundle / "myclient_config.txt"))
@@ -251,6 +272,6 @@ inline fs::path PlaceHud(const fs::path& package, const fs::path& managed, const
     }
     if (fs::is_regular_file(bundle / "MyClient.exe")) return bundle / "MyClient.exe";
     if (fs::is_regular_file(placed)) return placed;
-    throw std::runtime_error("HUD（MyClient.exe）が見つかりません。Settings の「更新を確認」を押してから起動してください。");
+    throw std::runtime_error(Lang::T("HUD（MyClient.exe）が見つかりません。Settings の「更新を確認」を押してから起動してください。", "The HUD (MyClient.exe) was not found. Press \"Check for updates\" in Settings, then launch."));
 }
 }

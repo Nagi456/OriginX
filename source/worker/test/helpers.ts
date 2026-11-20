@@ -99,7 +99,7 @@ export async function oidcSigner(kid = "k1") {
   async function token(claims: Record<string, unknown> = {}, header: Record<string, unknown> = {}) {
     const body = {
       iss: OIDC_ISSUER, aud: OIDC_AUDIENCE, repository_id: REPOSITORY_ID, repository: "Nagi456/MyClient",
-      workflow_ref: "Nagi456/MyClient/.github/workflows/build-dll.yml@refs/heads/x", run_id: "7",
+      workflow_ref: "Nagi456/MyClient/.github/workflows/build-dll.yml@refs/heads/main", ref: "refs/heads/main", run_id: "7",
       exp: NOW / 1000 + 300, nbf: NOW / 1000 - 10, ...claims,
     };
     const head = enc({ alg: "RS256", typ: "JWT", kid, ...header });

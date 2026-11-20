@@ -8,6 +8,11 @@ MyClientLauncher also uses **TinyXML2 11.0.0 (zlib license)** for the original
 MicrosoftGame.config XML. Its unmodified source/license are vendored at
 `launcher/vendor/tinyxml2/`, with source archive and file hashes recorded in
 `launcher/runtime.lock.json`. The license is also supplied in `licenses/tinyxml2/`.
+MyClientLauncher also uses **Monocypher 4.0.2 (CC0-1.0 or BSD-2-Clause, at the user's
+choice)** to check the Ed25519 signatures of the update lists. Its unmodified source and licence are
+vendored at `launcher/vendor/monocypher/` (source archive monocypher-4.0.2.tar.gz, SHA256
+38d07179738c0c90677dba3ceb7a7b8496bcfea758ba1a53e803fed30ae0879c). The licence is also supplied in
+`licenses/monocypher/`.
 
 Standalone setup downloads the official, unmodified runtime dependencies at the
 URLs and SHA256 hashes in `launcher/runtime.lock.json`: LeviLamina Client 26.51.6,

@@ -10,6 +10,7 @@ void DisableFeatures();
 uint32_t HitboxFilter();  // which hitboxes: 1 players, 2 items, 4 entities, 8 mobs
 void HitboxColors(uint32_t out[4]);   // their colours by kind (player, item, entity, mob), 0xRRGGBB
 bool ShulkerHoverWanted();   // Shulker Preview is on: hide the game's tooltip over shulker boxes (bit 26 of command.autoRq)
+uint32_t FpsLimitWanted();  // FPS limit from the HUD (Optimization), 0 = none; render thread
 bool UncapFpsWanted();       // Optimization is on: presents with V-Sync off use ALLOW_TEARING (Shared.optimize UncapFpsBit)
 bool HitboxRequested();   // the HUD wants Hitbox data (bit 16 of the command record)
 // Frame Generation request: bits 27..31 of command.autoRq (MyClientFeatures::FrameGenMultiplierOf...), 0 = off or
@@ -32,5 +33,7 @@ void ClearArmor();
 // should be handed to the game again so it makes its picture with the new packs.
 bool TakeSkinRefresh();
 bool TextureReloadHeld(); // model/atlas resources are being replaced; do not override UI skin builds
+bool TitleAvatarRefreshPending();
+bool TakeTitleAvatarRefresh(); // consume once from the own-title doll update after resource completion
 uint64_t AvatarResourceEpoch(); // pack/atlas replacement invalidates cached menu model readiness
 }

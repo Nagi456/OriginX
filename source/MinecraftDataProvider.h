@@ -5,13 +5,19 @@
 #include "FeatureData.h"
 #include "ResourceChannel.h"
 #include "ShulkerChannel.h"
+#include "MapChannel.h"
 #include "ItemCountChannel.h"
 #include "TabListChannel.h"
 #include "PartyData.h"
+#include "ReplayCamera.h"
+#include "ReplayVideoChannel.h"
+#include <functional>
 #include <string>
 #include <vector>
 
 namespace MinecraftDataProvider {
+struct ComboState { bool available = false; uint32_t combo = 0; };
+ComboState Combo();
 struct BlockOutlineData {
     bool valid = false;
     float minX = 0, minY = 0, minZ = 0;
@@ -32,6 +38,8 @@ enum class Status { Disconnected, WaitingForData, Live, Stale, InvalidData };
 
 // These functions are called only by the overlay's UI thread.
 bool Initialize(HWND minecraftWindow);
+bool GetMap(MyClientMap::Shared& out);
+void SetMapWanted(bool map, bool mobs);
 void Tick(HWND minecraftWindow);
 void Shutdown();
 bool GetArrowCount(uint32_t& count);
@@ -66,6 +74,8 @@ SkinRequestState RequestCape(uint32_t id, const std::vector<uint8_t>& rgba);
 uint32_t CapeChoice();
 bool JavaChatSnapshot(bool enabled, MyClientJavaChat::Snapshot& out);
 bool JavaChatReady();
+int JavaChatJsonSupport(); // -1 unknown, 0 no JSON profile protocol, 1 supported
+int JavaChatAvailability(); // -1 unknown/old DLL, 0 checked unavailable, 1 available
 // Command Hotkeys: a line for the game's chat ('/...' = a command), sent by the DLL on its next tick.
 // Busy = the last line has not been sent yet; ChatLineAnswer follows the last line written.
 enum class ChatRequestState { None, NoGame, OldDll, Busy, Empty, Waiting, Sent, NoPlayer, Failed };
@@ -77,6 +87,12 @@ enum class ReplayJoinState { None, NoGame, OldDll, Busy, Waiting, Joining, Faile
 ReplayJoinState RequestReplayJoin(uint16_t port);
 ReplayJoinState ReplayJoinAnswer();
 bool GetShulkers(MyClientShulker::Shared& out);
+// Replay camera path for the DLL (ReplayCameraChannel.h). active = the camera follows the path now.
+// timeAtMicros: when timeMs was taken (ReplayPlayer::Status::positionAtMicros).
+void PublishReplayCamera(const std::vector<MyClientReplayCamera::Keyframe>& path, bool active, double timeMs, float speed, bool paused,
+                         uint64_t timeAtMicros);
+// The replay editor / export channel (ReplayVideoChannel.h), under its lock; false without a game.
+bool ReplayVideo(const std::function<void(MyClientReplayVideo::Shared&)>& f);
 // The shulker box under the mouse in an inventory / container screen (fresh within ~300 ms).
 bool GetShulkerHover(MyClientShulker::HoverBox& out);
 // Item Counter (ItemCountChannel.h): tell the DLL the feature is on (every tick), read the counts while Alt is held.

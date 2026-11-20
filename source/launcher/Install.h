@@ -1,4 +1,5 @@
 #pragma once
+#include "../Lang.h"
 #include <cstdio>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -26,10 +27,10 @@ using Json = nlohmann::json;
 inline Json ReadJson(const fs::path& path)
 {
     if (!fs::is_regular_file(path) || fs::file_size(path) > 1024 * 1024)
-        throw std::runtime_error("JSONファイルがないか、大きすぎます: " + path.u8string());
+        throw std::runtime_error(Lang::T("JSONファイルがないか、大きすぎます: ", "JSON file is missing or too large: ") + path.u8string());
     std::ifstream input(path, std::ios::binary);
     auto result = Json::parse(input);
-    if (!result.is_object()) throw std::runtime_error("JSONの形式が不正です: " + path.u8string());
+    if (!result.is_object()) throw std::runtime_error(Lang::T("JSONの形式が不正です: ", "Invalid JSON format: ") + path.u8string());
     return result;
 }
 
@@ -61,25 +62,25 @@ inline void RequireX64Pe(const fs::path& path)
     std::ifstream input(path, std::ios::binary);
     if (!input)
     {
-        std::string reason = "原因を特定できません";
+        std::string reason = Lang::T("原因を特定できません", "cause unknown");
 #ifdef _WIN32
         HANDLE probe = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (probe != INVALID_HANDLE_VALUE) { CloseHandle(probe); reason = "開けましたが別の理由で失敗しました"; }
+        if (probe != INVALID_HANDLE_VALUE) { CloseHandle(probe); reason = Lang::T("開けましたが別の理由で失敗しました", "opened but failed for another reason"); }
         else
         {
             const DWORD code = GetLastError();
             if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND)
-                reason = "ファイルまたはフォルダーが存在しません。ゲームが移動・アンインストールされていないか確認してください (Windowsエラー " + std::to_string(code) + ")";
+                reason = Lang::T("ファイルまたはフォルダーが存在しません。ゲームが移動・アンインストールされていないか確認してください (Windowsエラー ", "The file or folder does not exist. Check that the game was not moved or uninstalled (Windows error ") + std::to_string(code) + ")";
             else if (code == ERROR_ACCESS_DENIED)
-                reason = "Windowsが読み取りを拒否しました (エラー5)。GDK版本体は保護されているため、コピー方式ではなく起動中のゲームへ注入する方式を使います";
+                reason = Lang::T("Windowsが読み取りを拒否しました (エラー5)。GDK版本体は保護されているため、コピー方式ではなく起動中のゲームへ注入する方式を使います", "Windows refused to read it (error 5). The GDK game is protected, so OriginX injects into the running game instead of copying it");
             else if (code == ERROR_SHARING_VIOLATION)
-                reason = "他のプログラムが使用中です (エラー32)。Minecraftを終了してください";
+                reason = Lang::T("他のプログラムが使用中です (エラー32)。Minecraftを終了してください", "Another program is using it (error 32). Close Minecraft");
             else
-                reason = "Windowsエラー " + std::to_string(code);
+                reason = Lang::T("Windowsエラー ", "Windows error ") + std::to_string(code);
         }
 #endif
-        throw std::runtime_error("本体を開けません: " + reason + "\n" + path.u8string());
+        throw std::runtime_error(Lang::T("本体を開けません: ", "Cannot open the game: ") + reason + "\n" + path.u8string());
     }
     unsigned char dos[64]{};
     input.read(reinterpret_cast<char*>(dos), sizeof dos);
@@ -88,18 +89,18 @@ inline void RequireX64Pe(const fs::path& path)
     {
         char head[32]{};
         std::snprintf(head, sizeof head, "%02X %02X %02X %02X", dos[0], dos[1], dos[2], dos[3]);
-        throw std::runtime_error("Windows実行ファイルとして読み取れません（読み取り " + std::to_string(got) +
-                                 "バイト、先頭 " + head + "）: " + path.u8string());
+        throw std::runtime_error(Lang::T("Windows実行ファイルとして読み取れません（読み取り ", "Cannot read it as a Windows program (read ") + std::to_string(got) +
+                                 Lang::T("バイト、先頭 ", " bytes, starts with ") + head + "）: " + path.u8string());
     }
     const uint32_t offset = uint32_t(dos[60]) | uint32_t(dos[61]) << 8 |
                             uint32_t(dos[62]) << 16 | uint32_t(dos[63]) << 24;
     if (offset < 64 || offset > 64 * 1024 * 1024)
-        throw std::runtime_error("PEヘッダーが不正です: " + path.u8string());
+        throw std::runtime_error(Lang::T("PEヘッダーが不正です: ", "Invalid PE header: ") + path.u8string());
     input.seekg(offset);
     unsigned char pe[6]{};
     if (!input.read(reinterpret_cast<char*>(pe), sizeof pe) ||
         pe[0] != 'P' || pe[1] != 'E' || pe[2] || pe[3] || pe[4] != 0x64 || pe[5] != 0x86)
-        throw std::runtime_error("Windows x64版が必要です: " + path.u8string());
+        throw std::runtime_error(Lang::T("Windows x64版が必要です: ", "A Windows x64 build is required: ") + path.u8string());
 }
 
 struct Target {
@@ -141,19 +142,19 @@ inline GameIdentity ReadGameIdentity(const fs::path& directory)
 {
     const auto config = directory / "MicrosoftGame.config";
     if (!fs::is_regular_file(config) || fs::file_size(config) > 4 * 1024 * 1024)
-        throw std::runtime_error("GDK版のMicrosoftGame.configが見つかりません。Xboxアプリからゲーム本体の場所を確認してください。");
+        throw std::runtime_error(Lang::T("GDK版のMicrosoftGame.configが見つかりません。Xboxアプリからゲーム本体の場所を確認してください。", "MicrosoftGame.config for the GDK game was not found. Check the game's location in the Xbox app."));
     std::ifstream input(config, std::ios::binary);
     const std::string xml{std::istreambuf_iterator<char>(input), {}};
     tinyxml2::XMLDocument document;
     if (document.Parse(xml.data(), xml.size()) != tinyxml2::XML_SUCCESS)
-        throw std::runtime_error("MicrosoftGame.configのXMLが不正です。");
+        throw std::runtime_error(Lang::T("MicrosoftGame.configのXMLが不正です。", "The XML in MicrosoftGame.config is invalid."));
     const auto* root = document.RootElement();
     const auto* identity = root ? root->FirstChildElement("Identity") : nullptr;
     const auto* executables = root ? root->FirstChildElement("ExecutableList") : nullptr;
     const char* name = identity ? identity->Attribute("Name") : nullptr;
     const char* version = identity ? identity->Attribute("Version") : nullptr;
     if (!root || std::string(root->Name()) != "Game" || !name || !version || !executables)
-        throw std::runtime_error("MicrosoftGame.configにゲームの識別情報がありません。");
+        throw std::runtime_error(Lang::T("MicrosoftGame.configにゲームの識別情報がありません。", "MicrosoftGame.config has no game identity."));
     GameIdentity result{name, version};
     for (const auto* executable = executables->FirstChildElement("Executable"); executable;
          executable = executable->NextSiblingElement("Executable"))
@@ -173,7 +174,7 @@ inline bool ReleaseGameName(const std::string& name)
 inline Instance ResolveGame(const fs::path& game, const Target& target = {}, bool inspectExecutable = true)
 {
     if (Lower(game.filename().u8string()) != "minecraft.windows.exe")
-        throw std::runtime_error("Minecraft本体のMinecraft.Windows.exeを選択してください。");
+        throw std::runtime_error(Lang::T("Minecraft本体のMinecraft.Windows.exeを選択してください。", "Select Minecraft.Windows.exe of the game."));
     const auto executableFile = OriginalExecutable(game);
     if (inspectExecutable) RequireX64Pe(executableFile);
     const auto directory = game.parent_path();
@@ -181,15 +182,15 @@ inline Instance ResolveGame(const fs::path& game, const Target& target = {}, boo
     const auto& name = identity.name;
     const auto& version = identity.version;
     if (!ReleaseGameName(name))
-        throw std::runtime_error("MinecraftのGDK Release版を選択してください。Preview版には対応していません。");
+        throw std::runtime_error(Lang::T("MinecraftのGDK Release版を選択してください。Preview版には対応していません。", "Select the GDK Release build of Minecraft. Preview is not supported."));
     if (!SupportedGameVersion(version, target))
-        throw std::runtime_error("Minecraft " + target.id + "が必要です。選択した本体のバージョン: " + version);
-    if (!identity.listsExecutable) throw std::runtime_error("GDK設定にMinecraft.Windows.exeが登録されていません。");
+        throw std::runtime_error("Minecraft " + target.id + Lang::T("が必要です。選択した本体のバージョン: ", " is required. Version of the selected game: ") + version);
+    if (!identity.listsExecutable) throw std::runtime_error(Lang::T("GDK設定にMinecraft.Windows.exeが登録されていません。", "Minecraft.Windows.exe is not registered in the GDK settings."));
     if (inspectExecutable)
     {
         const auto imports = ImportedDlls(executableFile);
         if (imports.count("levilauncher.dll"))
-            throw std::runtime_error("別ランチャー用に変更された本体です。Xboxアプリの公式インストール先の本体を選択してください。");
+            throw std::runtime_error(Lang::T("別ランチャー用に変更された本体です。Xboxアプリの公式インストール先の本体を選択してください。", "This game was modified for another launcher. Select the game from the Xbox app's official install location."));
     }
     return {directory, name, version};
 }
@@ -199,10 +200,10 @@ inline fs::path SafeChild(const fs::path& root, const std::string& relative)
     std::string normalized = relative;
     std::replace(normalized.begin(), normalized.end(), '\\', '/');
     if (normalized.empty() || normalized.front() == '/' || normalized.find(':') != std::string::npos)
-        throw std::runtime_error("相対パスの形式が不正です。");
+        throw std::runtime_error(Lang::T("相対パスの形式が不正です。", "Invalid relative path."));
     const auto path = fs::u8path(normalized);
     for (const auto& part : path)
-        if (part == ".." || part == "." || part.empty()) throw std::runtime_error("範囲外のパスは使用できません。");
+        if (part == ".." || part == "." || part.empty()) throw std::runtime_error(Lang::T("範囲外のパスは使用できません。", "Paths outside the allowed range cannot be used."));
     return root / path;
 }
 
@@ -212,7 +213,7 @@ inline void RequireLoader(const fs::path& gameDirectory, const Target& target = 
     const auto meta = ReadJson(directory / "manifest.json");
     if (meta.value("name", "") != "LeviLamina" || meta.value("version", "") != target.loader ||
         meta.value("type", "") != "preload-native" || meta.value("entry", "") != "LeviLamina.dll")
-        throw std::runtime_error("必要なLeviLamina Client: " + target.loader);
+        throw std::runtime_error(Lang::T("必要なLeviLamina Client: ", "LeviLamina Client required: ") + target.loader);
     RequireX64Pe(directory / "LeviLamina.dll");
 }
 
@@ -225,18 +226,18 @@ inline void RequireMod(const fs::path& directory, [[maybe_unused]] const Target&
     const bool hasDependencies = meta.contains("dependencies") && !meta.at("dependencies").empty();
     if (meta.value("name", "") != "MyClientData" || meta.value("entry", "") != "MyClientData.dll" ||
         meta.value("type", "") != "native" || hasDependencies)
-        throw std::runtime_error("配布MODの形式が一致しません。ZIPをすべて展開してください。");
+        throw std::runtime_error(Lang::T("配布MODの形式が一致しません。ZIPをすべて展開してください。", "The mod package does not match. Extract the whole ZIP."));
     RequireX64Pe(directory / "MyClientData.dll");
 }
 
 inline void RequirePlainTree(const fs::path& directory)
 {
     if (fs::is_symlink(fs::symlink_status(directory)) || !fs::is_directory(directory))
-        throw std::runtime_error("MODフォルダーが通常のフォルダーではありません: " + directory.u8string());
+        throw std::runtime_error(Lang::T("MODフォルダーが通常のフォルダーではありません: ", "The mods folder is not a normal folder: ") + directory.u8string());
     for (const auto& entry : fs::recursive_directory_iterator(directory))
         if (fs::is_symlink(entry.symlink_status()) ||
             (!entry.is_regular_file() && !entry.is_directory()))
-            throw std::runtime_error("MOD内のリンクや特殊ファイルには対応していません: " + entry.path().u8string());
+            throw std::runtime_error(Lang::T("MOD内のリンクや特殊ファイルには対応していません: ", "Links and special files inside mods are not supported: ") + entry.path().u8string());
 }
 
 // Progress callback: bytes copied so far, total bytes to copy.
@@ -257,7 +258,7 @@ inline void CopyFileChunked(const fs::path& from, const fs::path& to, unsigned l
 {
     std::ifstream in(from, std::ios::binary);
     std::ofstream out(to, std::ios::binary | std::ios::trunc);
-    if (!in || !out) throw std::runtime_error("ゲームのファイルをコピーできません: " + from.u8string());
+    if (!in || !out) throw std::runtime_error(Lang::T("ゲームのファイルをコピーできません: ", "Cannot copy a game file: ") + from.u8string());
     std::vector<char> buffer(4u << 20);
     // Reported each time the running total passes another 8 MiB, counted over all files: the game's data folder
     // is thousands of small files, and counting per file never reported until the whole folder was done
@@ -269,13 +270,13 @@ inline void CopyFileChunked(const fs::path& from, const fs::path& to, unsigned l
         const auto count = in.gcount();
         if (count <= 0) break;
         out.write(buffer.data(), count);
-        if (!out) throw std::runtime_error("ゲームのファイルを書き込めません。空き容量を確認してください: " + to.u8string());
+        if (!out) throw std::runtime_error(Lang::T("ゲームのファイルを書き込めません。空き容量を確認してください: ", "Cannot write a game file. Check free space: ") + to.u8string());
         const unsigned long long before = done;
         done += static_cast<unsigned long long>(count);
         if (progress && done / step != before / step) progress(done, total);
     }
     out.close();
-    if (!out) throw std::runtime_error("ゲームのファイルを書き込めません。空き容量を確認してください: " + to.u8string());
+    if (!out) throw std::runtime_error(Lang::T("ゲームのファイルを書き込めません。空き容量を確認してください: ", "Cannot write a game file. Check free space: ") + to.u8string());
     std::error_code ignored;
     fs::last_write_time(to, fs::last_write_time(from), ignored);
 }
@@ -303,28 +304,28 @@ inline Instance PrepareManagedGame(const fs::path& sourceExecutable, const fs::p
     if (fs::exists(destination))
     {
         if (fs::is_symlink(fs::symlink_status(destination)) || !fs::is_directory(destination))
-            throw std::runtime_error("自作ソフト用のゲーム保存先が通常のフォルダーではありません。");
+            throw std::runtime_error(Lang::T("自作ソフト用のゲーム保存先が通常のフォルダーではありません。", "The game folder for third-party software is not a normal folder."));
         const auto marker = ReadJson(destination / "MyClient-game.json");
         if (marker.value("owner", "") != "MyClient" || marker.value("schemaVersion", 0) != 1 ||
             !fs::is_regular_file(destination / "MyClient-original.exe"))
-            throw std::runtime_error("準備済みゲームの情報が不正です。保存先とログを確認してください。");
+            throw std::runtime_error(Lang::T("準備済みゲームの情報が不正です。保存先とログを確認してください。", "The prepared game information is invalid. Check the folder and the log."));
         return ResolveGame(destination / "Minecraft.Windows.exe", target);
     }
     const auto source = ResolveGame(sourceExecutable, target);
     const auto originalExecutable = OriginalExecutable(sourceExecutable);
     if (ImportedDlls(originalExecutable).count("preloader.dll"))
-        throw std::runtime_error("変更済みの本体です。Xboxアプリの公式インストール先の本体を選択してください。");
+        throw std::runtime_error(Lang::T("変更済みの本体です。Xboxアプリの公式インストール先の本体を選択してください。", "This game has been modified. Select the game from the Xbox app's official install location."));
     const auto canonicalSource = fs::canonical(source.directory);
     const auto canonicalTarget = fs::weakly_canonical(destination);
     auto sourcePart = canonicalSource.begin(), targetPart = canonicalTarget.begin();
     while (sourcePart != canonicalSource.end() && targetPart != canonicalTarget.end() && *sourcePart == *targetPart)
     { ++sourcePart; ++targetPart; }
     if (sourcePart == canonicalSource.end())
-        throw std::runtime_error("ゲームのコピー先を元のゲームフォルダー内には作成できません。");
+        throw std::runtime_error(Lang::T("ゲームのコピー先を元のゲームフォルダー内には作成できません。", "The game copy cannot be created inside the original game folder."));
     const auto token = std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count());
     fs::create_directories(destination.parent_path());
     const auto stage = destination.parent_path() / fs::u8path(".MyClient-game-" + token);
-    if (!fs::create_directory(stage)) throw std::runtime_error("ゲーム用の一時フォルダーを作成できません。");
+    if (!fs::create_directory(stage)) throw std::runtime_error(Lang::T("ゲーム用の一時フォルダーを作成できません。", "Cannot create a temporary folder for the game."));
     try
     {
         // Game saves are outside the installed GDK content directory. Do not
@@ -341,9 +342,9 @@ inline Instance PrepareManagedGame(const fs::path& sourceExecutable, const fs::p
                 return name.size() >= suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
             };
             if (excluded.count(name) || endsWith(".bak") || endsWith(".orig")) continue;
-            if (fs::is_symlink(entry.symlink_status())) throw std::runtime_error("ゲーム本体内のリンクには対応していません。");
+            if (fs::is_symlink(entry.symlink_status())) throw std::runtime_error(Lang::T("ゲーム本体内のリンクには対応していません。", "Links inside the game folder are not supported."));
             if (entry.is_directory()) RequirePlainTree(entry.path());
-            else if (!entry.is_regular_file()) throw std::runtime_error("ゲーム本体に特殊ファイルがあります。");
+            else if (!entry.is_regular_file()) throw std::runtime_error(Lang::T("ゲーム本体に特殊ファイルがあります。", "The game folder contains special files."));
             toCopy.push_back(entry.path());
             total += TreeBytes(entry.path());
         }
@@ -358,7 +359,7 @@ inline Instance PrepareManagedGame(const fs::path& sourceExecutable, const fs::p
         marker << Json{{"owner", "MyClient"}, {"schemaVersion", 1}, {"source", source.directory.u8string()},
                        {"gameVersion", source.version}}.dump(2);
         marker.close();
-        if (!marker) throw std::runtime_error("ゲームの準備情報を保存できません。");
+        if (!marker) throw std::runtime_error(Lang::T("ゲームの準備情報を保存できません。", "Cannot save the game preparation information."));
         fs::rename(stage, destination);
     }
     catch (...)
@@ -427,24 +428,24 @@ inline fs::path InstallMod(const fs::path& source, const fs::path& gameDirectory
     RequireLoader(gameDirectory, profile);
     const auto mods = gameDirectory / "mods";
     if (fs::is_symlink(fs::symlink_status(mods)))
-        throw std::runtime_error("modsフォルダーのリンクには対応していません。");
+        throw std::runtime_error(Lang::T("modsフォルダーのリンクには対応していません。", "A link as the mods folder is not supported."));
     const auto target = mods / "MyClientData";
     if (fs::exists(target))
     {
         RequirePlainTree(target);
         if (fs::equivalent(source, target))
-            throw std::runtime_error("配布ZIPはゲーム環境とは別のフォルダーに展開してください。");
+            throw std::runtime_error(Lang::T("配布ZIPはゲーム環境とは別のフォルダーに展開してください。", "Extract the ZIP into a folder separate from the game."));
     }
     else if (fs::is_symlink(fs::symlink_status(target)))
-        throw std::runtime_error("導入先にリンクがあります。");
+        throw std::runtime_error(Lang::T("導入先にリンクがあります。", "The install location contains a link."));
     // Backups stay outside mods, so the loader cannot discover the old DLL.
     const auto backups = gameDirectory / "MyClient-backups";
     if (fs::exists(backups) && (fs::is_symlink(fs::symlink_status(backups)) || !fs::is_directory(backups)))
-        throw std::runtime_error("MyClient-backupsが通常のフォルダーではありません。");
+        throw std::runtime_error(Lang::T("MyClient-backupsが通常のフォルダーではありません。", "MyClient-backups is not a normal folder."));
     const auto token = std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count());
     const auto stage = gameDirectory / fs::u8path(".MyClient-install-" + token);
     const auto backup = backups / fs::u8path("MyClientData-" + token);
-    if (fs::exists(stage) || fs::exists(backup)) throw std::runtime_error("導入用の一時フォルダーが既に存在します。");
+    if (fs::exists(stage) || fs::exists(backup)) throw std::runtime_error(Lang::T("導入用の一時フォルダーが既に存在します。", "The temporary install folder already exists."));
     fs::create_directory(stage);
     bool movedOld = false;
     try
@@ -471,7 +472,7 @@ inline fs::path InstallMod(const fs::path& source, const fs::path& gameDirectory
         {
             fs::rename(backup, target, ignored);
             if (ignored)
-                throw std::runtime_error("復元に失敗しました。以前のMODはここに保管されています: " + backup.u8string());
+                throw std::runtime_error(Lang::T("復元に失敗しました。以前のMODはここに保管されています: ", "Restore failed. Your previous mods are kept here: ") + backup.u8string());
         }
         fs::remove_all(stage, ignored);
         throw;

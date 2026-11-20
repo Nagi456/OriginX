@@ -3,8 +3,9 @@
 # 使い方: Actionsタブ →「build-launcher」→「Run workflow」。完了後、Artifactsから MyClientLauncher.exe を取得します。
 # publish を true にすると、サイトのダウンロード（R2 の launcher/MyClientLauncher.exe）も置き換えます
 # （GitHub Actions の OIDC トークンで認証するので秘密の設定は要りません）。
-# 実行番号がランチャーの build 番号になり、publish すると stable/launcher.json も更新され、
-# 古いランチャーは起動時に自分を新しい版へ入れ替えます（launcher/SelfUpdate.h）。
+# 実行番号がランチャーの build 番号になります。自己更新の stable/launcher.json は署名が要るので、ここでは上げません
+# （秘密鍵は CI に置かない。2026-11-20 の署名の設計 §6-3）。Artifacts の MyClientLauncher.exe を作者の PC で
+# docs/signing.md の手順（ハッシュの計算し直し → 署名 → publish_r2.py launcher）で公開します。
 name: build-launcher
 on:
   workflow_dispatch:
@@ -13,12 +14,17 @@ on:
         description: "Replace the launcher the site hands out (R2 launcher/MyClientLauncher.exe)"
         type: boolean
         default: false
+  # ci.yml builds it on every pull request (never publishes: a called run's number is the caller's, not a launcher build).
+  workflow_call:
 permissions:
   contents: read
   id-token: write   # the OIDC token that lets publish_r2.py upload to R2
 jobs:
   build:
     runs-on: ubuntu-24.04
+    concurrency:
+      group: ${{ inputs.publish && 'originx-publish' || format('launcher-{0}', github.run_id) }}
+      cancel-in-progress: false
     defaults:
       run:
         working-directory: source
@@ -43,12 +49,14 @@ jobs:
             -o build/MyClientLauncher.exe \
             -municode -mwindows -luser32 -lgdi32 -lcomdlg32 -lshell32 -lole32 -luuid -lbcrypt -lversion -lwinhttp \
             -lws2_32 -lwindowscodecs -lmsimg32
+          # compared by the author with the hash worked out again on their PC before signing (docs/signing.md §3)
+          sha256sum build/MyClientLauncher.exe
       - uses: actions/upload-artifact@v4
         with:
           name: MyClientLauncher
           path: source/build/MyClientLauncher.exe
       - name: Upload to R2 for the site
-        if: inputs.publish
+        if: inputs.publish && github.event_name == 'workflow_dispatch'
         run: |
           python3 tools/publish_r2.py file build/MyClientLauncher.exe launcher/MyClientLauncher.exe
-          python3 tools/publish_r2.py launcher build/MyClientLauncher.exe ${{ github.run_number }}
+          # stable/launcher.json (the self-update) is signed and uploaded by the author: docs/signing.md

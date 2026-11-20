@@ -40,6 +40,15 @@ inline bool ParsePong(const uint8_t* data, size_t size, uint64_t& echoedTimeMs)
     return true;
 }
 
+// A pong counts for the ping just sent only if it comes from the address and port pinged and echoes that
+// ping's time (2026-11-20 report #8): a late answer to an earlier ping would give a far too short time.
+// Addresses and ports compare as stored (network byte order on both sides).
+inline bool PongForPing(uint32_t fromAddr, uint16_t fromPort, uint32_t pingedAddr, uint16_t pingedPort,
+                        uint64_t echoedTimeMs, uint64_t sentTimeMs)
+{
+    return fromAddr == pingedAddr && fromPort == pingedPort && echoedTimeMs == sentTimeMs;
+}
+
 inline bool PlausibleMs(double ms) { return std::isfinite(ms) && ms >= 0.0 && ms <= 5000.0; }
 
 inline bool Average(const std::vector<double>& samples, size_t window, double& result)

@@ -8,11 +8,28 @@
 int main()
 {
     using namespace GameSigs;
+    const int b45 = FindBuild(0x6A8378BAu, 0x12888000u);
+    assert(b45 >= 0 && FindBuild(0x6A8378BAu, 0x12889000u) == -1);
+    size_t entries45 = 0, fatal45 = 0;
+    for (const Sig& s : kSigs) {
+        const At* at = AtFor(s.index, b45);
+        entries45 += at != nullptr;
+        if (s.fatal) { assert(at); ++fatal45; }
+        if (std::strcmp(s.name, "?$onLevelExit@ClientInstance@@QEAAXXZ") == 0)
+            assert(at && at->rva == 0xD54BE0u);
+        if (std::strcmp(s.name, "AtlasReloadedHook") == 0) assert(!at); // insufficient evidence stays unavailable
+    }
+    assert(entries45 == 58 && fatal45 == 3);   // 58: + ScreenController::bindString (title version text)
+    assert(SameGameVersion("1.26.45.1", "1.26.45"));
+    for (const Sig& s : kSigs)
+        if (std::strcmp(s.name, "PlayerUpdateSkinHook") == 0)
+            assert(Newest(s.index)->rva == 0x2E83C0u); // adding an older game must not replace newest patterns
     assert(kBuildCount >= 2 && kSigCount >= 80);
     const int b51 = FindBuild(0x6AA482FDu, 0x12C0C000u), b60 = FindBuild(0x6AD79EE4u, 0x13846000u);
     assert(b51 >= 0 && b60 >= 0 && b51 != b60 && FindBuild(0x6AA482FDu, 1) == -1 && FindBuild(0, 0) == -1);
     // every build of sigs.json is a build of the address table, and the other way round
-    for (const Build& b : kBuilds) assert(GameRva::FindExe(b.timestamp, b.imageSize) == b.index);
+    for (const Build& b : kBuilds) assert(GameRva::FindExe(b.timestamp, b.imageSize) == b.index && GameRva::FindExe(b.timestamp, b.imageSizeEdited) == b.index);
+    assert(FindBuild(0x6AA482FDu, 0x12C01000u) == b51 && FindBuild(0x6AD79EE4u, 0x1383B000u) == b60);   // standalone: the exe as shipped
     size_t fatal = 0;
     for (const Sig& s : kSigs)
     {
@@ -37,6 +54,7 @@ int main()
     uint32_t value = 0;
     assert(OffsetFor("MinecraftGame.ResourcePackListener", b51, value) && value == 0xC0);
     assert(OffsetFor("MinecraftGame.ResourcePackListener", b60, value) && value == 0xB8);
+    assert(!OffsetFor("MinecraftGame.ResourcePackListener", b45, value)); // not inferred from another version
     assert(!OffsetFor("MinecraftGame.ResourcePackListener", -1, value) && !OffsetFor("nothing", b51, value));
 
     // patterns
@@ -69,6 +87,9 @@ int main()
         fn[7] = 0x83; fn[0] = 0xCC;
         assert(!MatchAtMaybeHooked(fn, sizeof fn, p, hooked));
     }
+    assert(SameGameVersion("1.26.51.1", "1.26.51") && SameGameVersion("1.26.51", "1.26.51"));
+    assert(!SameGameVersion("1.26.510.0", "1.26.51") && !SameGameVersion("1.26.60.5", "1.26.51"));
+    assert(!SameGameVersion("1.26.5", "1.26.51") && !SameGameVersion("1.26.51.1", "") && !SameGameVersion(nullptr, "1.26.51"));
     const std::string line = ReportLine("NG", kSigs[0], "rva 0x10", "48 8B");
     assert(line.rfind("NG\t", 0) == 0 && line.find(kSigs[0].name) != std::string::npos);
     std::printf("game_sigs ok (%zu signatures, %zu fatal, %zu builds)\n", kSigCount, fatal, kBuildCount);

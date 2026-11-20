@@ -1,7 +1,9 @@
 # MyClientData.dll をGitHubのWindows環境でビルドします。
 # 使い方: Actionsタブ →「build-dll」→「Run workflow」。完了後、Artifactsを取得します。
 # publish を true にすると、ランチャーの自動更新用に OriginX の R2 へ公開します（revision / sequence は前回より大きくすること）:
-#   1. 同じコミットの HUD（build-hud）も作り、DLL と一緒に stable/myclient-26.51.1-r<revision>/ へアップロード
+# 注意（2026-11-20）：一覧（catalog.json）は作者の PC での署名が要るので、ここでの公開は catalog.json.sig が無いため止まります。
+# publish は使わず、Artifacts を作者の PC で署名して上げてください（docs/signing.md）。
+#   1. 同じコミットの HUD（build-hud）も作り、DLL と一緒に stable/myclient-26.51.1-r<revision>/ へアップロード（一覧は公開中の stable/catalog.json に足す）
 #   2. stable/catalog.json を最後にアップロード（誰でも https://originx.originx-client.workers.dev/dl/stable/... で取れる）
 #   3. 新しい catalog.json（source/launcher と同梱用ルート）と SHA256SUMS.txt を実行したブランチへコミット
 # channel=test にすると、一般向け（stable/）には何も触らず、モデレーター用のテスト版として test/myclient-<ゲーム版>-r<revision>-test<test_number>/ へ
@@ -39,6 +41,17 @@ on:
       loader_tag:
         description: "LeviLamina tag (e.g. v26.60.0): makes source/tools/sdks/<game>.lock.json first when it is missing, and commits it"
         default: ""
+  # The same inputs, for ci.yml (pull requests: build and test, never publish) and build-release.yml (release/request.json).
+  workflow_call:
+    inputs:
+      publish: { type: boolean, default: false }
+      revision: { type: string, default: "0" }
+      sequence: { type: string, default: "0" }
+      game: { type: string, default: "26.51.1" }
+      channel: { type: string, default: stable }
+      test_number: { type: string, default: "" }
+      standalone: { type: boolean, default: false }
+      loader_tag: { type: string, default: "" }
 permissions:
   contents: write
   id-token: write   # the OIDC token that lets publish_r2.py upload to R2
@@ -51,6 +64,11 @@ jobs:
     # runs when the HUD was built or skipped (no publish)
     if: ${{ !failure() && !cancelled() }}
     runs-on: windows-latest
+    # One publish at a time (two would race for the catalog's sequence and the channel lists). Builds that do not
+    # publish never wait. A third publish queued behind a waiting one replaces it (GitHub's rule): start it again.
+    concurrency:
+      group: ${{ inputs.publish && 'originx-publish' || format('dll-{0}-{1}-{2}', github.run_id, inputs.game, inputs.standalone) }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       matrix:
@@ -115,7 +133,7 @@ jobs:
           cp "$d/MyClientData.map" out/ 2>/dev/null || true   # names for the hook patches the game image dump finds
       - uses: actions/upload-artifact@v4
         with:
-          name: MyClientData-${{ matrix.game }}
+          name: MyClientData-${{ matrix.game }}${{ inputs.standalone && '-standalone' || '' }}
           path: source/out
       - uses: actions/download-artifact@v4
         if: inputs.publish
@@ -138,6 +156,12 @@ jobs:
               --revision "$REVISION" --game-version "$GAME" --hud build/hud/MyClient.exe \
               --channel test --test-number "$TEST_NUMBER" $STANDALONE
           else
+            # Catch up with the branch (another publish in the same run committed its catalog after this checkout), so
+            # the commit back below is a fast-forward.
+            git fetch -q origin "$GITHUB_REF_NAME" && git merge -q --ff-only FETCH_HEAD
+            # The new list is built on the LIVE stable/catalog.json, not on the branch's copy: a branch can hold an old
+            # copy (main had sequence 32 when stable was at 91), and building on it would drop the newer entries.
+            curl -sSf "https://originx.originx-client.workers.dev/dl/stable/catalog.json" -o "$RUNNER_TEMP/live-stable.json"
             tag="myclient-$GAME-r$REVISION"
             # (the DLL: every release has it; a standalone one has no runtime.lock.json)
             code=$(curl -s -o /dev/null -w '%{http_code}' "https://originx.originx-client.workers.dev/dl/stable/$tag/mods__MyClientData__MyClientData.dll")
@@ -145,7 +169,7 @@ jobs:
               echo "stable/$tag already exists on R2 (HTTP $code); increment revision." >&2; exit 1
             fi
             python tools/package_update.py --sdk-root "$sdk" --output "$RUNNER_TEMP/release" \
-              --catalog launcher/catalog.json --revision "$REVISION" --sequence "$SEQUENCE" --game-version "$GAME" \
+              --catalog "$RUNNER_TEMP/live-stable.json" --revision "$REVISION" --sequence "$SEQUENCE" --game-version "$GAME" \
               --hud build/hud/MyClient.exe $STANDALONE
           fi
       - name: Upload to R2 (catalog last)
@@ -170,5 +194,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: inputs.publish
         with:
-          name: release-assets-r${{ inputs.revision }}${{ inputs.channel == 'test' && format('-test{0}', inputs.test_number) || '' }}
+          name: release-assets-${{ matrix.game }}-r${{ inputs.revision }}${{ inputs.channel == 'test' && format('-test{0}', inputs.test_number) || '' }}
           path: ${{ runner.temp }}/release

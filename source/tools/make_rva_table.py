@@ -154,14 +154,14 @@ def make(builds) -> str:
     hook_names = collect()
     lines = [
         "// Made by tools/make_rva_table.py. Do not edit.",
-        "// MYCLIENT_RVA_EXE(exe, timestamp, image size); MYCLIENT_RVA_ROW(exe, label, (names...), RVA, first bytes, mask)",
+        "// MYCLIENT_RVA_EXE(exe, timestamp, image size, image size with .nimp); MYCLIENT_RVA_ROW(exe, label, (names...), RVA, first bytes, mask)",
         "// mask 0 = not compared (a relocated byte, or a hook's jump when the image was dumped)",
     ]
     for index, (image_path, rows) in enumerate(builds):
         image = Image(Path(image_path).read_bytes())
         starts = image.function_starts()
         relocated = image.relocated()
-        lines.append(f"MYCLIENT_RVA_EXE({index}, 0x{image.timestamp:08X}u, 0x{image.size_of_image:X}u)")
+        lines.append(f"MYCLIENT_RVA_EXE({index}, 0x{image.timestamp:08X}u, 0x{image.size_of_image:X}u, 0x{image.size_of_image:X}u)")   # (shipped, edited): tools/make_sigs.py is the real source now
         seen = set()
         seen_names = set()
         for label, rva in rows:

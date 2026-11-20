@@ -1,22 +1,21 @@
 // POST /publish/promote {"tag": "myclient-26.51.1-r54-test1"}: moves a verified test build to the early channel
-// by copying the very same bytes inside R2 (test/<tag>/ -> early/<tag>/), then writes early/catalog.json LAST, so
-// the list never names a file that is not there yet. Only the promote- workflow (or PUBLISH_KEY) may call it.
+// by copying the very same bytes inside R2 (test/<tag>/ -> early/<tag>/) and returns the promoted version entry.
+// The early list itself is signed, so the author writes it (tools/publish_r2.py promote), after the files are there. Only the promote- workflow (or PUBLISH_KEY) may call it.
 //
 // A tag's version entry sits in test/<tag>/entry.json (package_update.py --channel test writes it): test/catalog.json
 // lists only the latest build of each game version, and promoting an older tag again is how the early channel is
 // put back to it.
 
 import type { Env } from "./env";
-import { allowed, isPromoteWorkflow } from "./publish";
+import { caller, isPromoteWorkflow, mayRelease, releaseRefs } from "./publish";
 
 const TAG = /^myclient-[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,2}-r[0-9]+-test[0-9]+$/;
 
 type FileEntry = { url: string; sha256: string; bytes: number };
 type VersionEntry = { id: string; files: Record<string, FileEntry>; [key: string]: unknown };
-type Catalog = { schemaVersion: number; sequence: number; versions: VersionEntry[] };
 
 export type PromoteResult =
-  | { ok: true; tag: string; files: number; sequence: number }
+  | { ok: true; tag: string; files: number; entry: VersionEntry }
   | { ok: false; status: 400 | 404 | 409 | 500; message: string };
 
 function fail(status: 400 | 404 | 409 | 500, message: string): PromoteResult {
@@ -81,41 +80,28 @@ export async function promoteTag(env: Env, tag: string): Promise<PromoteResult> 
   }
   await env.FILES.put(`early/${tag}/entry.json`, new TextEncoder().encode(JSON.stringify(entry)).buffer as ArrayBuffer);
 
-  // 3. The early list, last: this game version's entry replaced, the others kept, sequence raised by one.
-  let previous: Catalog = { schemaVersion: 1, sequence: 0, versions: [] };
-  const listBytes = await readBytes(env, "early/catalog.json");
-  if (listBytes) {
-    try {
-      const parsed = JSON.parse(new TextDecoder().decode(listBytes)) as Catalog;
-      if (!Array.isArray(parsed.versions) || typeof parsed.sequence !== "number") return fail(500, "early/catalog.json is broken");
-      previous = parsed;
-    } catch {
-      return fail(500, "early/catalog.json is broken");
-    }
-  }
+  // 3. The early list is no longer written here (design 2026-11-20-manifest-signing-design.md §6-2): the Worker
+  //    holds no signing key. The promoted entry is returned; the author merges it into early/catalog.json on
+  //    their PC (tools/publish_r2.py promote), signs it and uploads catalog.json.sig and catalog.json.
   const promoted: VersionEntry = {
     ...entry,
     files: Object.fromEntries(sources.map((s) => [s.name, { ...entry.files[s.name], url: s.to }])),
   };
-  const index = previous.versions.findIndex((v) => v.id === entry.id);
-  const versions = [...previous.versions];
-  if (index >= 0) versions[index] = promoted;
-  else versions.push(promoted);
-  const sequence = previous.sequence + 1;
-  const list: Catalog = { schemaVersion: previous.schemaVersion ?? 1, sequence, versions };
-  await env.FILES.put("early/catalog.json", new TextEncoder().encode(JSON.stringify(list, null, 2) + "\n").buffer as ArrayBuffer);
-  console.log("promote:", tag, sources.length, "files, early sequence", sequence);
-  return { ok: true, tag, files: sources.length, sequence };
+  console.log("promote:", tag, sources.length, "files copied; early/catalog.json is signed and uploaded by the author");
+  return { ok: true, tag, files: sources.length, entry: promoted };
 }
 
 export async function handlePromote(request: Request, env: Env, now = Date.now(), fetchFn?: (url: string) => Promise<Response>): Promise<Response> {
   const auth = request.headers.get("authorization") ?? "";
-  const who = auth.startsWith("Bearer ") ? await allowed(env, auth.slice(7), now, fetchFn) : null;
+  const from = auth.startsWith("Bearer ") ? await caller(env, auth.slice(7), now, fetchFn) : null;
+  const who = from?.who ?? null;
   const text = (body: string, status: number) =>
     new Response(body, { status, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
   if (!who) return text("Unauthorized", 401);
   // Only the promote workflow (or the administrator's PUBLISH_KEY) may move a build; a build- workflow may not.
   if (!isPromoteWorkflow(who) && who !== "PUBLISH_KEY") return text("Forbidden", 403);
+  // early/ goes to every supporter: only from the release branches (RELEASE_REFS), like stable/.
+  if (from && !mayRelease(env, from)) return text(`Forbidden: only ${releaseRefs(env).join(", ")} may promote (this run: ${from.ref || "?"})`, 403);
 
   let tag = "";
   try {
@@ -128,5 +114,5 @@ export async function handlePromote(request: Request, env: Env, now = Date.now()
 
   const result = await promoteTag(env, tag);
   if (!result.ok) return text(result.message, result.status);
-  return Response.json({ tag: result.tag, files: result.files, sequence: result.sequence }, { headers: { "cache-control": "no-store" } });
+  return Response.json({ tag: result.tag, files: result.files, entry: result.entry }, { headers: { "cache-control": "no-store" } });
 }

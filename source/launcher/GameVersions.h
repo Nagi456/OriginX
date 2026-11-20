@@ -1,12 +1,13 @@
 #pragma once
+#include "../Lang.h"
 #include "Install.h"
 #include <map>
 
 namespace MyClientLauncher {
-// Released Minecraft versions, from the public list LeviLauncher reads (version numbers and
-// Microsoft download links; only the numbers are used here).
-inline constexpr const char* VersionDbUrl =
-    "https://raw.githubusercontent.com/LiteLDev/minecraft-windows-gdk-version-db/refs/heads/main/historical_versions.json";
+// Released Minecraft versions (version numbers and Microsoft download links). The list is the one LeviLauncher
+// reads (LiteLDev/minecraft-windows-gdk-version-db historical_versions.json), copied unchanged by the author with
+// tools/make_versions_list.py and signed (versions/stable, design 2026-11-20 §6-1): the launcher reads only our copy.
+inline constexpr const char* VersionDbUrl = "https://originx.originx-client.workers.dev/dl/stable/versions.json";
 
 // The id MyClient uses ("26.51.1", or "1.21.120.4" before 26.x) from any spelling of a version:
 // MicrosoftGame.config packs patch and build ("1.26.5101.0"), the database pads the build and
@@ -55,7 +56,7 @@ inline int CompareVersionIds(const std::string& a, const std::string& b)
 inline std::vector<std::string> ParseVersionDb(const Json& db)
 {
     if (!db.is_object() || !db.contains("releaseVersions") || !db.at("releaseVersions").is_array())
-        throw std::runtime_error("公開版の一覧の形式が不正です。");
+        throw std::runtime_error(Lang::T("公開版の一覧の形式が不正です。", "The published version list has an invalid format."));
     std::vector<std::string> ids;
     for (const auto& item : db.at("releaseVersions"))
     {

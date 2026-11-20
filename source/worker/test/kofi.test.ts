@@ -178,4 +178,14 @@ describe("hourly supporter check", () => {
     expect(f.calls[0].method).toBe("PUT");
     expect((await loadRecords(env)).users["11111"].granted).toBe(true);
   });
+
+  it("also gives the founder cape role by the donation day", async () => {
+    const f = discord();
+    vi.stubGlobal("fetch", f.fn);
+    const env = testEnv({ KOFI_TOKEN: "kofi-token", FILES: memoryBucket(), PUBLIC_LAUNCH_DATE: "2026-10-01", FOUNDER_ROLE_ID: "601", SUPPORTER_CAPE_ROLE_ID: "602" });
+    expect((await post(payment(), env)).status).toBe(200);
+    const puts = f.calls.filter((c) => c.method === "PUT").map((c) => c.url);
+    expect(puts.some((u) => u.endsWith("/roles/300"))).toBe(true);
+    expect(puts.some((u) => u.endsWith("/roles/601"))).toBe(true);
+  });
 });

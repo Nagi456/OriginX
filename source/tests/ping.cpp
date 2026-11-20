@@ -24,6 +24,11 @@ int main()
     auto wrongId = pong; wrongId[0] = 0x1D; assert(!ParsePong(wrongId.data(), wrongId.size(), echoed));
     auto wrongMagic = pong; wrongMagic[20] ^= 1; assert(!ParsePong(wrongMagic.data(), wrongMagic.size(), echoed));
     assert(!ParsePong(pong.data(), 32, echoed) && !ParsePong(nullptr, 40, echoed));   // truncated / null
+    // ---- a pong is taken only for the ping just sent ----
+    assert(PongForPing(0x04030201u, 0xBC4Au, 0x04030201u, 0xBC4Au, 5000, 5000));
+    assert(!PongForPing(0x04030201u, 0xBC4Au, 0x04030201u, 0xBC4Au, 4000, 5000));   // late answer to the previous ping
+    assert(!PongForPing(0x04030201u, 0x1234u, 0x04030201u, 0xBC4Au, 5000, 5000));   // another port
+    assert(!PongForPing(0x05030201u, 0xBC4Au, 0x04030201u, 0xBC4Au, 5000, 5000));   // another address
     // ---- smoothing / plausibility ----
     assert(PlausibleMs(0) && PlausibleMs(35.5) && PlausibleMs(5000) && !PlausibleMs(-1) && !PlausibleMs(5001));
     assert(!PlausibleMs(std::nan("")) && !PlausibleMs(INFINITY));
@@ -33,7 +38,7 @@ int main()
     assert(Average({100, 10, 20, 30, 40, 50}, 5, mean) && mean == 30);   // only the latest 5
     // ---- shared "Server" record (DLL -> HUD) ----
     using namespace MyClientFeatures;
-    static_assert(sizeof(Server) == 80 && sizeof(Stats) == 48 && sizeof(Shared) == 1592 && Version == 16);
+    static_assert(sizeof(Server) == 80 && sizeof(Stats) == 48 && sizeof(Shared) == 1608 && Version == 17);
     Server server{};
     SetServer(server, "1.2.3.4", 19132, 0, 1000);
     char host[64]; uint32_t port = 0;
@@ -41,7 +46,9 @@ int main()
     assert(!PingTarget(server, 7001, host, port));                    // stale (> 6 s)
     assert(!PingTarget(server, 999, host, port));                     // stamp from the future
     SetServer(server, "geo.hivebedrock.network", 19132, 2, 1000);
-    assert(!PingTarget(server, 1500, host, port));                    // not RakNet: nothing is sent
+    assert(!PingTarget(server, 1500, host, port));                    // other transport: nothing is sent
+    SetServer(server, "109.224.231.202", 19132, 4, 1000);
+    assert(PingTarget(server, 1500, host, port) && port == 19132);    // NetherNet (featured servers): pinged
     SetServer(server, "", 19132, 0, 1000);
     assert(!PingTarget(server, 1500, host, port));                    // no server
     SetServer(server, "evil host;rm", 19132, 0, 1000);

@@ -12,6 +12,7 @@
 // had the role before their first donation is marked `keep`: their days are
 // still counted, but the role stays when the days are over.
 
+import { capeRoleFor } from "./capes";
 import type { Env } from "./env";
 import { addRole, getMember, removeRole } from "./discord";
 
@@ -127,6 +128,15 @@ export async function handleKofi(request: Request, env: Env, now: number): Promi
     console.error(`Ko-fi: giving ${userId} the supporter role failed, the cron will retry`, e);
   }
   if (record.granted) await saveRecords(env, records);
+  // The cape role (capes.ts): founder or supporter cape by the donation day. Never taken back.
+  const capeRole = capeRoleFor(env, now);
+  if (capeRole) {
+    try {
+      if (!(await addRole(env, userId, capeRole))) console.error("Ko-fi: could not give the cape role (not in the server, or the bot's role is too low)");
+    } catch (e) {
+      console.error("Ko-fi: giving the cape role failed", e);
+    }
+  }
   console.log(`Ko-fi: ${userId} is a supporter until ${new Date(until).toISOString()}${keep ? " (had the role before, it stays after that)" : ""}`);
   return text("ok");
 }

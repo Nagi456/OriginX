@@ -232,6 +232,8 @@ g++ -std=c++17 -Wall -Wextra -Werror -I. tests/game_data.cpp -o /tmp/myclient-ga
 /tmp/myclient-game-data
 g++ -std=c++17 -Wall -Wextra -Werror -I. -Ilauncher/vendor tests/launcher_install.cpp launcher/vendor/tinyxml2/tinyxml2.cpp -o /tmp/myclient-launcher-install
 /tmp/myclient-launcher-install
+g++ -std=c++17 -Wall -Wextra -Werror -I. tests/config_share.cpp -o /tmp/config_share
+/tmp/config_share
 ```
 
 配布ZIPの作成（SDK準備と両ビルドの完了後。更新用ファイルを先に作成）：
@@ -281,3 +283,7 @@ MyClient は現在 **Minecraft 1.26.51（26.51.1、LeviLamina 26.51.6）だけ**
 - SDK のロックは `tools/client-sdk.lock.json` です。
 - 新しい版に移るときは `python tools/generate_sdk_lock.py --game <版> --tag <LeviLaminaのタグ>` でロックを作り、`tools/client-sdk.lock.json` を置き換えます。
 - **LeviLaminaのクライアント版が存在する系列のみ**対応できます（26.45.x / 26.50.x / 26.52.x は現時点で存在しません）。
+
+---
+
+OriginX は非公式クライアントです。ソースコードは GPLv3 で https://github.com/Nagi456/OriginX に公開しています。

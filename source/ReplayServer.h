@@ -17,6 +17,7 @@
 // host (tests/replay_server.cpp). ReplayPlayer.h runs it on a Windows UDP socket.
 #include "ReplayFormat.h"
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -507,7 +508,10 @@ public:
     State GetState() const { return state_; }
     uint64_t PositionMs() const { return playMs_ < rec_.LengthMs() ? static_cast<uint64_t>(playMs_) : rec_.LengthMs(); }
     bool Paused() const { return paused_; }
-    void SetPaused(bool p) { paused_ = p; }
+    void SetPaused(bool p) { paused_ = p; if (!p) stepMs_ = 0; }
+    // Video export (2026-11-12): moves the paused clock on by `ms`; the records then due go out as in normal play.
+    // Only while paused, never backwards.
+    void Step(double ms) { if (paused_ && ms > 0) stepMs_ += ms; }
     float Speed() const { return speed_; }
     void SetSpeed(float s) { speed_ = s < 0.25f ? 0.25f : s > 8.f ? 8.f : s; }
     bool PacksRequested() const { return packsRequested_; }
@@ -625,12 +629,15 @@ private:
     double playMs_ = 0;          // playback position (ms after the mark)
     uint64_t lastPlayAt_ = 0;
     bool paused_ = false; float speed_ = 1.f;
+    double stepMs_ = 0;   // Step while paused, added by the next Play
     uint64_t tick_ = 0;
     bool freeCamera_ = true, selfShown_ = false;
     double seekTo_ = -1;            // a jump forward still to make (ms after the mark); -1 = none
     double skipUntil_ = -1;         // records up to here are a jump's: no sounds and particles
     bool rewinding_ = false, haveViewerPose_ = false;
     Pose viewerPose_{};
+    bool haveLastRecorded_ = false;   // the recorded player's last pose sent (HoldAtRecordedPose)
+    Pose lastRecorded_{};
 
     // Back to waiting for the game, the recording from its start (a jump back; see SeekTo).
     void Restart(double target) {
@@ -739,7 +746,10 @@ private:
         if (state_ == State::Playing || state_ == State::Finished) {
             for (const auto& p : packets) {
                 Pose pose;
-                if (GameId(p) == Id::PlayerAuthInput && ReadPose(p, pose)) { viewerPose_ = pose; haveViewerPose_ = true; }
+                if (GameId(p) == Id::PlayerAuthInput && ReadPose(p, pose)) {
+                    viewerPose_ = pose; haveViewerPose_ = true;
+                    HoldAtRecordedPose(pose);
+                }
             }
             return;
         }
@@ -751,6 +761,21 @@ private:
             if (state_ == State::Packs && (status == PackStatus::HaveAllPacks || status == PackStatus::SendPacks)) SendStack(now);
             else if (state_ == State::Stack && status == PackStatus::Completed) StartPlaying(now);
         }
+    }
+
+    // From the recorded player's eyes the viewer only watches: no recorded movement comes while paused or after the
+    // end, and the game then let the viewer walk and look around in the recorded world (2026-11-12, user report:
+    // "the replay ended and I could move"). Any own movement is put back to the last recorded pose. Moving freely is
+    // the free camera's job (K).
+    static bool PoseMoved(const Pose& a, const Pose& b) {
+        const auto far = [](float u, float v, float limit) { return std::fabs(u - v) > limit; };
+        return far(a.x, b.x, 0.05f) || far(a.y, b.y, 0.05f) || far(a.z, b.z, 0.05f) || far(a.pitch, b.pitch, 0.5f) || far(a.yaw, b.yaw, 0.5f);
+    }
+    void HoldAtRecordedPose(const Pose& viewer) {
+        if (FreeCamera() || !haveLastRecorded_ || !(paused_ || state_ == State::Finished)) return;
+        if (!PoseMoved(viewer, lastRecorded_)) return;
+        const Pose& r = lastRecorded_;
+        SendGame({MovePlayer(rec_.runtimeId, r.x, r.y, r.z, r.pitch, r.yaw, r.headYaw, ++tick_)});
     }
 
     void SendStack(uint64_t now) { SendGame({rec_.packStack}); state_ = State::Stack; stateAt_ = now; }
@@ -765,6 +790,8 @@ private:
         const auto flushBatch = [&] { if (!batch.empty()) { SendGame(batch); batch.clear(); batchBytes = 0; } };
         bool reachedMark = !rec_.hasMark || fileMs_ >= rec_.markMs;
         if (reachedMark && !paused_) playMs_ += static_cast<double>(step) * speed_;
+        if (paused_ && stepMs_ > 0) playMs_ += stepMs_;
+        stepMs_ = 0;
         if (seekTo_ >= 0) {   // a jump: everything up to there is due now
             if (seekTo_ > playMs_) { skipUntil_ = seekTo_; playMs_ = seekTo_; }
             seekTo_ = -1;
@@ -786,9 +813,11 @@ private:
             if (!pending_.sent && reachedMark && static_cast<double>(at - rec_.markMs) <= skipUntil_ && FreeCam::Transient(id)) continue;
             if (pending_.sent) {
                 Pose pose;
-                if (id == Id::PlayerAuthInput && ReadPose(pending_.data, pose))
+                if (id == Id::PlayerAuthInput && ReadPose(pending_.data, pose)) {
+                    lastRecorded_ = pose; haveLastRecorded_ = true;
                     batch.push_back(free ? FreeCam::MoveRecorded(rec_.runtimeId, pose.x, pose.y, pose.z, pose.pitch, pose.yaw, pose.headYaw, ++tick_)
                                          : MovePlayer(rec_.runtimeId, pose.x, pose.y, pose.z, pose.pitch, pose.yaw, pose.headYaw, ++tick_));
+                }
                 // the recorded player's own swings and held items, for the others to see (same layout both ways)
                 else if (free && selfShown_ && (id == FreeCam::Animate || id == FreeCam::MobEquipment))
                     batch.push_back(std::move(pending_.data));

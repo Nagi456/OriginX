@@ -51,7 +51,16 @@ void Worker()
             Sleep(500);
             continue;
         }
-        if (!resolved || host != resolvedHost || port != resolvedPort) {
+        if (resolved && (host != resolvedHost || port != resolvedPort)) {
+            // The target changed (2026-11-20 report #7): forget the old server at once, so a failed lookup of
+            // the new one cannot keep pinging the old address, its value is not shown for the new server, and
+            // a late pong to the old socket is never read.
+            resolved = false;
+            latestMs.store(-1);
+            samples.clear(); missed = 0;
+            if (sock != INVALID_SOCKET) { closesocket(sock); sock = INVALID_SOCKET; }
+        }
+        if (!resolved) {
             addrinfo hints{}, *found = nullptr;
             hints.ai_family = AF_INET; hints.ai_socktype = SOCK_DGRAM; hints.ai_protocol = IPPROTO_UDP;
             if (getaddrinfo(host.c_str(), nullptr, &hints, &found) == 0 && found) {
@@ -72,7 +81,8 @@ void Worker()
 
         LARGE_INTEGER sent{}, received{};
         QueryPerformanceCounter(&sent);
-        const auto packet = BuildPing(GetTickCount64(), guid);
+        const uint64_t sentStamp = GetTickCount64();
+        const auto packet = BuildPing(sentStamp, guid);
         const int sentBytes = sendto(sock, reinterpret_cast<const char*>(packet.data()), static_cast<int>(packet.size()), 0,
                                      reinterpret_cast<const sockaddr*>(&remote), sizeof remote);
         bool answered = false;
@@ -85,8 +95,9 @@ void Worker()
                                        reinterpret_cast<sockaddr*>(&from), &fromLength);
                 if (n <= 0) break;   // timeout / error
                 uint64_t echoed = 0;
-                // Only accept a pong from the address we pinged.
-                if (from.sin_addr.s_addr == remote.sin_addr.s_addr && ParsePong(buffer, static_cast<size_t>(n), echoed)) {
+                // Only a pong from the address and port pinged, answering this ping.
+                if (ParsePong(buffer, static_cast<size_t>(n), echoed) &&
+                    PongForPing(from.sin_addr.s_addr, from.sin_port, remote.sin_addr.s_addr, remote.sin_port, echoed, sentStamp)) {
                     QueryPerformanceCounter(&received);
                     const double ms = 1000.0 * static_cast<double>(received.QuadPart - sent.QuadPart) / static_cast<double>(frequency.QuadPart);
                     if (PlausibleMs(ms)) {

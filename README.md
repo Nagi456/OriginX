@@ -13,6 +13,12 @@ OriginX is licensed under the GNU General Public License v3 (`LICENSE`).
 The launcher embeds gamelaunchhelper (GPLv3, `source/launcher/vendor/gamelaunchhelper`).
 This repository is updated with every release.
 
+## Tags
+
+Every launcher build that was distributed has a tag `build-<NN>` (for example
+`build-41`) on the commit holding its source. The same files are also offered as
+`OriginX-source.zip` beside that launcher on the official download site.
+
 ## Name and logo
 
 The name "OriginX" and the OriginX logo are not licensed under the GPL. If you

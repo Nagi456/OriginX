@@ -11,7 +11,7 @@
 #include <type_traits>
 
 namespace MyClientTabList {
-constexpr uint32_t Magic = 0x4d435431, Version = 3;
+constexpr uint32_t Magic = 0x4d435431, Version = 4;
 constexpr uint64_t StaleMs = 2000;
 constexpr uint32_t MaxPlayers = 64, NameSize = 32, TitleSize = 160, MaxBoxes = 24, BoxSegments = 8;
 
@@ -28,7 +28,7 @@ inline void Corner(const Box& b, int i, float out[3]) {
 }
 
 struct Shared { uint32_t magic, version, size, pid; uint64_t at; uint32_t count, total; char names[MaxPlayers][NameSize]; char title[TitleSize];
-                uint32_t boxCount, boxPad[3]; Box boxes[MaxBoxes]; };
+                uint32_t boxCount, hive, boxPad[2]; Box boxes[MaxBoxes]; };   // hive: 1 = connected to The Hive (v4)
 static_assert(sizeof(Shared) == 32 + 64 * 32 + 160 + 16 + 24 * 40);
 static_assert(std::is_trivially_copyable<Shared>::value);
 
@@ -63,6 +63,7 @@ public:
         std::memcpy(data_.title, s.data(), n);
         data_.title[n] = 0;
     }
+    void SetHive(bool on) { data_.hive = on ? 1u : 0u; }
     void AddBox(const Box& box) { if (data_.boxCount < MaxBoxes) data_.boxes[data_.boxCount++] = box; }
     const Shared& Result() const { return data_; }
 };

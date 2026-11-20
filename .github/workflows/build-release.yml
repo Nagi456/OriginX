@@ -1,0 +1,73 @@
+# 公開の依頼ファイル release/request.json（docs/release.md「公開の依頼ファイル」）を読んで公開します。
+# - channel test  : その PR に push された時（依頼ファイルが変わった時だけ）に test/ へ公開。モデレーターだけに届く。
+# - channel stable: その PR が main にマージされた時に stable/ へ公開（catalog は main に書き戻される）。
+# - 手動（Run workflow）：選んだブランチの依頼ファイルをそのまま公開（stable/early は Worker が RELEASE_REFS 以外を拒否する。
+#   wrangler.jsonc：main と、移行が終わるまでは作業ブランチ）。
+# 名前は build- で始める（Worker の OIDC 確認は build-*／promote-* の workflow だけを受け付ける）。
+name: build-release
+on:
+  pull_request:
+    paths: ["release/request.json"]
+  push:
+    branches: [main]
+    paths: ["release/request.json"]
+  workflow_dispatch:
+permissions:
+  contents: write
+  id-token: write   # build-dll uploads with the OIDC token
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      plan: ${{ steps.plan.outputs.plan }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - id: changed
+        name: Did release/request.json change in this push?
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after || github.sha }}
+        run: |
+          flag=--changed
+          if [ "$EVENT" = pull_request ] && [ "$ACTION" = reopened ]; then
+            flag=""                             # reopened: already published when it was opened or pushed
+          elif [ "$EVENT" = pull_request ] && [ "$ACTION" != synchronize ]; then
+            flag=--changed                      # opened: the request is new to this pull request
+          elif [ -n "$BEFORE" ] && ! [[ "$BEFORE" =~ ^0+$ ]] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            git diff --quiet "$BEFORE" "$AFTER" -- release/request.json && flag=""
+          fi
+          echo "flag=$flag" >> "$GITHUB_OUTPUT"
+      - id: plan
+        shell: bash
+        run: |
+          python source/tools/release_request.py plan --event "${{ github.event_name }}" ${{ steps.changed.outputs.flag }} > "$RUNNER_TEMP/plan.json"
+          cat "$RUNNER_TEMP/plan.json"
+          echo "plan=$(cat "$RUNNER_TEMP/plan.json")" >> "$GITHUB_OUTPUT"
+          python -c 'import json,sys; p=json.load(open(sys.argv[1])); print("publish=" + str(p["publish"]).lower())' "$RUNNER_TEMP/plan.json" >> "$GITHUB_OUTPUT"
+          python -c 'import json,sys; print("### " + json.load(open(sys.argv[1]))["summary"])' "$RUNNER_TEMP/plan.json" >> "$GITHUB_STEP_SUMMARY"
+  dll:
+    needs: plan
+    if: needs.plan.outputs.publish == 'true'
+    strategy:
+      max-parallel: 1     # one game after the other: each one merges into the list the previous one wrote
+      fail-fast: true
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.plan).matrix }}
+    uses: ./.github/workflows/build-dll.yml
+    with:
+      publish: true
+      game: ${{ matrix.game }}
+      revision: ${{ matrix.revision }}
+      sequence: ${{ matrix.sequence }}
+      channel: ${{ fromJSON(needs.plan.outputs.plan).channel }}
+      test_number: ${{ matrix.test_number }}
+      standalone: ${{ matrix.standalone }}

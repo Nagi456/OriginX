@@ -38,46 +38,35 @@ async function world(...builds: Array<Awaited<ReturnType<typeof build>>>) {
   return { env: testEnv({ PUBLISH_KEY: KEY, FILES: bucket }), bucket, files };
 }
 
-const early = (files: Record<string, string>) => JSON.parse(files["early/catalog.json"]);
-
 describe("promoteTag", () => {
-  it("copies the same bytes to early/ and writes early/catalog.json last", async () => {
+  it("copies the same bytes to early/, returns the promoted entry and never writes early/catalog.json (it is signed by the author)", async () => {
     const b = await build(TAG, "26.51.1");
     const { env, bucket, files } = await world(b);
     const result = await promoteTag(env, TAG);
-    expect(result).toEqual({ ok: true, tag: TAG, files: 2, sequence: 1 });
+    expect(result).toMatchObject({ ok: true, tag: TAG, files: 2 });
     expect(files[`early/${TAG}/runtime.lock.json`]).toBe(`lock ${TAG}`);
     expect(files[`early/${TAG}/mods__MyClientData__MyClientData.dll`]).toBe(`dll ${TAG}`);
-    const keys = Object.keys(bucket.puts);
-    expect(keys[keys.length - 1]).toBe("early/catalog.json");
-    expect(keys.slice(0, -1).every((k) => k.startsWith(`early/${TAG}/`))).toBe(true);
-    const entry = early(files).versions[0];
-    expect(early(files).sequence).toBe(1);
-    expect(entry.id).toBe("26.51.1");
-    expect(entry.files["runtime.lock.json"]).toEqual({ url: `early/${TAG}/runtime.lock.json`, sha256: await sha(`lock ${TAG}`), bytes: new TextEncoder().encode(`lock ${TAG}`).length });
-    expect(entry.revision).toBe(54);
+    expect(Object.keys(bucket.puts).every((k) => k.startsWith(`early/${TAG}/`))).toBe(true);
+    expect(files["early/catalog.json"]).toBeUndefined();
+    if (!result.ok) throw new Error("promote failed");
+    expect(result.entry.id).toBe("26.51.1");
+    expect(result.entry.files["runtime.lock.json"]).toEqual({ url: `early/${TAG}/runtime.lock.json`, sha256: await sha(`lock ${TAG}`), bytes: new TextEncoder().encode(`lock ${TAG}`).length });
+    expect(result.entry.revision).toBe(54);
   });
 
-  it("keeps both game versions, replaces only the one promoted, and a later promote raises the sequence", async () => {
-    const a = await build(TAG, "26.51.1"), c = await build(TAG2, "26.60.5");
-    const { env, files } = await world(a, c);
-    await promoteTag(env, TAG);
-    expect(await promoteTag(env, TAG2)).toMatchObject({ ok: true, sequence: 2 });
-    expect(early(files).versions.map((v: { id: string }) => v.id)).toEqual(["26.51.1", "26.60.5"]);
-    // an earlier tag for the same game version puts the early channel back to it
-    // (the test list does not name it any more: only entry.json under its tag does)
+  it("an earlier tag can be promoted again (its entry.json is still under its tag)", async () => {
+    const { env, files } = await world(await build(TAG, "26.51.1"));
     const older = await build("myclient-26.51.1-r53-test2", "26.51.1");
     Object.assign(files, older.objects);
-    expect(await promoteTag(env, "myclient-26.51.1-r53-test2")).toMatchObject({ ok: true, sequence: 3 });
-    const now = early(files).versions;
-    expect(now.map((v: { id: string }) => v.id).sort()).toEqual(["26.51.1", "26.60.5"]);
-    expect(now.find((v: { id: string }) => v.id === "26.51.1").files["runtime.lock.json"].url).toBe("early/myclient-26.51.1-r53-test2/runtime.lock.json");
+    const result = await promoteTag(env, "myclient-26.51.1-r53-test2");
+    expect(result).toMatchObject({ ok: true });
+    if (result.ok) expect(result.entry.files["runtime.lock.json"].url).toBe("early/myclient-26.51.1-r53-test2/runtime.lock.json");
   });
 
   it("is repeatable: a second promote of the same tag finds the same bytes and succeeds", async () => {
     const { env } = await world(await build(TAG, "26.51.1"));
-    expect(await promoteTag(env, TAG)).toMatchObject({ ok: true, sequence: 1 });
-    expect(await promoteTag(env, TAG)).toMatchObject({ ok: true, sequence: 2 });
+    expect(await promoteTag(env, TAG)).toMatchObject({ ok: true });
+    expect(await promoteTag(env, TAG)).toMatchObject({ ok: true });
   });
 
   it("stops without touching early/ when a file does not match its SHA256, and when one is missing", async () => {
@@ -100,14 +89,12 @@ describe("promoteTag", () => {
     expect(bucket.puts["early/catalog.json"]).toBeUndefined();
   });
 
-  it("is 404 for a tag with no entry.json, 400 for a badly formed tag, 500 for a broken early list", async () => {
-    const { env, files } = await world(await build(TAG, "26.51.1"));
+  it("is 404 for a tag with no entry.json, 400 for a badly formed tag", async () => {
+    const { env } = await world(await build(TAG, "26.51.1"));
     expect(await promoteTag(env, "myclient-26.51.1-r99-test9")).toMatchObject({ ok: false, status: 404 });
     for (const tag of ["myclient-26.51.1-r54", "../x", "myclient-26.51.1-r54-test1/../../stable", "", "myclient-26.51.1-r54-test1 "]) {
       expect(await promoteTag(env, tag), tag).toMatchObject({ ok: false, status: 400 });
     }
-    files["early/catalog.json"] = "{";
-    expect(await promoteTag(env, TAG)).toMatchObject({ ok: false, status: 500 });
   });
 });
 
@@ -123,12 +110,24 @@ describe("POST /publish/promote", () => {
     const s = await oidcSigner();
     expect((await post(env, null)).status).toBe(401);
     expect((await post(env, await s.token(), { tag: TAG }, s.fetchFn)).status).toBe(403);
-    const promote = { workflow_ref: "Nagi456/MyClient/.github/workflows/promote-build.yml@refs/heads/x" };
+    const promote = { workflow_ref: "Nagi456/MyClient/.github/workflows/promote-build.yml@refs/heads/main", ref: "refs/heads/main" };
     const ok = await post(env, await s.token(promote), { tag: TAG }, s.fetchFn);
     expect(ok.status).toBe(200);
-    expect(await ok.json()).toEqual({ tag: TAG, files: 2, sequence: 1 });
-    expect(files["early/catalog.json"]).toBeDefined();
+    const answer = (await ok.json()) as { tag: string; files: number; entry: { id: string } };
+    expect(answer).toMatchObject({ tag: TAG, files: 2, entry: { id: "26.51.1" } });
+    expect(files[`early/${TAG}/runtime.lock.json`]).toBeDefined();
+    expect(files["early/catalog.json"]).toBeUndefined();
     expect((await post(env, KEY)).status).toBe(200);
+  });
+
+  it("403 for a promote- workflow run on a branch that is not a release branch (RELEASE_REFS)", async () => {
+    const { env, files } = await world(await build(TAG, "26.51.1"));
+    const s = await oidcSigner();
+    const work = { workflow_ref: "Nagi456/MyClient/.github/workflows/promote-build.yml@refs/heads/codex/x", ref: "refs/heads/codex/x" };
+    const res = await post(env, await s.token(work), { tag: TAG }, s.fetchFn);
+    expect(res.status).toBe(403);
+    expect(await res.text()).toContain("refs/heads/codex/x");
+    expect(files["early/catalog.json"]).toBeUndefined();
   });
 
   it("400 for a body that is not JSON with a tag, and passes the failure status of the promote through", async () => {
@@ -149,6 +148,6 @@ describe("routing", () => {
       method: "POST", headers: { authorization: `Bearer ${KEY}` }, body: JSON.stringify({ tag: TAG }),
     }), env, { waitUntil() {} });
     expect(res.status).toBe(200);
-    expect(files["early/catalog.json"]).toBeDefined();
+    expect(files[`early/${TAG}/runtime.lock.json`]).toBeDefined();
   });
 });

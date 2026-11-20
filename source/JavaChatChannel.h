@@ -67,6 +67,11 @@ public:
         if (ok) { data_->requestedAt = GetTickCount64(); data_->wanted = wanted ? 1 : 0; out = data_->snapshot; }
         Unlock(); return ok;
     }
+    bool ConsumerAlive(DWORD pid) {
+        if (!Lock(0)) return false;
+        const bool alive = Valid(pid) && Fresh(data_->requestedAt, GetTickCount64());
+        Unlock(); return alive;
+    }
     bool Wanted(DWORD pid) {
         if (!Lock(0)) return false;
         const bool wanted = Valid(pid) && data_->wanted && Fresh(data_->requestedAt, GetTickCount64());

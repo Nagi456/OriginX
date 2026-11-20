@@ -13,6 +13,7 @@
 #include "GameSigs.h"
 
 #include <windows.h>
+#include "../LogPrivacy.h"
 
 #include <atomic>
 #include <cstdio>
@@ -60,7 +61,7 @@ void WriteFileLine(const wchar_t* name, const std::string& text, bool fresh)
     char stamp[32];
     std::snprintf(stamp, sizeof stamp, "%04u-%02u-%02u %02u:%02u:%02u.%03u ", now.wYear, now.wMonth, now.wDay, now.wHour,
                   now.wMinute, now.wSecond, now.wMilliseconds);
-    const std::string line = stamp + text + "\r\n";
+    const std::string line = stamp + LogPrivacy::Redact(text) + "\r\n";
     DWORD written = 0;
     WriteFile(file, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
     FlushFileBuffers(file);
@@ -165,7 +166,7 @@ Verdict Check(const char* dllFor, bool scanUnknown)
     v.version = GameVersionText();
     v.build = GameSigs::FindBuild(exe.timestamp, exe.imageSize);
     // A DLL is built against one game version's SDK (class layouts): another supported build is still the wrong one.
-    const bool sameVersion = v.build >= 0 && dllFor && std::strncmp(GameSigs::kBuilds[v.build].version, dllFor, std::strlen(dllFor)) == 0;
+    const bool sameVersion = v.build >= 0 && GameSigs::SameGameVersion(GameSigs::kBuilds[v.build].version, dllFor);
     runningBuild.store(v.build);
     StartupLine("game version " + v.version + ", exe timestamp " + Hex(exe.timestamp) + ", image size " + Hex(exe.imageSize) +
                 "; this DLL is for Minecraft " + (dllFor ? dllFor : "?"));

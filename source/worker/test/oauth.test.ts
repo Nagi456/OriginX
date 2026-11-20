@@ -85,6 +85,17 @@ describe("callback", () => {
     expect(res.headers.get("location")).toMatch(/^https:\/\/site\.example\/file\/launcher\/MyClientLauncher\.exe\?exp=\d+&sig=/);
   });
 
+  it("marks the launcher link of an English visitor with lang=en, and only theirs", async () => {
+    const en = await startLogin("/login?lang=en");
+    discordSays(json({ roles: ["200"], user: { id: "42", username: "u" } }));
+    const english = new URL((await callback(`code=c&state=${en.state}`, en.cookie)).headers.get("location")!);
+    expect(english.searchParams.get("lang")).toBe("en");
+    const ja = await startLogin("/login");
+    discordSays(json({ roles: ["200"], user: { id: "42", username: "u" } }));
+    const japanese = new URL((await callback(`code=c&state=${ja.state}`, ja.cookie)).headers.get("location")!);
+    expect(japanese.searchParams.has("lang")).toBe(false);
+  });
+
   it("sends a non-member to need=verify", async () => {
     const { state, cookie } = await startLogin("/login");
     discordSays(json({ message: "Unknown Member" }, 404));

@@ -37,6 +37,16 @@ int main()
     assert(LauncherUpdateWanted(14, info));
     assert(!LauncherUpdateWanted(15, info));
     assert(!LauncherUpdateWanted(16, info));
+    assert(!LauncherUpdateWanted(14, info, 15));   // this build did not start last time: skipped
+    assert(LauncherUpdateWanted(14, info, 13));    // an older failure does not stop a newer build
+    // Hand-over: the mark wins, the new launcher ending or 10 s without a mark rolls back.
+    assert(HandOverState(false, false, 0) == HandOver::Waiting);
+    assert(HandOverState(false, false, 9999) == HandOver::Waiting);
+    assert(HandOverState(true, false, 9999) == HandOver::Ready);
+    assert(HandOverState(true, true, 20000) == HandOver::Ready);
+    assert(HandOverState(false, true, 100) == HandOver::Failed);
+    assert(HandOverState(false, false, 10000) == HandOver::Failed);
+    assert(StartedMarkPath("x", 42) == fs::path("x") / "launcher-started-42");
 
     // Swap: the running exe becomes .old, the new one takes its name; the .old is removed later.
     const auto dir = fs::temp_directory_path() / "myclient-self-update-test";
@@ -54,6 +64,21 @@ int main()
     // The new file missing: the original is put back.
     Reject([&] { SwapLauncher(exe, dir / "missing.exe"); });
     assert(Read(exe) == "new");
+
+    // Rollback after the new launcher did not start: the previous one is back, the new one is set aside.
+    Write(OldLauncherPath(exe), "old");
+    RollbackLauncher(exe);
+    assert(Read(exe) == "old" && Read(FailedLauncherPath(exe)) == "new" && !fs::exists(OldLauncherPath(exe)));
+    RemoveOldLauncher(exe);   // also clears the .failed copy
+    assert(!fs::exists(FailedLauncherPath(exe)) && Read(exe) == "old");
+    // No previous launcher: nothing is moved.
+    Reject([&] { RollbackLauncher(exe); });
+    assert(Read(exe) == "old");
+    // The exe cannot be moved aside (here: it is missing): the previous one stays where it is.
+    Write(OldLauncherPath(exe), "older");
+    fs::remove(exe);
+    Reject([&] { RollbackLauncher(exe); });
+    assert(Read(OldLauncherPath(exe)) == "older");
     fs::remove_all(dir);
     std::cout << "launcher self update tests passed\n";
 }

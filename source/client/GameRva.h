@@ -17,7 +17,8 @@ inline constexpr size_t kMaxNames = 4;
 struct Exe
 {
     uint32_t timestamp;   // the exe's PE timestamp and SizeOfImage: which game build a row is for
-    uint32_t imageSize;
+    uint32_t imageSize;         // as Microsoft ships it (the standalone DLL runs in this one)
+    uint32_t imageSizeEdited;   // after LeviLamina's PeEditor added its .nimp section (same code, same RVAs)
 };
 
 struct Row
@@ -31,14 +32,14 @@ struct Row
 };
 
 #define MYCLIENT_RVA_NAMES(...) __VA_ARGS__
-#define MYCLIENT_RVA_EXE(index, timestamp, size)
+#define MYCLIENT_RVA_EXE(index, timestamp, size, edited)
 #define MYCLIENT_RVA_ROW(exe, label, names, rva, code, mask) {exe, label, {MYCLIENT_RVA_NAMES names}, rva, code, mask},
 inline constexpr Row kRows[] = {
 #include "GameRvaTable.inc"
 };
 #undef MYCLIENT_RVA_EXE
 #undef MYCLIENT_RVA_ROW
-#define MYCLIENT_RVA_EXE(index, timestamp, size) {timestamp, size},
+#define MYCLIENT_RVA_EXE(index, timestamp, size, edited) {timestamp, size, edited},
 #define MYCLIENT_RVA_ROW(exe, label, names, rva, code, mask)
 inline constexpr Exe kExes[] = {
 #include "GameRvaTable.inc"
@@ -53,7 +54,8 @@ inline constexpr size_t kExeCount = sizeof(kExes) / sizeof(kExes[0]);
 inline int FindExe(uint32_t timestamp, uint32_t imageSize)
 {
     for (size_t i = 0; i < kExeCount; ++i)
-        if (kExes[i].timestamp == timestamp && kExes[i].imageSize == imageSize) return static_cast<int>(i);
+        if (kExes[i].timestamp == timestamp && (kExes[i].imageSize == imageSize || kExes[i].imageSizeEdited == imageSize))
+            return static_cast<int>(i);
     return -1;
 }
 

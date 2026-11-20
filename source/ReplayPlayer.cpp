@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include "ReplayCameraChannel.h"   // after winsock2.h (it brings windows.h)
 
 namespace ReplayPlayer {
 namespace {
@@ -25,7 +26,9 @@ bool haveClient = false;
 uint64_t startedAt = 0;
 Status last;                           // kept after the playback ends (the error stays readable)
 
-uint64_t Now() { return GetTickCount64(); }
+// Milliseconds of the fine clock (ReplayCameraChannel.h): GetTickCount64's 15.6 ms steps made the playback clock,
+// and the camera path that follows it, move in jumps.
+uint64_t Now() { return MyClientReplayCameraChannel::NowMicros() / 1000; }
 
 Phase PhaseOf(State s)
 {
@@ -87,6 +90,7 @@ void Run()
         }
         last.phase = PhaseOf(session->GetState());
         last.positionMs = session->PositionMs();
+        last.positionAtMicros = MyClientReplayCameraChannel::NowMicros();
         last.paused = session->Paused();
         last.speed = session->Speed();
         last.packsRequested = session->PacksRequested();
@@ -221,6 +225,13 @@ void SetFreeCamera(bool on)
 {
     std::lock_guard guard(mutex);
     if (session) session->SwitchCamera(on, Now());
+}
+
+// Video export: one frame of the paused clock (ReplayServer.h Session::Step).
+void Step(double ms)
+{
+    std::lock_guard guard(mutex);
+    if (session) session->Step(ms);
 }
 
 void SetSpeed(float speed)

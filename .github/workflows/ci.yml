@@ -1,0 +1,85 @@
+# プルリクエストごとのビルドとテスト（公開はしない）。Codex・Claude Code は、この結果で「ビルド 0 エラー・テスト通過」を確かめる。
+# DLL（対応する全版 × LeviLamina 版/単独版）、HUD、ランチャー、Worker、Python の道具、サイト、シグネチャ表。
+name: ci
+on:
+  pull_request:
+    paths-ignore: ["docs/**", "**/*.md", "release/**"]
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+# build-dll / build-launcher ask for these; with publish false they upload nothing.
+permissions:
+  contents: write
+  id-token: write
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: source
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Signature table (tools/sigs.json)
+        run: python tools/make_sigs.py
+      - name: Python tools
+        run: python -m unittest discover -s tests -p "test_*.py"
+      - name: Site
+        run: python tools/check_site.py site
+      - name: Signature self check (C++)
+        run: g++ -std=c++20 -I. tests/game_sigs.cpp -o "$RUNNER_TEMP/game_sigs" && "$RUNNER_TEMP/game_sigs"
+      - name: Closet layout (C++)
+        run: g++ -std=c++17 -Wall -Wextra -I. tests/closet_layout.cpp -o "$RUNNER_TEMP/closet_layout" && "$RUNNER_TEMP/closet_layout"
+      - name: Home branding isolation (C++)
+        run: g++ -std=c++17 -Wall -Wextra -I. tests/home_brand_pack.cpp -o "$RUNNER_TEMP/home_brand_pack" && "$RUNNER_TEMP/home_brand_pack"
+      - name: Test22 policies (C++)
+        run: |
+          for t in texture_reload_policy cape_echo home_replay_input batch_chat combo_counter combo_packets; do
+            g++ -std=c++17 -Wall -Wextra -I. "tests/$t.cpp" -o "$RUNNER_TEMP/$t" && "$RUNNER_TEMP/$t" || exit 1
+          done
+      - name: Launcher version-switch cache (C++)
+        run: g++ -std=c++17 -Wall -Wextra -Werror -I. tests/launcher_package_cache.cpp -o "$RUNNER_TEMP/launcher_package_cache" && "$RUNNER_TEMP/launcher_package_cache"
+      - name: Replay tests (C++)
+        run: |
+          for t in replay replay_server replay_camera replay_camera_channel replay_export replay_video_channel; do
+            g++ -std=c++17 -I. "tests/$t.cpp" -o "$RUNNER_TEMP/$t" && "$RUNNER_TEMP/$t"
+          done
+      - name: Map tests (C++)
+        run: |
+          for t in map_data map_channel map_store map_view game_data_mirror origin_marks cape_channel cape_client cape_apply; do
+            g++ -std=c++17 -Wall -Wextra -I. "tests/$t.cpp" -o "$RUNNER_TEMP/$t" && "$RUNNER_TEMP/$t" || exit 1
+          done
+      - name: Config sharing (C++)
+        run: g++ -std=c++17 -Wall -Wextra -Werror -I. tests/config_share.cpp -o "$RUNNER_TEMP/config_share" && "$RUNNER_TEMP/config_share"
+      - name: Worker
+        working-directory: source/worker
+        run: npm ci && npm test && npm run check
+  games:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.games.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: games
+        run: echo "matrix=$(python3 -c 'import json,sys; sys.path.insert(0,"source/tools"); import release_request as r; print(json.dumps(r.build_variants()))')" >> "$GITHUB_OUTPUT"
+  dll:
+    needs: games
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.games.outputs.matrix) }}
+    uses: ./.github/workflows/build-dll.yml
+    with:
+      publish: false
+      game: ${{ matrix.game }}
+      standalone: ${{ matrix.standalone }}
+  hud:
+    uses: ./.github/workflows/build-hud.yml
+  launcher:
+    uses: ./.github/workflows/build-launcher.yml

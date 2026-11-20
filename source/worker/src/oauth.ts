@@ -118,7 +118,8 @@ export async function handleCallback(request: Request, env: Env, now: number): P
     if (!member || !member.roles.includes(env.MEMBER_ROLE_ID)) {
       return redirect(`${env.SITE_URL}${pending.lang === "en" ? "/en" : ""}/download/?need=verify`, clear);
     }
-    return redirect(await signedFileUrl(env, LAUNCHER_KEY, 300, now), clear);
+    // lang=en is not checked; Windows keeps the link on the downloaded file, and the launcher's first start reads it to pick English.
+    return redirect(`${await signedFileUrl(env, LAUNCHER_KEY, 300, now)}${pending.lang === "en" ? "&lang=en" : ""}`, clear);
   } catch (e) {
     if (e instanceof DiscordError && e.status === 400) {
       console.error("login callback: Discord refused the login", e.message);

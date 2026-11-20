@@ -73,6 +73,14 @@ int main()
 
     assert(MissingHook::hook() == -1);
     assert(MyClientHook::Installed() == 4);
+    // The call counts for the FPS diagnostics: every hook that is put in counts the calls reaching its origin().
+    {
+        const std::string report = MyClientHook::CallReport(1.0);
+        assert(report.find("AddHook=") != std::string::npos);
+        assert(report.find("ThriceHook=") != std::string::npos);
+        assert(MyClientHook::CallReport(1.0).find("AddHook=0/s") != std::string::npos);   // counted again from zero
+        assert(!MyClientHook::Disabled("NoSuchHook"));
+    }
     std::printf("own_hook ok (last refusal: %s)\n", MyClientHook::LastError());
     return 0;
 }

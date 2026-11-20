@@ -16,8 +16,12 @@ enum Site : int { Frame, Fov, Light, Outline, TessColor, ActorRender, NameTag, N
 inline constexpr const char* kNames[Count] = {"frame", "fov", "light", "outline", "tessColor", "actorRender",
                                               "nameTag", "nick", "hit", "replay", "tick", "screen", "chat",
                                               "gameFrame", "uiUpdate", "uiRender", "hudTick", "itemUpdate", "itemRender"};
-struct Counter { std::atomic<uint64_t> calls{0}, ticks{0}, peak{0}; };
+struct Counter { std::atomic<uint64_t> calls{0}, ticks{0}, peak{0}, frameTicks{0}, frameCalls{0}; };
 inline Counter counters[Count];
+// r57-test39 (stutter only with OriginX): a game frame over SpikeMs is logged with what each site cost inside it.
+inline constexpr double SpikeMs = 50.0;
+inline std::atomic<uint64_t> lastFrameEnd{0};
+void LogSpike(const std::string& line);   // MyClientData.cpp (log + rate limit)
 
 inline uint64_t Now() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return static_cast<uint64_t>(t.QuadPart); }
 
@@ -25,8 +29,11 @@ struct Scope {
     Site site; uint64_t start;
     explicit Scope(Site s) : site(s), start(Now()) {}
     ~Scope() {
-        counters[site].ticks.fetch_add(Now() - start, std::memory_order_relaxed);
+        const auto t = Now() - start;
+        counters[site].ticks.fetch_add(t, std::memory_order_relaxed);
         counters[site].calls.fetch_add(1, std::memory_order_relaxed);
+        counters[site].frameTicks.fetch_add(t, std::memory_order_relaxed);
+        counters[site].frameCalls.fetch_add(1, std::memory_order_relaxed);
     }
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;
@@ -40,9 +47,33 @@ struct GameScope {
     explicit GameScope(Site s) : site(s) { if (Depth(s)++ == 0) start = Now(); }
     ~GameScope() {
         if (--Depth(site) != 0) return;
-        const auto elapsed = Now() - start;
+        const auto end = Now();
+        const auto elapsed = end - start;
         counters[site].ticks.fetch_add(elapsed, std::memory_order_relaxed);
+        if (site != GameFrame) {
+            counters[site].frameTicks.fetch_add(elapsed, std::memory_order_relaxed);
+            counters[site].frameCalls.fetch_add(1, std::memory_order_relaxed);
+        }
         if (site == GameFrame) {
+            LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+            const double toMs = 1000.0 / static_cast<double>(f.QuadPart);
+            const uint64_t prevEnd = lastFrameEnd.exchange(end, std::memory_order_relaxed);
+            const double frameMs = elapsed * toMs, gapMs = prevEnd ? (start - prevEnd) * toMs : 0.0;
+            if (frameMs > SpikeMs || gapMs > SpikeMs) {
+                char part[96];
+                std::snprintf(part, sizeof part, "Stutter: game frame %.1f ms, time outside the frame %.1f ms;", frameMs, gapMs);
+                std::string line = part;
+                for (int i = 0; i < Count; i++) {
+                    if (i == GameFrame) continue;
+                    const uint64_t t = counters[i].frameTicks.load(std::memory_order_relaxed);
+                    if (t * toMs < 0.5) continue;
+                    std::snprintf(part, sizeof part, " %s=%.1f ms/%llu", kNames[i], t * toMs,
+                                  static_cast<unsigned long long>(counters[i].frameCalls.load(std::memory_order_relaxed)));
+                    line += part;
+                }
+                LogSpike(line);
+            }
+            for (int i = 0; i < Count; i++) { counters[i].frameTicks.store(0, std::memory_order_relaxed); counters[i].frameCalls.store(0, std::memory_order_relaxed); }
             auto peak = counters[site].peak.load(std::memory_order_relaxed);
             while (peak < elapsed && !counters[site].peak.compare_exchange_weak(peak, elapsed, std::memory_order_relaxed)) {}
         }

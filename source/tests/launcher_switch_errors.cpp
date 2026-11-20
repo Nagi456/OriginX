@@ -28,6 +28,12 @@ int main()
     assert(InstallErrorHint("no code here").empty());
     // Japanese Windows message around the code
     assert(InstallErrorHint("展開は HRESULT: 0x80073CFB で失敗しました").find("0x80073CFB") != std::string::npos);
+    // 2026-11-11, the user's PC: Minecraft registered from an unpacked folder (another launcher) cannot be replaced.
+    const std::string unpackaged = "[407] 現在のユーザーが、このアプリのパッケージ化されていないバージョンを既にインストールしています。\n"
+                                   "[401] エラー 0x80073CFB が発生したため、展開 Add 操作に失敗しました。";
+    assert(InstallErrorHint(unpackaged).find("Xbox アプリ") != std::string::npos);
+    assert(InstallErrorHint("0x80073CFB The current user has already installed an unpackaged version of this app.").find("Xbox アプリ") != std::string::npos);
+    assert(InstallErrorHint("HRESULT: 0x80073CFB").find("Xbox アプリ") == std::string::npos);
 
     std::cout << "launcher switch errors: ok\n";
     return 0;

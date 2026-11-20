@@ -17,12 +17,17 @@
 #include "fmt/std.h"
 
 namespace MyClientLog {
-enum class Level { Info, Warn, Error };
+// Debug lines (raw text from the game, such as scoreboard names) are written only while
+// %LOCALAPPDATA%\MyClient\log-debug.txt exists (checked when the log opens); Info and above always are.
+// Every line has the user's folders replaced by %USERPROFILE% / %LOCALAPPDATA% / %APPDATA% (../LogPrivacy.h).
+enum class Level { Debug, Info, Warn, Error };
 void Write(Level level, std::string_view text);   // thread-safe; never throws
 const wchar_t* FilePath();                         // the own file, "" until the first line
 
 struct Logger
 {
+    template <class... Args>
+    void debug(fmt::format_string<Args...> format, Args&&... args) { Emit(Level::Debug, format, std::forward<Args>(args)...); }
     template <class... Args>
     void info(fmt::format_string<Args...> format, Args&&... args) { Emit(Level::Info, format, std::forward<Args>(args)...); }
     template <class... Args>

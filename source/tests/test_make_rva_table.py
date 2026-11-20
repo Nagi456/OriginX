@@ -59,7 +59,7 @@ class MakeRvaTableTest(unittest.TestCase):
             ["C", "?c", "0x1100", "sure", "1", "0", "how", ""],            # not a known label
             ["A", "?a", "0x1100", "unsure", "1", "0", "how", ""],          # unsure
         ])
-        self.assertIn("MYCLIENT_RVA_EXE(0, 0x6AD79EE4u, 0x5000u)", text)
+        self.assertIn("MYCLIENT_RVA_EXE(0, 0x6AD79EE4u, 0x5000u, 0x5000u)", text)
         self.assertEqual(sum(l.startswith("MYCLIENT_RVA_ROW(") for l in text.splitlines()), 2)
         row_a = next(l for l in text.splitlines() if l.startswith('MYCLIENT_RVA_ROW(0, "A"'))
         self.assertIn('0x1000u, "\\x40\\x41', row_a)

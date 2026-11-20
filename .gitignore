@@ -2,3 +2,6 @@ source/build/
 graphify-out/
 __pycache__/
 source/worker/node_modules/
+source/launcher/*.key
+*.key
+signing/

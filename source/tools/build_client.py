@@ -11,11 +11,20 @@ from make_sigs import main as make_sigs
 from prepare_client_sdk import DEFAULT_GAME, REPO, default_sdk_root, load_lock, prepare
 
 
+def validate_build_mode(lock, standalone):
+    if lock.get("layoutsFrom") and not standalone:
+        raise ValueError("Borrowed SDK layouts require --standalone; there is no matching LeviLamina runtime for this game")
+
+
 def build(args):
     lock = load_lock(args.game)
+    standalone = getattr(args, "standalone", False)
+    try:
+        validate_build_mode(lock, standalone)
+    except ValueError as error:
+        raise SystemExit(str(error)) from None
     sdk = (args.sdk_root or default_sdk_root(args.game)).resolve()
     prepare(sdk, args.game)
-    standalone = getattr(args, "standalone", False)
     output = REPO / (("build/client" if args.game == DEFAULT_GAME else "build/client-" + args.game) +
                      ("-standalone" if standalone else ""))
     output.mkdir(parents=True, exist_ok=True)
@@ -61,7 +70,7 @@ def build(args):
     # sigs: tools/sigs.json -> client/GameRvaTable.inc + client/GameSigs.inc (stops the build when sigs.json is wrong)
     if make_sigs([]) != 0:
         raise SystemExit("tools/sigs.json has problems (see above); fix it before building")
-    sources = ["client/SignatureDump.cpp", "client/MyClientData.cpp", "client/FeatureAdapter.cpp", "client/PartyAdapter.cpp", "client/Compositor.cpp", "client/FrameGen.cpp", "client/MemoryOperators.cpp", "client/GameImageDump.cpp", "client/GameRva.cpp", "client/GameSigs.cpp", "client/OwnHook.cpp", "client/Log.cpp", "client/LeviLaminaParts.cpp", "MyClientBridge.cpp",
+    sources = ["client/SignatureDump.cpp", "client/MyClientData.cpp", "client/FeatureAdapter.cpp", "client/PartyAdapter.cpp", "client/Compositor.cpp", "client/FrameGen.cpp", "client/MemoryOperators.cpp", "client/GameImageDump.cpp", "client/GameRva.cpp", "client/GameSigs.cpp", "client/HangWatch.cpp", "client/VideoExport.cpp", "client/OwnHook.cpp", "client/Log.cpp", "client/LeviLaminaParts.cpp", "MyClientBridge.cpp",
                # MinHook (client/OwnHook.h), C
                "client/vendor/minhook/src/buffer.c", "client/vendor/minhook/src/hook.c",
                "client/vendor/minhook/src/trampoline.c", "client/vendor/minhook/src/hde/hde64.c"]

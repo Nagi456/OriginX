@@ -3,6 +3,7 @@
 // (Hitbox, Block Outline). See Compositor.cpp.
 #include <cstdint>
 #include <string>
+#include <vector>
 #include "TabListChannel.h"
 
 namespace MyClientCompositor {
@@ -37,4 +38,14 @@ bool GpuInfo(Gpu& out);
 // At a pack-switch boundary only: finish commands submitted before resources are replaced.
 // Bounded wait; failure means the caller must leave the live resources untouched.
 bool DrainGameGpu();
+unsigned DisplayHz();   // the display's refresh rate seen when the swap chain was bound (0 = unknown)
+// Replay editor (2026-11-12): the game picture shrunk into the box x, y, w, h (0..1 of the picture), under the HUD.
+void SetPreview(bool on, float x, float y, float w, float h);
+// Replay video export: the back buffer of the frame `waitFrames` presents from now, before OriginX draws on it.
+void RequestCapture(uint32_t waitFrames);
+// Forgets a capture asked for or taken (a new, cancelled or failed export).
+void ResetCapture();
+enum class CaptureResult { None, Ready, Failed };
+// The capture once taken: BGRA, width x height, tightly packed; or why it failed.
+CaptureResult TakeCapture(std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height, std::string& error);
 }

@@ -13,7 +13,9 @@ The source of truth is tools/sigs.json (edited by hand / by an agent, see docs/v
 tools/build_client.py runs the generation before compiling, so an edit of sigs.json is all a version update needs.
 
 sigs.json:
-  "supported": [{"version": "1.26.51.1", "timestamp": "0x6AA482FD", "imageSize": "0x12C0C000"}, ...]
+  "supported": [{"version": "1.26.51.1", "timestamp": "0x6AA482FD", "imageSize": "0x12C01000", "imageSizeEdited": "0x12C0C000"}, ...]
+  imageSize = SizeOfImage of the exe as Microsoft ships it (the standalone DLL runs in it); imageSizeEdited = the same exe
+  after LeviLamina's PeEditor added its .nimp section (the LeviLamina DLL runs in that). The code is the same in both.
   "signatures": [{"name", "purpose", "breaks", "fatal", "lastUpdated", "symbols": [...],
                   "builds": {"1.26.51.1": {"rva": "0x...", "pattern": "48 89 5C 24 ?? ...", "unique": true,
                                            "check": "16 bytes GameRva compares (optional)", "note": "..."}, ...}}]
@@ -67,7 +69,7 @@ def validate(doc):
         v = b.get("version", "")
         if not VERSION.fullmatch(v):
             problems.append(f"supported: bad version {v!r} (write all four parts, e.g. 1.26.60.5)")
-        for key in ("timestamp", "imageSize"):
+        for key in ("timestamp", "imageSize", "imageSizeEdited"):
             if not re.fullmatch(r"0x[0-9A-Fa-f]{1,8}", str(b.get(key, ""))):
                 problems.append(f"supported {v}: {key} must be a hex number like 0x6AD79EE4")
         versions.append(v)
@@ -138,16 +140,17 @@ def cbytes(values):
 def generate(doc):
     versions = [b["version"] for b in doc["supported"]]
     rva = ["// Made by tools/make_sigs.py from tools/sigs.json. Do not edit: edit sigs.json and build.",
-           "// MYCLIENT_RVA_EXE(exe, timestamp, image size); MYCLIENT_RVA_ROW(exe, label, (names...), RVA, first bytes, mask)",
+           "// MYCLIENT_RVA_EXE(exe, timestamp, image size as shipped, image size with LeviLamina's .nimp); MYCLIENT_RVA_ROW(exe, label, (names...), RVA, first bytes, mask)",
            "// mask 0 = not compared (a byte the pattern leaves open: a relative target or a RIP displacement)"]
     sig = ["// Made by tools/make_sigs.py from tools/sigs.json. Do not edit: edit sigs.json and build.",
-           "// MYCLIENT_SIG_BUILD(index, version, timestamp, image size)",
+           "// MYCLIENT_SIG_BUILD(index, version, timestamp, image size as shipped, image size with LeviLamina's .nimp)",
            "// MYCLIENT_SIG(index, name, fatal, purpose, breaks, last updated)",
            "// MYCLIENT_SIG_AT(signature index, build index, rva, pattern)",
            "// MYCLIENT_SIG_OFFSET(name, build index, value)"]
     for i, b in enumerate(doc["supported"]):
-        rva.append(f"MYCLIENT_RVA_EXE({i}, {b['timestamp'].upper().replace('0X', '0x')}u, {b['imageSize'].upper().replace('0X', '0x')}u)")
-        sig.append(f"MYCLIENT_SIG_BUILD({i}, {cstr(b['version'])}, {b['timestamp']}u, {b['imageSize']}u)")
+        rva.append(f"MYCLIENT_RVA_EXE({i}, {b['timestamp'].upper().replace('0X', '0x')}u, {b['imageSize'].upper().replace('0X', '0x')}u, "
+                   f"{b['imageSizeEdited'].upper().replace('0X', '0x')}u)")
+        sig.append(f"MYCLIENT_SIG_BUILD({i}, {cstr(b['version'])}, {b['timestamp']}u, {b['imageSize']}u, {b['imageSizeEdited']}u)")
     for i, b in enumerate(doc["supported"]):
         for s in doc["signatures"]:
             at = s["builds"].get(b["version"])
@@ -300,6 +303,15 @@ def main(argv=None):
         import struct
         pe = struct.unpack_from("<I", img.data, 0x3C)[0]
         stamp, size = struct.unpack_from("<I", img.data, pe + 8)[0], struct.unpack_from("<I", img.data, pe + 24 + 56)[0]
+        # LeviLamina's PeEditor appends a ".nimp" section: the size as shipped ends where it starts. Both are recorded.
+        sections, optional = struct.unpack_from("<H", img.data, pe + 6)[0], struct.unpack_from("<H", img.data, pe + 20)[0]
+        last = pe + 24 + optional + (sections - 1) * 40
+        shipped, edited = size, size
+        if img.data[last:last + 5] == b".nimp":
+            shipped = struct.unpack_from("<I", img.data, last + 12)[0]
+        else:
+            print("this exe has no .nimp section (not edited for LeviLamina); imageSizeEdited is set to the same size: "
+                  "check it against a LeviLamina run's startup.log before a LeviLamina release", file=sys.stderr)
         if any(b["version"] == version for b in doc["supported"]):
             print(f"{version} is already supported", file=sys.stderr)
             return 1
@@ -307,7 +319,8 @@ def main(argv=None):
         if fatal_missing:
             print("these fatal signatures have no entry for " + version + " yet: " + ", ".join(fatal_missing), file=sys.stderr)
             return 1
-        doc["supported"].append({"version": version, "timestamp": f"0x{stamp:08X}", "imageSize": f"0x{size:X}"})
+        doc["supported"].append({"version": version, "timestamp": f"0x{stamp:08X}", "imageSize": f"0x{shipped:X}",
+                                 "imageSizeEdited": f"0x{edited:X}"})
         problems = validate(doc)
         if problems:
             print("not added:\n  " + "\n  ".join(problems), file=sys.stderr)

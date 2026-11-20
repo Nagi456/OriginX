@@ -8,12 +8,14 @@ if [[ "$("$compiler" -dumpmachine)" != x86_64-w64-mingw32* ]]; then
 fi
 mkdir -p build
 x86_64-w64-mingw32-windres -O coff -o build/myclient_res.o myclient.rc
+# The Closet's capes (HUD only, as in .github/workflows/build-hud.yml): without them no cape can be chosen.
+x86_64-w64-mingw32-windres -O coff -o build/capes_res.o assets/capes/capes.rc
 flags=(-std=c++17 -O2 -Wall -Wextra -Wno-unknown-pragmas -DNOMINMAX -D_WIN32_WINNT=0x0601 -static -static-libgcc -static-libstdc++)
 "$compiler" "${flags[@]}" -DMYCLIENT_BRIDGE_BUILD -shared MyClientBridge.cpp \
     -o build/MyClientBridge.dll -Wl,--exclude-all-symbols \
     -Wl,--out-implib,build/libMyClientBridge.dll.a
 "$compiler" "${flags[@]}" MyClient.cpp MinecraftDataProvider.cpp PingMonitor.cpp ReplayPlayer.cpp \
-    build/myclient_res.o -o build/MyClient.exe -mwindows -luser32 -lgdi32 -lshell32 -lws2_32 -lwinhttp -lwinmm -lole32 -luuid -lwindowscodecs -lmsimg32
+    build/myclient_res.o build/capes_res.o -o build/MyClient.exe -mwindows -luser32 -lgdi32 -lshell32 -lws2_32 -lwinhttp -lwinmm -lole32 -luuid -lwindowscodecs -lmsimg32
 "$compiler" "${flags[@]}" -Ilauncher/vendor -I. launcher/MyClientLauncher.cpp launcher/vendor/tinyxml2/tinyxml2.cpp build/myclient_res.o \
     -o build/MyClientLauncher.exe -municode -mwindows -luser32 -lgdi32 -lcomdlg32 -lshell32 -lole32 -luuid -lbcrypt -lversion -lwinhttp -lws2_32 -lwindowscodecs -lmsimg32
 "$compiler" "${flags[@]}" -I. tests/bridge_smoke.cpp MinecraftDataProvider.cpp \

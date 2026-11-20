@@ -1,0 +1,8 @@
+{
+  "channel": "test",
+  "revision": 57,
+  "testNumber": 7,
+  "games": ["26.51.1", "26.60.5"],
+  "standalone": true,
+  "note": "r57-test7: r57-test6 + Frame Generation pauses by itself during a replay video export (published from the session: GitHub Actions is stopped)"
+}

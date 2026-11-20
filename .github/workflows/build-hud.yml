@@ -34,3 +34,4 @@ jobs:
         with:
           name: MyClient-hud
           path: source/build/MyClient.exe
+          overwrite: true   # build-release.yml builds it once per game in the same run

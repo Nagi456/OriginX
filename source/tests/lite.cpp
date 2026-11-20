@@ -8,6 +8,47 @@ int main()
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / "lite_test";
     fs::remove_all(dir);
+    // Failed pack writes must retry even if the detected loader mode stays unchanged.
+    {
+        LitePack::HomeBrandRetry retry;
+        assert(retry.Due(true, 0));
+        retry.Finished(true, false, 0);
+        assert(!retry.Due(true, 1999) && retry.Due(true, 2000));
+        retry.Finished(true, true, 2000);
+        assert(!retry.Due(true, 60000));
+        assert(retry.Due(false, 2001)); // loader appeared: remove the prefix immediately
+        retry.Finished(false, false, 2001);
+        assert(!retry.Due(false, 4000) && retry.Due(false, 4001));
+        assert(retry.Due(true, 2002)); // mode changed again after a partially failed write
+        retry.Finished(false, true, 4001);
+        assert(!retry.Due(false, 60000));
+    }
+    // Branding needs the native label even with all optimization switches off.
+    {
+        auto brand = LitePack::NothingOn();
+        const int offVersion = LitePack::ContentVersion(brand);
+        brand.homeBrand = true;
+        assert(LitePack::ContentVersion(brand) != offVersion);
+        assert(LitePack::Write(dir, brand));
+        assert(!fs::exists(dir / "ui/start_screen.json"));
+        assert(!fs::exists(dir / "textures/environment/clouds.png"));
+        const auto start = TexturePacks::ReadFile(dir / "ui/start_screen.json");
+        assert(start.empty()); // shared Lite can never emit branding, even from a stale option
+        // A LeviLamina/unknown session must remove stale branding, while retaining other Lite settings.
+        brand.homeBrand = false;
+        brand.fastUi = true;
+        assert(LitePack::Write(dir, brand));
+        assert(!fs::exists(dir / "ui/start_screen.json") && fs::exists(dir / "ui/_global_variables.json"));
+        assert(LitePack::Write(dir, LitePack::NothingOn()));
+        assert(!fs::exists(dir / "ui/start_screen.json"));
+        // A real filesystem removal error must keep loader-mode cleanup pending.
+        const auto blocked = dir / "ui/start_screen.json";
+        fs::create_directories(blocked);
+        assert(LitePack::WriteFile(blocked / "busy", "busy"));
+        assert(!LitePack::Write(dir, LitePack::NothingOn()));
+        fs::remove_all(blocked);
+        assert(LitePack::Write(dir, LitePack::NothingOn()));
+    }
     LitePack::Options o;
     assert(LitePack::Write(dir, o));
     assert(fs::exists(dir / "manifest.json") && fs::exists(dir / "textures/environment/clouds.png"));

@@ -1,6 +1,8 @@
 # 検証済みのテスト版（test/）を先行版（early/）へ移します。作り直さず、R2 の中で同じファイルをそのままコピーします。
 # 使い方: Actionsタブ →「promote-build」→「Run workflow」→ tag に移したい版の名前（例: myclient-26.51.1-r54-test1）。
-# Worker が test/<tag>/entry.json の各ファイルの SHA256 を確かめ、全部一致したらコピーし、early/catalog.json を最後に書きます。
+# Worker が test/<tag>/entry.json の各ファイルの SHA256 を確かめ、全部一致したらコピーします。early/catalog.json は署名が要るので
+# Worker もこのワークフローも書きません（2026-11-20 の署名の設計 §6-2）。新しい一覧は Artifacts の catalog.json で、作者が PC で
+# 署名して上げます（docs/signing.md）。手元で `publish_r2.py promote <tag> <dir>` を使っても同じです。
 # 以前の tag で実行し直すと、先行版がその版に戻ります。認証は GitHub Actions の OIDC（このワークフロー名 promote-* だけが許可されます）。
 name: promote-build
 on:
@@ -15,6 +17,9 @@ permissions:
 jobs:
   promote:
     runs-on: ubuntu-24.04
+    concurrency:
+      group: originx-publish
+      cancel-in-progress: false
     defaults:
       run:
         working-directory: source
@@ -26,4 +31,8 @@ jobs:
         with:
           python-version: "3.12"
       - name: Promote the test build to early/
-        run: python tools/publish_r2.py promote "$TAG"
+        run: python tools/publish_r2.py promote "$TAG" "$RUNNER_TEMP/early"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: early-catalog-unsigned
+          path: ${{ runner.temp }}/early/catalog.json

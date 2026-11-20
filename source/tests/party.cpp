@@ -14,6 +14,10 @@ int main() {
     assert(HiveHost("GEO.HIVEBEDROCK.NETWORK.")); assert(HiveHost("as.hivebedrock.network"));
     assert(!HiveHost("geo.hivebedrock.network.evil.com")); assert(!HiveHost("evilhivebedrock.network"));
     assert(!HiveHost("evil.hivebedrock.network")); assert(!HiveHost("127.0.0.1"));
+    assert(HiveHost("https://nethernet.playhive.com:19132")); assert(HostName("https://NetherNet.PlayHive.com:19132/x") == "nethernet.playhive.com");
+    assert(!HiveHost("https://nethernet.playhive.com.evil.com:19132")); assert(!HiveHost("evil.playhive.com"));
+    assert(HiveDomain("https://nethernet.playhive.com:19132")); assert(HiveDomain("geo.hivebedrock.network"));
+    assert(!HiveDomain("evilplayhive.com")); assert(!HiveDomain("127.0.0.1")); assert(HostName("1.2.3.4:19132") == "1.2.3.4");
     assert(Invite("Test Playerからパーティへの招待が来ています",0,false,false) == "Test Player");
     assert(Invite("§aAlex§r has invited you to their party!",6,false,false) == "Alex");
     // The real English wording (screenshot): name, then "wants you to join their party!"

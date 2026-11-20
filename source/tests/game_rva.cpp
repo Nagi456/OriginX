@@ -11,14 +11,18 @@ int main()
     const int v51 = FindExe(0x6AA482FDu, 0x12C0C000u), v60 = FindExe(0x6AD79EE4u, 0x13846000u);
     assert(v51 >= 0 && v60 >= 0 && v51 != v60);
     assert(FindExe(0x6AA482FDu, 0x1000u) == -1);   // same timestamp, other size: not that build
-    // Preliminary matching reports for these versions must not silently activate unverified SDK layouts.
-    assert(FindExe(0x6A8378BAu, 0x12888000u) == -1);
+    // the exe as shipped (the standalone DLL) and with LeviLamina's .nimp section are the same build
+    assert(FindExe(0x6AA482FDu, 0x12C01000u) == v51 && FindExe(0x6AD79EE4u, 0x1383B000u) == v60);
+    const int v45 = FindExe(0x6A8378BAu, 0x12888000u);
+    assert(v45 >= 0 && FindExe(0x6A8378BAu, 0x12889000u) == -1);
+    // 26.62 still has only preliminary matching, and remains unavailable.
     assert(FindExe(0x6AEA437Eu, 0x1383D000u) == -1);
     size_t rows51 = 0, rows60 = 0;
     for (size_t i = 0; i < kRowCount; ++i)
     {
         const Row& row = kRows[i];
-        (row.exe == v51 ? rows51 : rows60)++;
+        if (row.exe == v51) ++rows51;
+        if (row.exe == v60) ++rows60;
         assert(row.names[0]);
         for (const char* name : row.names)
             if (name) assert(FindRow(kRows, kRowCount, row.exe, name) == static_cast<int>(i));

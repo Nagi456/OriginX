@@ -5,14 +5,47 @@ using namespace MyClientSkin;
 
 int main()
 {
+    // Native account updates must not let the same choice flicker every frame.
+    ReapplyBudget reapply;
+    assert(reapply.CanTry(0));
+    reapply.Tried(0);
+    assert(!reapply.CanTry(0) && !reapply.CanTry(999));
+    assert(reapply.CanTry(1000));
+    for (uint64_t now = 1000; now <= 4000; now += 1000) {
+        assert(reapply.CanTry(now));
+        reapply.Tried(now);
+        assert(!reapply.CanTry(now + 50));
+    }
+    assert(!reapply.CanTry(60000)); // native notifications never reset the budget
+    reapply.Reset(); // a new world or a new user choice
+    assert(reapply.CanTry(100));
+    reapply.Tried(100);
+    assert(!reapply.CanTry(99)); // clock rollback cannot bypass the interval
+    for (unsigned cape = 0; cape <= 6; ++cape) {
+        const std::string selection = "MyClient_12345678_slim" + (cape ? "_c" + std::to_string(cape) : "");
+        assert(MatchesSelection(InstanceId(selection, 1957), selection));
+        assert(!MatchesSelection(InstanceId(selection, 1957), selection + "_c1"));
+    }
+    {
+        std::vector<uint8_t> classic(ClassicCapeBytes, 0), hd(CapeBytes, 0);
+        classic[(1 * ClassicCapeWidth + 2) * 4] = 200;   // pixel (2,1)
+        UpscaleClassicCape(classic.data(), hd.data());
+        const uint32_t f = CapeWidth / ClassicCapeWidth;
+        assert(hd[((1 * f) * CapeWidth + 2 * f) * 4] == 200 && hd[((1 * f + f - 1) * CapeWidth + 2 * f + f - 1) * 4] == 200);
+        assert(hd[((1 * f) * CapeWidth + 3 * f) * 4] == 0);
+    }
+
     // The independent cape request ABI must not reinterpret a skin-only reset or overwrite the
     // last confirmed cape while a new request is still pending.
     static Request appearance{};
     appearance.width = appearance.height = 64;
     appearance.capeId = 2;
     assert(UsableRequest(appearance));
-    appearance.capeId = 3;
+    appearance.capeId = 4;   // Creator (v3 capes: 1..4)
+    assert(UsableRequest(appearance));
+    appearance.capeId = 7;
     assert(!UsableRequest(appearance));
+    assert(KnownCape(6) && KnownCape(0) && !KnownCape(7));   // review C3: the chosen cape 3 / 4 is read back as it is
     assert(offsetof(Request, rgba) == 104); // legacy saved skin header remains readable
 #ifdef _WIN32
     {
@@ -88,6 +121,17 @@ int main()
     assert(!MatchesSelection("", "") && InstanceId(choice, UINT64_MAX).size() < 48);
 
     // Startup must let the real selected avatar finish first; a saved request is not proof of model readiness.
+    AvatarLifecycle accountAvatar;
+    accountAvatar.ObserveNative(true);
+    accountAvatar.Select(1, false);
+    const auto afterReload = accountAvatar.Select(2, false, true, true);
+    assert(afterReload.changed && afterReload.rebuild); // no Closet selection still needs cache invalidation
+    assert(!accountAvatar.nativeReady && !accountAvatar.overriding && accountAvatar.initialized);
+    assert(!accountAvatar.Select(2, false, true).rebuild); // once only, await real native readiness
+    accountAvatar.ObserveNative(false);
+    assert(!accountAvatar.nativeReady);
+    accountAvatar.ObserveNative(true);
+    assert(accountAvatar.nativeReady);
     AvatarLifecycle avatar;
     AvatarResources resources;
     assert(!resources.Changed(7)); // first observation must allow the initial native load

@@ -24,6 +24,12 @@ describe("GET /file", () => {
     expect(await res.text()).toBe("exe-bytes");
   });
 
+  it("still serves a good link with lang=en added (the launcher reads it, the link check ignores it)", async () => {
+    const { env, url } = await setup({ [KEY]: "exe-bytes" });
+    const res = await handleFile(new Request(`${url}&lang=en`), env, NOW);
+    expect(res.status).toBe(200);
+  });
+
   it("rejects an expired link", async () => {
     const { env, bucket, url } = await setup({ [KEY]: "exe-bytes" });
     const res = await handleFile(new Request(url), env, NOW + 301 * 1000);

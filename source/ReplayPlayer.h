@@ -16,6 +16,7 @@ struct Status {
     bool packsRequested = false;   // the game asked for resource packs the recording cannot give
     bool freeCamera = false;       // the viewer flies freely and sees the recorded player (ReplayServer.h FreeCam)
     bool rewinding = false;        // a jump back is under way (the game connects again)
+    uint64_t positionAtMicros = 0; // when positionMs was taken (ReplayCameraChannel::NowMicros): the camera path's clock
     std::wstring file, error;   // error: why the last playback ended early (empty = it did not)
 };
 
@@ -34,6 +35,8 @@ Status Get();
 bool Active();   // a playback is running (the HUD keeps the recorder off meanwhile)
 void SetPaused(bool paused);
 void SetSpeed(float speed);
+// Video export: while paused, moves the playback on by `ms` (the records then due are sent). Never backwards.
+void Step(double ms);
 // Jumps to a time of the recording (ms from where recording was started). Back in time, the game connects again.
 void SeekTo(uint64_t positionMs);
 void SetFreeCamera(bool on);   // on by default; while playing, the game connects again and goes on from the same time

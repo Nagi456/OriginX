@@ -23,6 +23,7 @@
 #include "FrameGenPacing.h"
 #include "FeatureData.h"
 #include "PresentPolicy.h"
+#include "ResizeWait.h"
 
 #include <windows.h>
 #include <psapi.h>
@@ -134,6 +135,26 @@ ComPtr<ID3D12Resource> texture;
 UINT textureWidth = 0, textureHeight = 0, uploadPitch = 0;
 D3D12_RESOURCE_STATES textureState = D3D12_RESOURCE_STATE_COPY_DEST;
 bool textureFilled = false;
+// ---- replay editor preview and video export (2026-11-12, ReplayVideoChannel.h) ----
+// Preview: the game's own picture of the frame, copied and drawn shrunk into the editor's box (no blending), under
+// the HUD. Capture: a later frame's back buffer, before anything of OriginX is drawn on it, read back for the encoder.
+std::mutex previewMutex;
+bool previewOn = false;
+float previewBox[4] = {};                               // x, y, w, h, 0..1 of the picture
+ComPtr<ID3D12Resource> previewTexture;                  // a copy of the back buffer (same size and format)
+D3D12_RESOURCE_STATES previewState = D3D12_RESOURCE_STATE_COPY_DEST;
+ComPtr<ID3D12PipelineState> previewPipeline;            // the same shaders, blending off
+UINT srvStep = 0;
+std::mutex captureMutex;
+int captureCountdown = -1;                              // presents to let pass; 0 = capture this one; -1 = none
+int captureState = 0;                                   // 0 none, 1 ready, 2 failed
+std::vector<uint32_t> capturePixels;
+UINT captureWidth = 0, captureHeight = 0;
+std::string captureError;
+ComPtr<ID3D12CommandAllocator> captureAllocator;
+ComPtr<ID3D12GraphicsCommandList> captureList;
+ComPtr<ID3D12Resource> readback;
+UINT64 readbackSize = 0;
 constexpr UINT kMaxVertices = 16384;   // 24 hitboxes x 96 segments x 6 + outline + picture fits
 std::vector<uint32_t> staging;
 std::vector<Vertex> vertices;
@@ -205,18 +226,116 @@ void ForgetProxies(IDXGISwapChain* swap) {
         if (proxies[i].swap == swap) { proxies.erase(proxies.begin() + static_cast<std::ptrdiff_t>(i)); return; }
 }
 
-void WaitFor(UINT64 value) {
-    if (!fence || !value) return;
-    if (fence->GetCompletedValue() < value && SUCCEEDED(fence->SetEventOnCompletion(value, fenceEvent)))
-        WaitForSingleObject(fenceEvent, 500);
+double NowMs();
+// r57-test42 (stutter): after a GPU wait over 30 ms, Frame Generation makes no extra frames for 1 s, so the GPU
+// catches up instead of getting more work while it is already behind.
+std::atomic<double> fgBackoffUntil{0};
+std::atomic<unsigned> displayHz{0};
+std::atomic<uint32_t> fgBackoffFrames{0};
+bool WaitForChecked(UINT64 value);
+// r57-test40 (stutter in play: "time outside the frame 505.7 ms", outside every game hook): the GPU waits below
+// time out at 500 ms. A wait that takes over 30 ms is logged (which wait, how far the GPU was, timed out or not).
+void NoteGpuWait(const char* site, double startMs, UINT64 wanted, UINT64 completed, DWORD result) {
+    const double took = NowMs() - startMs;
+    if (took < 30.0) return;
+    fgBackoffUntil.store(NowMs() + 1000.0);
+    static double loggedAt = 0;
+    if (loggedAt && NowMs() - loggedAt < 2000.0) return;
+    loggedAt = NowMs();
+    char text[220];
+    std::snprintf(text, sizeof text, "Stutter: GPU wait '%s' took %.1f ms (wanted %llu, GPU at %llu, %s)", site, took,
+                  static_cast<unsigned long long>(wanted), static_cast<unsigned long long>(completed),
+                  result == WAIT_TIMEOUT ? "timed out" : "finished");
+    Info(text);
 }
-void WaitForGpu() { WaitFor(fenceValue); }   // everything submitted so far (resize, new texture size)
+std::atomic<uint64_t> gpuTimeouts{0};
+// GPU waits that timed out (frame skipped, nothing reset or freed), added up since the game started
+// (author 2026-11-20). Called every 10 s by the timing summary; a line is written only when the count
+// went up, or once a minute with the running total.
+void ReportGpuTimeouts() {
+    static uint64_t total = 0;
+    static double lastLine = 0;
+    const uint64_t added = gpuTimeouts.exchange(0) + MyClientFrameGen::TakeGpuTimeouts();
+    total += added;
+    const double now = NowMs();
+    if (!added && now - lastLine < 60000) return;
+    lastLine = now;
+    Info("GPU timeouts: +" + std::to_string(added) + " in the last 10 s, " + std::to_string(total) + " since start");
+}
+bool WaitFor(UINT64 value) {
+    if (!value) return true;
+    if (!fence) return false;
+    if (fence->GetCompletedValue() < value && SUCCEEDED(fence->SetEventOnCompletion(value, fenceEvent))) {
+        const double start = NowMs();
+        const DWORD r = WaitForSingleObject(fenceEvent, 500);
+        NoteGpuWait("frame fence", start, value, fence->GetCompletedValue(), r);
+    }
+    const bool done = fence->GetCompletedValue() >= value;
+    if (!done) gpuTimeouts.fetch_add(1, std::memory_order_relaxed);
+    return done;
+}
+bool WaitForGpu() { return WaitFor(fenceValue); }   // everything submitted so far (resize, new texture size)
+// The same wait, saying whether the GPU really got there (the export must not read a copy still in flight).
+bool WaitForChecked(UINT64 value) {
+    return WaitFor(value);
+}
 
-void ReleaseTargets() {
-    WaitForGpu();
-    MyClientFrameGen::Release();   // its copies are sized for these back buffers
+// Only Resize uses unbounded retries. Keep a private device reference: the
+// presenter may still be using render state before we can take renderMutex.
+struct ResizeWait {
+    ComPtr<ID3D12Device> resizeDevice;
+    const char* operation;
+    const double started = NowMs();
+    bool removed = false;
+
+    ResizeWait(IDXGISwapChain* swap, const char* name) : operation(name) {
+        if (swap) swap->GetDevice(IID_PPV_ARGS(&resizeDevice));
+    }
+    bool Removed(const char* stage) {
+        if (removed) return true;
+        const HRESULT reason = resizeDevice ? resizeDevice->GetDeviceRemovedReason() : S_OK;
+        if (reason == S_OK) return false;
+        removed = true;
+        char text[256];
+        std::snprintf(text, sizeof text, "%s: waited %.3f s for %s; device removed (0x%08lx), continuing native resize",
+                      operation, (NowMs() - started) / 1000.0, stage, static_cast<unsigned long>(reason));
+        Warn(text);
+        return true;
+    }
+    template <class Wait>
+    bool UntilReady(const char* stage, DWORD intervalMs, Wait wait) {
+        return MyClientResizeWait::UntilReady([&] {
+            const double attemptStarted = NowMs();
+            const bool ready = wait();
+            // A missing event / SetEventOnCompletion failure can return at once.
+            // Keep that error path from spinning and flooding WARNs on a live device.
+            if (!ready && !Removed(stage)) {
+                const double remaining = intervalMs - (NowMs() - attemptStarted);
+                if (remaining > 0) Sleep(static_cast<DWORD>(std::ceil(remaining)));
+            }
+            return ready;
+        }, [&] { return Removed(stage); }, [&] {
+            char text[256];
+            std::snprintf(text, sizeof text, "%s: waited %.3f s for %s; retrying",
+                          operation, (NowMs() - started) / 1000.0, stage);
+            Warn(text);
+        });
+    }
+};
+
+bool WaitDirectIdle();
+bool ReleaseTargets(ResizeWait* resize = nullptr) {
+    const auto wait = [&](const char* stage, auto attempt) {
+        return resize ? resize->UntilReady(stage, 500, attempt) : attempt();
+    };
+    if (!wait("WaitDirectIdle", [] { return WaitDirectIdle(); }) ||
+        !wait("frame fence", [] { return WaitForGpu(); }) ||
+        !wait("FrameGen fence", [] { return MyClientFrameGen::Release(); })) return false;
+    // FG copies are sized for these back buffers.
+    previewTexture.Reset();        // sized for these back buffers too
     frames.clear();
     boundSwap = nullptr;
+    return true;
 }
 
 const char* kShader = R"(
@@ -233,9 +352,11 @@ bool CreateDeviceObjects() {
     HRESULT hr = device->CreateDescriptorHeap(&rtvDesc, IID_PPV_ARGS(&rtvHeap));
     if (FAILED(hr)) { Fail("CreateDescriptorHeap(RTV)", hr); return false; }
     rtvStep = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-    D3D12_DESCRIPTOR_HEAP_DESC srvDesc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    // slot 0: the HUD picture, slot 1: the replay editor's preview copy
+    D3D12_DESCRIPTOR_HEAP_DESC srvDesc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     hr = device->CreateDescriptorHeap(&srvDesc, IID_PPV_ARGS(&srvHeap));
     if (FAILED(hr)) { Fail("CreateDescriptorHeap(SRV)", hr); return false; }
+    srvStep = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
     if (FAILED(hr)) { Fail("CreateFence", hr); return false; }
     fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -331,11 +452,16 @@ bool CreatePipeline(DXGI_FORMAT format) {
     const HRESULT hr = device->CreateGraphicsPipelineState(&p, IID_PPV_ARGS(&pipeline));
     if (FAILED(hr)) { Fail("CreateGraphicsPipelineState", hr); return false; }
     pipelineFormat = format;
+    // The replay editor's preview: the game picture as it is (its alpha is not a coverage), so no blending.
+    // Optional: without it there is simply no shrunk preview.
+    blend.BlendEnable = FALSE;
+    previewPipeline.Reset();
+    if (FAILED(device->CreateGraphicsPipelineState(&p, IID_PPV_ARGS(&previewPipeline)))) previewPipeline.Reset();
     return true;
 }
 
 bool Bind(IDXGISwapChain* swap) {
-    ReleaseTargets();
+    if (!ReleaseTargets()) return false;
     DXGI_SWAP_CHAIN_DESC desc{};
     HRESULT hr = swap->GetDesc(&desc);
     if (FAILED(hr)) { Fail("IDXGISwapChain::GetDesc", hr); return false; }
@@ -381,6 +507,7 @@ bool Bind(IDXGISwapChain* swap) {
     DEVMODEW mode{};
     mode.dmSize = sizeof mode;
     const unsigned hz = EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) ? static_cast<unsigned>(mode.dmDisplayFrequency) : 0u;
+    displayHz.store(hz);
     char chainFlags[96];
     std::snprintf(chainFlags, sizeof chainFlags, " (swap effect %d, flags 0x%X, display %u Hz)", static_cast<int>(desc1.SwapEffect),
                   static_cast<unsigned>(desc1.Flags), hz);
@@ -395,7 +522,7 @@ bool Bind(IDXGISwapChain* swap) {
 
 bool EnsureTexture(UINT width, UINT height) {
     if (texture && width == textureWidth && height == textureHeight) return true;
-    WaitForGpu();
+    if (!WaitForGpu()) return false;
     texture.Reset();
     D3D12_RESOURCE_DESC t{};
     t.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; t.Width = width; t.Height = height; t.DepthOrArraySize = 1;
@@ -439,6 +566,145 @@ bool Prepare(IDXGISwapChain* swap) {
     return swap == boundSwap || Bind(swap);
 }
 
+// The preview copy: the back buffer's size and format, its view in SRV slot 1 (renderMutex held).
+bool EnsurePreviewTexture() {
+    if (previewTexture) return true;
+    if (!previewPipeline || frames.empty()) return false;
+    D3D12_RESOURCE_DESC t = frames[0].back->GetDesc();
+    t.Flags = D3D12_RESOURCE_FLAG_NONE;
+    const auto defaultHeap = HeapOf(D3D12_HEAP_TYPE_DEFAULT);
+    if (FAILED(device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &t, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                               IID_PPV_ARGS(&previewTexture)))) { previewTexture.Reset(); return false; }
+    previewState = D3D12_RESOURCE_STATE_COPY_DEST;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = t.Format;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE slot = srvHeap->GetCPUDescriptorHandleForHeapStart();
+    slot.ptr += srvStep;
+    device->CreateShaderResourceView(previewTexture.Get(), &srv, slot);
+    return true;
+}
+
+// One BGRA pixel from the back buffer's format; false for a format the export does not read (HDR).
+bool ToBgra(DXGI_FORMAT format, const uint8_t* rows, UINT width, UINT height, UINT pitch, std::vector<uint32_t>& out) {
+    out.resize(size_t(width) * height);
+    for (UINT y = 0; y < height; y++) {
+        const auto* row = reinterpret_cast<const uint32_t*>(rows + size_t(y) * pitch);
+        uint32_t* dst = out.data() + size_t(y) * width;
+        switch (format) {
+        case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: case DXGI_FORMAT_B8G8R8X8_UNORM:
+            for (UINT x = 0; x < width; x++) dst[x] = row[x] | 0xFF000000u;
+            break;
+        case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+            for (UINT x = 0; x < width; x++) {
+                const uint32_t v = row[x];
+                dst[x] = 0xFF000000u | ((v & 0xFFu) << 16) | (v & 0xFF00u) | ((v >> 16) & 0xFFu);
+            }
+            break;
+        case DXGI_FORMAT_R10G10B10A2_UNORM:
+            for (UINT x = 0; x < width; x++) {
+                const uint32_t v = row[x];
+                const uint32_t r = (v & 0x3FFu) >> 2, g = ((v >> 10) & 0x3FFu) >> 2, b = ((v >> 20) & 0x3FFu) >> 2;
+                dst[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            }
+            break;
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
+// The back buffer of `swap` as it is now (the game's frame, nothing of OriginX on it yet), read back to the CPU.
+void CaptureNow(IDXGISwapChain* swap) {
+    std::string error;
+    std::vector<uint32_t> pixels;
+    UINT width = 0, height = 0;
+    {
+        std::lock_guard guard(renderMutex);
+        if (!Prepare(swap)) error = "in-game drawing is not available";
+        ComPtr<IDXGISwapChain3> swap3;
+        if (error.empty() && FAILED(swap->QueryInterface(IID_PPV_ARGS(&swap3)))) error = "the swap chain has no IDXGISwapChain3";
+        const UINT index = error.empty() ? RealIndex(swap3.Get()) : 0;
+        if (error.empty() && index >= frames.size()) error = "unknown back buffer";
+        ID3D12CommandQueue* queue = gameQueue.load();
+        if (error.empty() && !queue) error = "no game command queue";
+        if (error.empty()) {
+            ID3D12Resource* back = frames[index].back.Get();
+            const D3D12_RESOURCE_DESC desc = back->GetDesc();
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+            UINT64 total = 0;
+            device->GetCopyableFootprints(&desc, 0, 1, 0, &footprint, nullptr, nullptr, &total);
+            // The previous copy into the read-back buffer must be done before the buffer is released for a larger
+            // one (2026-11-20, Cl#5): after a timed-out capture the GPU may still be writing into it.
+            if (!WaitForChecked(fenceValue)) error = "the GPU did not finish in time";
+            if (error.empty() && (!readback || readbackSize < total)) {
+                readback.Reset();
+                const auto heap = HeapOf(D3D12_HEAP_TYPE_READBACK);
+                const auto buffer = BufferDesc(total);
+                if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                           IID_PPV_ARGS(&readback)))) error = "creating the read-back buffer";
+                readbackSize = readback ? total : 0;
+            }
+            if (error.empty() && !captureAllocator &&
+                FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&captureAllocator)))) error = "a command allocator";
+            if (error.empty() && !captureList) {
+                if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, captureAllocator.Get(), nullptr, IID_PPV_ARGS(&captureList))))
+                    error = "a command list";
+                else captureList->Close();
+            }
+            if (error.empty()) {   // the allocator's previous list is done (waited above)
+                captureAllocator->Reset();
+                captureList->Reset(captureAllocator.Get(), nullptr);
+                const auto toCopy = Transition(back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                captureList->ResourceBarrier(1, &toCopy);
+                D3D12_TEXTURE_COPY_LOCATION dst{};
+                dst.pResource = readback.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dst.PlacedFootprint = footprint;
+                D3D12_TEXTURE_COPY_LOCATION src{};
+                src.pResource = back; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+                captureList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+                const auto toPresent = Transition(back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT);
+                captureList->ResourceBarrier(1, &toPresent);
+                if (FAILED(captureList->Close())) error = "recording the copy";
+                else {
+                    ID3D12CommandList* lists[] = {captureList.Get()};
+                    executeOrig(queue, 1, lists);
+                    queue->Signal(fence.Get(), ++fenceValue);
+                    uint8_t* mapped = nullptr;
+                    const D3D12_RANGE readRange{0, static_cast<SIZE_T>(total)};
+                    if (!WaitForChecked(fenceValue)) error = "the GPU did not finish the copy in time";
+                    else if (FAILED(readback->Map(0, &readRange, reinterpret_cast<void**>(&mapped)))) error = "reading the picture back";
+                    else {
+                        width = static_cast<UINT>(desc.Width); height = desc.Height;
+                        if (!ToBgra(desc.Format, mapped + footprint.Offset, width, height, footprint.Footprint.RowPitch, pixels))
+                            error = "the game draws in a format the export cannot read (" + std::to_string(static_cast<int>(desc.Format)) +
+                                    "); turn HDR off";
+                        const D3D12_RANGE none{0, 0};
+                        readback->Unmap(0, &none);
+                    }
+                }
+            }
+        }
+    }
+    std::lock_guard guard(captureMutex);
+    if (error.empty()) { capturePixels.swap(pixels); captureWidth = width; captureHeight = height; captureState = 1; }
+    else { captureError = error; captureState = 2; }
+}
+
+// Every real present, before anything is drawn on the frame: a capture asked for (RequestCapture) is taken once its
+// frames have passed.
+void CaptureIfDue(IDXGISwapChain* swap) {
+    {
+        std::lock_guard guard(captureMutex);
+        if (captureCountdown < 0) return;
+        if (captureCountdown > 0) { --captureCountdown; return; }
+        captureCountdown = -1;
+    }
+    CaptureNow(swap);
+}
+
 void Render(IDXGISwapChain* swap) {
     if (!enabled.load() || failed) return;
     std::lock_guard guard(renderMutex);
@@ -453,6 +719,13 @@ void Render(IDXGISwapChain* swap) {
         if (h->dllState != MyClientHudFrame::Drawing) h->dllState = MyClientHudFrame::Ready;
     }
     const bool showHud = h && MyClientHudFrame::Fresh(h->hudAt, now) && h->width && h->height;
+    float box[4] = {};
+    bool preview = false;
+    {
+        std::lock_guard in(previewMutex);
+        preview = previewOn && showHud && previewPipeline;
+        for (int i = 0; i < 4; i++) box[i] = previewBox[i];
+    }
 
     Camera cam{}; bool haveCamera = false;
     Matrices mats{}; bool haveMatrices = false; float matPos[3] = {};
@@ -483,7 +756,7 @@ void Render(IDXGISwapChain* swap) {
     if (index >= frames.size()) return;
     Frame& frame = frames[index];
     // Only this back buffer's previous use must be finished (normally long ago): no stall per frame.
-    WaitFor(frame.fenceValue);
+    if (!WaitFor(frame.fenceValue)) return;
 
     bool copyRows = false;
     uint32_t top = 0, bottom = 0;
@@ -521,6 +794,15 @@ void Render(IDXGISwapChain* swap) {
         AddHitboxes(builder, projector, lineBoxes.data(), static_cast<uint32_t>(lineBoxes.size()), MyClientGame::HitboxFilter(), thickness, colors);
     }
     if (showHud && textureFilled) builder.Picture();   // last: the HUD sits on top of the lines
+    // The editor's preview: first, under the lines and the HUD (whose picture leaves the box clear).
+    preview = preview && textureFilled && EnsurePreviewTexture();
+    if (preview) {
+        const float x0 = -1.f + 2.f * box[0], x1 = -1.f + 2.f * (box[0] + box[2]);
+        const float y0 = 1.f - 2.f * box[1], y1 = 1.f - 2.f * (box[1] + box[3]);
+        const Vertex quad[6] = {{x0, y0, 0, 0, 1, 1, 1, 1}, {x1, y0, 1, 0, 1, 1, 1, 1}, {x0, y1, 0, 1, 1, 1, 1, 1},
+                                {x1, y0, 1, 0, 1, 1, 1, 1}, {x1, y1, 1, 1, 1, 1, 1, 1}, {x0, y1, 0, 1, 1, 1, 1, 1}};
+        vertices.insert(vertices.begin(), quad, quad + 6);
+    }
     if (vertices.empty() && !copyRows) return;
     if (vertices.size() > kMaxVertices) vertices.resize(kMaxVertices - kMaxVertices % 6);
     if (!EnsureFrameBuffers(frame, false)) return;
@@ -549,6 +831,18 @@ void Render(IDXGISwapChain* swap) {
         textureState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     }
 
+    if (preview) {
+        // The game's frame as it is now (only the game has drawn on it) into the preview copy.
+        const D3D12_RESOURCE_BARRIER before[2] = {Transition(frame.back.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                                                  Transition(previewTexture.Get(), previewState, D3D12_RESOURCE_STATE_COPY_DEST)};
+        list->ResourceBarrier(previewState == D3D12_RESOURCE_STATE_COPY_DEST ? 1 : 2, before);
+        list->CopyResource(previewTexture.Get(), frame.back.Get());
+        const D3D12_RESOURCE_BARRIER after[2] = {Transition(frame.back.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT),
+                                                 Transition(previewTexture.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)};
+        list->ResourceBarrier(2, after);
+        previewState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    }
+
     if (!vertices.empty()) {
         if (texture && textureState != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
             const auto b = Transition(texture.Get(), textureState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -570,7 +864,18 @@ void Render(IDXGISwapChain* swap) {
         const D3D12_VERTEX_BUFFER_VIEW view{frame.vertexBuffer->GetGPUVirtualAddress(), static_cast<UINT>(vertices.size() * sizeof(Vertex)),
                                             sizeof(Vertex)};
         list->IASetVertexBuffers(0, 1, &view);
-        list->DrawInstanced(static_cast<UINT>(vertices.size()), 1, 0, 0);
+        UINT first = 0;
+        if (preview) {
+            D3D12_GPU_DESCRIPTOR_HANDLE slot = srvHeap->GetGPUDescriptorHandleForHeapStart();
+            slot.ptr += srvStep;
+            list->SetPipelineState(previewPipeline.Get());
+            list->SetGraphicsRootDescriptorTable(0, slot);
+            list->DrawInstanced(6, 1, 0, 0);
+            list->SetPipelineState(pipeline.Get());
+            list->SetGraphicsRootDescriptorTable(0, srvHeap->GetGPUDescriptorHandleForHeapStart());
+            first = 6;
+        }
+        if (vertices.size() > first) list->DrawInstanced(static_cast<UINT>(vertices.size()) - first, 1, first, 0);
         const auto toPresent = Transition(frame.back.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT);
         list->ResourceBarrier(1, &toPresent);
     }
@@ -621,6 +926,17 @@ struct PresentTiming {
         copy += copyDone - presenterDone;
         hud += hudDone - copyDone;
         wait += exit - hudDone;
+        // r57-test39: one Present call (wait for the presenter + copy + HUD + present) over 30 ms is logged.
+        if (exit - entry > 30.0) {
+            static double loggedAt = 0;
+            if (exit - loggedAt > 2000.0) {
+                loggedAt = exit;
+                char spike[200];
+                std::snprintf(spike, sizeof spike, "Stutter: one Present took %.1f ms (waitPresenter=%.1f copy=%.1f hud=%.1f present=%.1f)",
+                              exit - entry, presenterDone - entry, copyDone - presenterDone, hudDone - copyDone, exit - hudDone);
+                Info(spike);
+            }
+        }
         lastExit = exit; sync = s; flags = f;
         if (++frames >= 30 && exit - start >= 10000) {
             char text[380];
@@ -628,6 +944,7 @@ struct PresentTiming {
                           frames, frames * 1000.0 / (exit - start), game / frames, presenter / frames, copy / frames,
                           hud / frames, wait / frames, sync, flags, proxy ? "true" : "false", uncap ? "true" : "false");
             Info(text);
+            ReportGpuTimeouts();
             ReportMemoryUsage();
             *this = {};
             lastExit = exit;
@@ -733,7 +1050,7 @@ Frame* CurrentFrame(IDXGISwapChain* swap) {
     if (FAILED(swap->QueryInterface(IID_PPV_ARGS(&swap3))) || !swap3) return nullptr;
     const UINT index = RealIndex(swap3.Get());
     if (index >= frames.size() || !frames[index].back) return nullptr;
-    WaitFor(frames[index].fenceValue);   // the HUD's last list on this buffer
+    if (!WaitFor(frames[index].fenceValue)) return nullptr;   // the HUD's last list on this buffer
     return &frames[index];
 }
 
@@ -748,7 +1065,7 @@ bool CopyDrawn(IDXGISwapChain* swap, ID3D12Resource* drawn) {
     if (d.Width != backWidth || d.Height != backHeight || d.Format != backFormat) return false;
     Frame* frame = CurrentFrame(swap);
     if (!frame || !frame->back || !frame->copyAllocator) return false;
-    WaitFor(frame->copyFenceValue);
+    if (!WaitFor(frame->copyFenceValue)) return false;
     if (FAILED(frame->copyAllocator->Reset()) || FAILED(copyList->Reset(frame->copyAllocator.Get(), nullptr))) return false;
     const D3D12_RESOURCE_BARRIER in[2] = {
         Transition(drawn, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -780,6 +1097,19 @@ struct DirectCopy {
     bool broken = false;
 };
 DirectCopy direct;
+bool WaitDirectIdle() {
+    if (!direct.value) return true;
+    if (!direct.fence || !direct.event) return false;
+    if (direct.fence->GetCompletedValue() < direct.value &&
+        SUCCEEDED(direct.fence->SetEventOnCompletion(direct.value, direct.event))) {
+        const double start = NowMs();
+        const DWORD r = WaitForSingleObject(direct.event, 500);
+        NoteGpuWait("proxy copy retire", start, direct.value, direct.fence->GetCompletedValue(), r);
+    }
+    if (direct.fence->GetCompletedValue() >= direct.value) return true;
+    gpuTimeouts.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
 bool CopyDrawnDirect(IDXGISwapChain* swap, ID3D12Resource* drawn) {
     ID3D12CommandQueue* queue = gameQueue.load();
     if (!swap || !drawn || !queue || !executeOrig || direct.broken) return false;
@@ -808,8 +1138,12 @@ bool CopyDrawnDirect(IDXGISwapChain* swap, ID3D12Resource* drawn) {
     const UINT slot = direct.next;
     direct.next = (slot + 1) % 4;
     if (direct.fence->GetCompletedValue() < direct.done[slot] &&
-        SUCCEEDED(direct.fence->SetEventOnCompletion(direct.done[slot], direct.event)))
-        WaitForSingleObject(direct.event, 500);
+        SUCCEEDED(direct.fence->SetEventOnCompletion(direct.done[slot], direct.event))) {
+        const double start = NowMs();
+        const DWORD r = WaitForSingleObject(direct.event, 500);
+        NoteGpuWait("proxy copy slot", start, direct.done[slot], direct.fence->GetCompletedValue(), r);
+    }
+    if (direct.fence->GetCompletedValue() < direct.done[slot]) { gpuTimeouts.fetch_add(1); return false; }
     if (FAILED(direct.allocators[slot]->Reset()) || FAILED(direct.list->Reset(direct.allocators[slot].Get(), nullptr))) return false;
     const D3D12_RESOURCE_BARRIER in[2] = {
         Transition(drawn, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
@@ -851,6 +1185,9 @@ std::atomic<bool> presenterRunning{false};
 std::once_flag presenterOnce;
 std::atomic<bool> gameFrameWaiting{false};   // the game's next Present is waiting: show the game frame now
 std::atomic<uint32_t> madeSkipped{0};        // made-up frames left out so the game is not held (for the log)
+// r57-test27 diagnostics (FG gave no FPS gain): why made-up frames were left out, and what the planner saw.
+std::atomic<uint32_t> skipByPlan{0}, skipByWait{0}, skipByFit{0}, planFitsLast{0}, planWantedLast{0};
+std::atomic<double> planIntervalLast{0};
 std::atomic<uint32_t> madeFailed{0};         // made-up frames that could not be made (for the log)
 std::atomic<uint32_t> jobsPlain{0};          // game frames handed over without made-up frames (for the log)
 // Why (for the log): a menu was open (the game's or the HUD's) / the frame came late after the previous one / the
@@ -910,16 +1247,23 @@ HRESULT RunJob(const Job& job) {
         // As many made-up frames as fit (MyClientFrameGen::Extras), spread evenly over the game's frame time.
         presenterFits.store(MyClientFrameGen::FitCount(MyClientFeatures::FrameGenMaxMultiplier - 1, job.intervalMs,
                                                        presenterCost, start));
-        const uint32_t extra = presenterTuner.Choose(
+        uint32_t extra = presenterTuner.Choose(
             job.multiplier, presenterExtras.Plan(job.multiplier, job.intervalMs, presenterCost, start), start);
+        // A made-up frame that costs more than half the game's frame also means the GPU is behind: back off too.
+        if (presenterMadeMs.load() > job.intervalMs * 0.5 && job.intervalMs > 0) fgBackoffUntil.store(start + 1000.0);
+        if (extra && start < fgBackoffUntil.load()) { fgBackoffFrames.fetch_add(extra); extra = 0; }
         presenterChoice.store(extra);
-        if (extra + 1 < job.multiplier) madeSkipped.fetch_add(job.multiplier - 1 - extra);
+        planFitsLast.store(presenterFits.load());
+        planWantedLast.store(job.multiplier - 1);
+        planIntervalLast.store(job.intervalMs);
+        if (extra + 1 < job.multiplier) { madeSkipped.fetch_add(job.multiplier - 1 - extra); skipByPlan.fetch_add(job.multiplier - 1 - extra); }
         const uint32_t steps = extra + 1;
         const double spacing = job.spacingMs > 0 ? job.spacingMs * job.multiplier / steps : 0;
         for (uint32_t k = 1; k <= extra; k++) {
             WaitPrecise(start + (k - 1) * spacing - NowMs(), &gameFrameWaiting);
             if (gameFrameWaiting.load() || !MyClientFrameGen::Fits(NowMs(), start, job.intervalMs, presenterCost)) {
                 madeSkipped.fetch_add(steps - k);
+                (gameFrameWaiting.load() ? skipByWait : skipByFit).fetch_add(steps - k);
                 break;
             }
             const double madeStart = NowMs();
@@ -1035,12 +1379,15 @@ struct FrameGenTiming {
                           plainCapture.exchange(0), presenterChoice.load(), game / frames,
                           wait / frames, capture / frames, presenterMadeMs.load(), presenterRealMs.load());
             Info(text);
+            ReportGpuTimeouts();
             char stages[300];
             std::snprintf(stages, sizeof stages,
                           "Frame Generation stages: synth=%.2f ms restore=%.2f ms hud=%.2f ms nativePresent=%.2f ms (sync=0 flags=0x%x hr=0x%08x)",
                           synthStage.TakeMs(), restoreStage.TakeMs(), hudStage.TakeMs(), nativePresentStage.TakeMs(),
                           presenterFlags.load(), static_cast<unsigned>(presenterHr.load()));
             Info(stages);
+            if (const uint32_t held = fgBackoffFrames.exchange(0))
+                Info("Frame Generation: " + std::to_string(held) + " made-up frames held back while the GPU was behind (10 s)");
             ReportMemoryUsage();
             *this = {};
             lastExit = exit;
@@ -1070,6 +1417,10 @@ HRESULT PresentProxied(IDXGISwapChain* swap, UINT sync, UINT flags, ID3D12Resour
     const bool resume = wasPaused && !paused;
     wasPaused = paused || !on;
     if (on) {
+        {   // the replay export reads the real back buffer; made-up frames in between would be captured instead
+            std::lock_guard guard(captureMutex);
+            if (captureCountdown >= 0) { captureCountdown = -1; captureError = "turn Frame Generation off to export a video"; captureState = 2; }
+        }
         pacer.Frame(entry);
         pacer.Held(waited - entry);
         Job job;
@@ -1133,6 +1484,7 @@ HRESULT PresentProxied(IDXGISwapChain* swap, UINT sync, UINT flags, ID3D12Resour
         Warn("In-game drawing: the game's picture could not be copied to the screen (one frame shows an old picture).");
     }
     const double copyDone = NowMs();
+    if (copied) CaptureIfDue(swap);   // the game frame is in the real back buffer now (PRESENT), nothing of OriginX on it yet
     Render(swap);
     const double hudDone = NowMs();
     const HRESULT hr = present(sync, tearing);
@@ -1184,6 +1536,7 @@ HRESULT PresentFrame(IDXGISwapChain* swap, UINT sync, UINT flags, PresentCall pr
             tearing = DXGI_PRESENT_ALLOW_TEARING;
     }
     const double copyDone = NowMs(); // includes setup; this path does not copy a proxy image
+    CaptureIfDue(swap);   // the replay export's frame: before OriginX draws anything on it
     Render(swap);
     const double hudDone = NowMs();
     const HRESULT hr = present(sync, tearing);
@@ -1247,11 +1600,24 @@ void NoteGpu(IDXGISwapChain* swap) {
          ", " + std::to_string(found.videoMb) + " MB).");
 }
 
+// r57-test42: FPS limit (Optimization). The game's frame is held before its Present until 1/limit s after the last
+// one, so the GPU keeps headroom and a sudden heavy frame does not stall a full queue. 0 = no limit.
+void FpsLimitPace() {
+    const uint32_t limit = MyClientGame::FpsLimitWanted();
+    static double next = 0;
+    if (!limit) { next = 0; return; }
+    const double interval = 1000.0 / limit, now = NowMs();
+    if (next > now && next - now < 1000.0) WaitPrecise(next - now, nullptr);
+    const double after = NowMs();
+    next = (next > 0 && after - next < interval) ? next + interval : after + interval;
+}
 HRESULT STDMETHODCALLTYPE PresentDetour(IDXGISwapChain* swap, UINT sync, UINT flags) {
     NoteGpu(swap);
     HRESULT hr;
-    if (presentDepth++ == 0 && !(flags & DXGI_PRESENT_TEST))
+    if (presentDepth++ == 0 && !(flags & DXGI_PRESENT_TEST)) {
+        FpsLimitPace();
         hr = PresentFrame(swap, sync, flags, [&](UINT interval, UINT more) { return presentOrig(swap, interval, flags | more); });
+    }
     else
         hr = presentOrig(swap, sync, flags);
     presentDepth--;
@@ -1260,8 +1626,10 @@ HRESULT STDMETHODCALLTYPE PresentDetour(IDXGISwapChain* swap, UINT sync, UINT fl
 HRESULT STDMETHODCALLTYPE Present1Detour(IDXGISwapChain1* swap, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* params) {
     NoteGpu(swap);
     HRESULT hr;
-    if (presentDepth++ == 0 && !(flags & DXGI_PRESENT_TEST))
+    if (presentDepth++ == 0 && !(flags & DXGI_PRESENT_TEST)) {
+        FpsLimitPace();
         hr = PresentFrame(swap, sync, flags, [&](UINT interval, UINT more) { return present1Orig(swap, interval, flags | more, params); });
+    }
     else
         hr = present1Orig(swap, sync, flags, params);
     presentDepth--;
@@ -1355,17 +1723,22 @@ UINT KeepTearing(IDXGISwapChain* swap, UINT flags) {
     return flags;
 }
 // The game asks for its buffers again after a resize: new proxies are made then, at the new size.
+void PrepareResize(IDXGISwapChain* swap, const char* operation) {
+    ResizeWait resize(swap, operation);
+    // Never hold renderMutex while waiting for the presenter: it needs that lock
+    // to finish its job. Removal can also break a presenter stuck in native Present.
+    if (!resize.UntilReady("WaitPresenterIdle", 1000, [] { return WaitPresenterIdle(); })) return;
+    std::lock_guard guard(renderMutex);
+    if (!ReleaseTargets(&resize)) return; // device removed: retain state, let native resize report it
+    ForgetProxies(swap);                 // our back-buffer references would make the resize fail
+}
 HRESULT STDMETHODCALLTYPE ResizeDetour(IDXGISwapChain* swap, UINT count, UINT w, UINT h, DXGI_FORMAT format, UINT flags) {
-    WaitPresenterIdle();
-    ForgetProxies(swap);
-    { std::lock_guard guard(renderMutex); ReleaseTargets(); }   // our back-buffer references would make the resize fail
+    PrepareResize(swap, "ResizeBuffers");
     return resizeOrig(swap, count, w, h, format, KeepTearing(swap, flags));
 }
 HRESULT STDMETHODCALLTYPE Resize1Detour(IDXGISwapChain3* swap, UINT count, UINT w, UINT h, DXGI_FORMAT format, UINT flags,
                                         const UINT* mask, IUnknown* const* queues) {
-    WaitPresenterIdle();
-    ForgetProxies(swap);
-    { std::lock_guard guard(renderMutex); ReleaseTargets(); }
+    PrepareResize(swap, "ResizeBuffers1");
     return resize1Orig(swap, count, w, h, format, KeepTearing(swap, flags), mask, queues);
 }
 
@@ -1777,6 +2150,35 @@ void SetTarget(bool has, int x, int y, int z) {
     hasTarget = has; targetX = x; targetY = y; targetZ = z;
     targetAt = GetTickCount64();
 }
+void SetPreview(bool on, float x, float y, float w, float h) {
+    std::lock_guard guard(previewMutex);
+    previewOn = on;
+    previewBox[0] = x; previewBox[1] = y; previewBox[2] = w; previewBox[3] = h;
+}
+
+void ResetCapture() {
+    std::lock_guard guard(captureMutex);
+    captureCountdown = -1;
+    captureState = 0;
+    captureError.clear();
+    capturePixels.clear();
+}
+
+void RequestCapture(uint32_t waitFrames) {
+    std::lock_guard guard(captureMutex);
+    captureCountdown = static_cast<int>(waitFrames > 30 ? 30 : waitFrames);
+    captureState = 0;
+    captureError.clear();
+}
+
+CaptureResult TakeCapture(std::vector<uint32_t>& bgra, uint32_t& width, uint32_t& height, std::string& error) {
+    std::lock_guard guard(captureMutex);
+    if (captureState == 1) { bgra.swap(capturePixels); width = captureWidth; height = captureHeight; captureState = 0; return CaptureResult::Ready; }
+    if (captureState == 2) { error = captureError; captureState = 0; return CaptureResult::Failed; }
+    return CaptureResult::None;
+}
+
+unsigned DisplayHz() { return displayHz.load(); }
 bool DrainGameGpu() {
     std::lock_guard guard(renderMutex);
     auto* queue = gameQueue.load();

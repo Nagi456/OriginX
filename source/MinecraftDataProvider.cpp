@@ -8,9 +8,15 @@
 #include "TabListChannel.h"
 #include "SkinChannel.h"
 #include "ChatChannel.h"
+#include "ReplayCameraChannel.h"
+#include "ReplayVideoChannel.h"
 
 namespace MinecraftDataProvider {
 namespace {
+MyClientMap::Channel mapChannel;
+MyClientMap::Shared mapSnapshot{};
+ULONGLONG mapOpenAttempt=0;
+bool mapWanted=false,mapMobsWanted=false;
 MyClientIpc::Channel channel;
 MyClientFeatures::Channel features;
 MyClientParty::Channel party;
@@ -27,6 +33,10 @@ MyClientTabList::Channel tabLists;
 MyClientTabList::Shared tabListSnapshot{};
 ULONGLONG tabListOpenAttempt = 0;
 MyClientSkin::Channel skins;
+MyClientReplayCameraChannel::Channel replayCamera;   // HUD -> DLL (this side creates it)
+DWORD replayCameraPid = 0;
+MyClientReplayVideo::Channel replayVideo;   // HUD <-> DLL, editor preview and export (this side creates it)
+DWORD replayVideoPid = 0;
 ULONGLONG skinOpenAttempt = 0;
 uint32_t skinSerial = 0;          // of the channel (per game process)
 uint32_t skinChanges = 0;         // goes up whenever skinRgba changed: the HUD redraws its head then
@@ -72,6 +82,8 @@ bool replayBuffer = false;   // keep the session from joining so recording can s
 bool hitEffectCrit = false, hitEffectMagic = false;   // Hit Effect module (DLL spawns the particles)
 bool leftHandRequested = false;   // Left Hand module (DLL mirrors the first-person held item)
 uint32_t frameGenBits = 0;   // Frame Generation request (bits 27..31 of the autoRq field)
+MinecraftDataProvider::ComboState comboSnapshot{};
+uint64_t comboAt = 0;
 float framePresentedFps = 0; uint32_t frameGenState = 0;   // from the DLL, with featureSnapshot
 bool shulkerHoverRequested = false;   // Shulker Preview (DLL hides the game's tooltip under the HUD's popup)
 bool hudMenuOpen = false;         // the HUD menu has the focus (the DLL closes the pause screen that causes)
@@ -115,8 +127,9 @@ bool Initialize(HWND window)
 void Shutdown()
 {
     if (features.Data() && features.Lock()) { features.Data()->command = {}; features.Unlock(); }
-    features.Close(); featureSnapshot = {}; serverSnapshot = {}; statsSnapshot = {}; statsPrevious = {}; statsRate = {}; statsPreviousAt = 0; featureOpenAttempt = 0;
+    features.Close(); comboSnapshot = {}; comboAt = 0; featureSnapshot = {}; serverSnapshot = {}; statsSnapshot = {}; statsPrevious = {}; statsRate = {}; statsPreviousAt = 0; featureOpenAttempt = 0;
     resources.Close(); resourceSnapshot = {}; resourceOpenAttempt = 0;
+    mapChannel.Close(); mapSnapshot={}; mapOpenAttempt=0;
     shulkers.Close(); shulkerSnapshot = {}; shulkerOpenAttempt = 0;
     shulkerHover.Close(); shulkerHoverSnapshot = {}; shulkerHoverOpenAttempt = 0;
     tabLists.Close(); tabListSnapshot = {}; tabListOpenAttempt = 0;
@@ -129,6 +142,8 @@ void Shutdown()
     itemCount.Close();
     if (party.Data() && party.Lock()) { party.Data()->config = {}; party.Unlock(); }
     party.Close(); partySnapshot = {}; partyOpenAttempt = 0;
+    replayCamera.Close(); replayCameraPid = 0;
+    replayVideo.Close(); replayVideoPid = 0;
     channel.Close();
     processId = 0;
     lastOpenAttempt = 0;
@@ -161,6 +176,17 @@ void Tick(HWND window)
     const ULONGLONG now = GetTickCount64();
     // The feature data is kept from the last good read: a lock that is busy for a moment must not blank
     // it (the settings pages flashed "UNAVAILABLE"). It is cleared when the channel is closed or invalid.
+    if(mapWanted && !mapChannel.Data() && (!mapOpenAttempt || now-mapOpenAttempt>=500)) {
+        mapOpenAttempt=now;mapChannel.Open(processId,false);
+    }
+    if(mapChannel.Data() && mapChannel.Lock()) {
+        auto* data=mapChannel.Data();
+        if(MyClientMap::Valid(*data,processId)) {
+            mapSnapshot=*data;data->hudAt=now;data->wantMap=mapWanted?1u:0u;
+            data->wantMobs=mapWanted && mapMobsWanted && MyClientMap::AutoMobs(data->locality,data->realm!=0)?1u:0u;
+            mapChannel.Unlock();
+        } else {mapChannel.Unlock();mapChannel.Close();}
+    }
     partySnapshot = {};
     resourceSnapshot = {};
     shulkerSnapshot = {};
@@ -227,13 +253,14 @@ void Tick(HWND window)
         featureOpenAttempt = now;
         features.Open(processId, false);
     }
-    if (!features.Data()) { featureSnapshot = {}; serverSnapshot = {}; statsSnapshot = {}; statsRate = {}; statsPreviousAt = 0; }
+    if (!features.Data()) { comboSnapshot = {}; comboAt = 0; featureSnapshot = {}; serverSnapshot = {}; statsSnapshot = {}; statsRate = {}; statsPreviousAt = 0; }
     if (features.Data() && features.Lock(2)) {
         const auto snapshot = *features.Data();
         features.Unlock();
         if (MyClientFeatures::Valid(snapshot, processId)) {
             std::memcpy(replayPath, snapshot.recPath, sizeof(replayPath)); replayPath[sizeof(replayPath) - 1] = 0;
             featureSnapshot = snapshot.telemetry; serverSnapshot = snapshot.server; statsSnapshot = snapshot.stats;
+            comboSnapshot = {(snapshot.comboFlags & 1u) != 0, snapshot.combo}; comboAt = snapshot.comboAt;
             framePresentedFps = snapshot.presentedFps; frameGenState = snapshot.frameGen;
             std::memcpy(armorItems, snapshot.armorItems, sizeof(armorItems));
             for (auto& item : armorItems) item[sizeof(item) - 1] = 0;
@@ -432,10 +459,19 @@ uint32_t CapeChoice() {
     return skinRequests.CapeChoice(processId);
 }
 bool JavaChatSnapshot(bool enabled, MyClientJavaChat::Snapshot& out) {
-    if (!processId || (!javaChat.IsOpen() && (!enabled || !javaChat.Open(processId, false)))) return false;
+    // OFF can still be pending at the title: observe the actually applied profile even when requested OFF.
+    if (!processId || (!javaChat.IsOpen() && !javaChat.Open(processId, false))) return false;
     if (!javaChat.ReadAndRequest(processId, enabled, out)) return false;
     lastJavaChat = out;
     return true;
+}
+int JavaChatJsonSupport() {
+    return MyClientFeatures::JavaChatJsonSupportOf(featureSnapshot.fullbrightAvailable,
+        MyClientFeatures::Fresh(statsSnapshot.at, GetTickCount64(), 3000));
+}
+int JavaChatAvailability() {
+    return MyClientFeatures::JavaChatAvailabilityOf(featureSnapshot.fullbrightAvailable,
+        MyClientFeatures::Fresh(statsSnapshot.at, GetTickCount64(), 3000));
 }
 bool JavaChatReady() { return lastJavaChat.ready && MyClientJavaChat::Fresh(lastJavaChat.at, GetTickCount64()); }
 bool SkinHasNoPicture() { return skinNoPicture; }
@@ -485,6 +521,8 @@ bool GetResources(MyClientResources::Counts& counts) {
     if (!MyClientResources::Fresh(resourceSnapshot.at, GetTickCount64())) return false;
     counts = resourceSnapshot.counts; return true;
 }
+void SetMapWanted(bool map,bool mobs){mapWanted=map;mapMobsWanted=mobs;}
+bool GetMap(MyClientMap::Shared& out){if(!MyClientMap::Fresh(mapSnapshot.at,GetTickCount64()))return false;out=mapSnapshot;return true;}
 bool GetShulkers(MyClientShulker::Shared& out) {
     out = {};
     if (!MyClientShulker::Fresh(shulkerSnapshot.at, GetTickCount64())) return false;
@@ -522,6 +560,10 @@ bool GetFps(float& fps) {
     if (!MyClientFeatures::Fresh(featureSnapshot.fpsAt, GetTickCount64()) ||
         !std::isfinite(featureSnapshot.fps) || featureSnapshot.fps <= 0 || featureSnapshot.fps > 10000) return false;
     fps = featureSnapshot.fps; return true;
+}
+ComboState Combo() {
+    if (!features.Data() || !MyClientFeatures::Fresh(comboAt, GetTickCount64())) return {};
+    return comboSnapshot;
 }
 bool GetWorldClock(int32_t& time, bool& moving) {
     const ULONGLONG now = GetTickCount64();
@@ -802,3 +844,33 @@ const wchar_t* GetPartyStatusText() {
     return L"Hive: invalid status";
 }
 }
+
+namespace MinecraftDataProvider {
+// The replay camera path for the DLL (ReplayCameraChannel.h), every HUD tick while a game is attached.
+void PublishReplayCamera(const std::vector<MyClientReplayCamera::Keyframe>& path, bool active, double timeMs, float speed, bool paused,
+                         uint64_t timeAtMicros)
+{
+    if (!processId) return;
+    if (replayCameraPid != processId || !replayCamera.Data()) {
+        replayCameraPid = processId;
+        if (!replayCamera.Open(processId, true)) return;
+    }
+    replayCamera.Publish(processId, path, active, timeMs, speed, paused, timeAtMicros);
+}
+}  // namespace MinecraftDataProvider
+
+namespace MinecraftDataProvider {
+bool ReplayVideo(const std::function<void(MyClientReplayVideo::Shared&)>& f)
+{
+    if (!processId) return false;
+    if (replayVideoPid != processId || !replayVideo.IsOpen()) {
+        replayVideoPid = processId;
+        if (!replayVideo.Open(processId, true)) return false;
+    }
+    const DWORD pid = processId;
+    return replayVideo.With([&](MyClientReplayVideo::Shared& s) {
+        if (!MyClientReplayVideo::Valid(s, pid)) MyClientReplayVideo::Reset(s, pid);
+        f(s);
+    });
+}
+}  // namespace MinecraftDataProvider

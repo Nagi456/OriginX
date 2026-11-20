@@ -6,6 +6,8 @@ using namespace BlockDetails;
 // Block Details: tool from tags, the held item's verdict, names and where a block comes from.
 int main()
 {
+    assert(BlockDetails::ToolFor("minecraft:leaves,minecraft:is_hoe_item_destructible").tool == BlockDetails::Tool::Shears);
+
     assert(Namespace("minecraft:diorite") == "minecraft" && Namespace("air_ship:engine") == "air_ship" && Namespace("dirt") == "minecraft");
     assert(Pretty("air_ship") == "Air Ship" && Pretty("polished_diorite") == "Polished Diorite" && Pretty("a--b_") == "A B");
 

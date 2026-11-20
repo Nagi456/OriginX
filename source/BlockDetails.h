@@ -56,13 +56,16 @@ inline std::vector<std::string> SplitTags(const std::string& tags) {
 // add-ons use too, and the older vanilla ones ("stone", "wood", "dirt", "iron_pick_diggable", ...). When a block
 // lists several tiers, the lowest is what it needs.
 inline ToolInfo ToolFor(const std::string& tags) {
-    bool pick = false, axe = false, shovel = false, hoe = false, shears = false, sword = false;
+    bool pick = false, axe = false, shovel = false, hoe = false, shears = false, sword = false, shearsFirst = false;
     int tier = 99;
     const auto has = [](const std::string& s, const char* part) { return s.find(part) != std::string::npos; };
     for (const std::string& raw : SplitTags(tags)) {
         std::string t = raw;
         for (char& c : t) c = (char)std::tolower((unsigned char)c);
         const std::string bare = PathOf(t);
+        // Leaves, wool, cobwebs, vines: shears are the right tool (they drop the block itself), even when the
+        // block is also listed as hoe / sword destructible (r57-test12 request: leaves showed a hoe).
+        if (bare == "leaves" || bare == "wool" || bare == "cobweb" || bare == "vine") shearsFirst = true;
         if (has(t, "pickaxe") || has(t, "_pick_diggable") || bare == "stone" || bare == "metal") pick = true;
         else if (has(t, "is_axe_item") || bare == "wood" || bare == "log" || bare == "pumpkin") axe = true;
         else if (has(t, "shovel") || bare == "dirt" || bare == "sand" || bare == "gravel" || bare == "grass" || bare == "snow") shovel = true;
@@ -78,7 +81,7 @@ inline ToolInfo ToolFor(const std::string& tags) {
         if (level >= 0) pick = true;
     }
     ToolInfo info;
-    info.tool = pick ? Tool::Pickaxe : axe ? Tool::Axe : shovel ? Tool::Shovel : hoe ? Tool::Hoe : shears ? Tool::Shears
+    info.tool = shearsFirst ? Tool::Shears : pick ? Tool::Pickaxe : axe ? Tool::Axe : shovel ? Tool::Shovel : hoe ? Tool::Hoe : shears ? Tool::Shears
               : sword ? Tool::Sword : Tool::None;
     info.tier = info.tool == Tool::None || tier == 99 ? 0 : tier;
     return info;

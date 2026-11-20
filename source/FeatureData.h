@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <cstddef>
 #include <string>
 #include <cmath>
 #include <algorithm>
@@ -9,7 +10,7 @@
 // arrow/target data; feature commands and snapshots use a separate v1 mapping.
 namespace MyClientFeatures {
 constexpr uint32_t Magic = 0x4d434631;
-constexpr uint32_t Version = 16;   // 10: armorItems (Armor HUD icons); 11: presentedFps / frameGen (Frame Generation); 12: optimize; 13: clock; 14: debug; 15: hitboxRgb; 16: look
+constexpr uint32_t Version = 17;   // 10: armorItems (Armor HUD icons); 11: presentedFps / frameGen (Frame Generation); 12: optimize; 13: clock; 14: debug; 15: hitboxRgb; 16: look; 17: combo
 constexpr uint64_t StaleMs = 2000, CommandLeaseMs = 250;
 enum ArmorState : uint32_t { Unknown, Empty, NoDurability, Durable };
 struct Armor { uint32_t state, remaining, maximum; };
@@ -22,9 +23,19 @@ struct Command { uint64_t at; uint32_t zoom, key, fullbright, nametag, outline, 
 // fullbrightAvailable / fullbrightActive carry one bit per light/name feature so the layout
 // (and the ABI version) stay the same; an older DLL only ever sets bit 0.
 constexpr uint32_t FlagFullbright = 1, FlagNametag = 2, FlagOutline = 4, FlagOutlineColored = 8, FlagTextures = 16;
+constexpr uint32_t FlagJavaChatJson = 256; // JSON profile protocol, not the older native-hide backend
+constexpr uint32_t FlagJavaChatChecked = 64, FlagJavaChatAvailable = 128; // additive bits; no shared-layout change
 constexpr uint32_t FlagLiveTextures = 32;   // all live-reload barriers/hooks available, separate from title reload
 // Available: bit FlagOutline = the outline hook is installed.
 // Active:    FlagOutline = the game ran the outline code recently, FlagOutlineColored = a colour call was overridden.
+inline int JavaChatAvailabilityOf(uint32_t flags, bool fresh) {
+    if (!fresh || !(flags & FlagJavaChatChecked)) return -1;
+    return (flags & FlagJavaChatAvailable) ? 1 : 0;
+}
+inline int JavaChatJsonSupportOf(uint32_t flags, bool fresh) {
+    const int available = JavaChatAvailabilityOf(flags, fresh);
+    return available < 0 ? -1 : available == 1 && (flags & FlagJavaChatJson) ? 1 : 0;
+}
 inline bool HasFlag(uint32_t value, uint32_t flag) { return (value & flag) != 0; }
 inline uint32_t WithFlag(uint32_t value, uint32_t flag, bool on) { return on ? (value | flag) : (value & ~flag); }
 struct Telemetry {
@@ -109,9 +120,12 @@ struct Shared {
     // kind's own colour. Version 15.
     uint32_t hitboxRgb[4];
     Look look;   // version 16
+    uint32_t combo, comboFlags; // version 17: bit0 = the packet hooks it reads are in (Combo Counter can count)
+    uint64_t comboAt; // monotonic milliseconds; zero outside a world
 };
 static_assert(sizeof(Armor) == 12 && sizeof(Command) == 48 && sizeof(Telemetry) == 152 &&
-              sizeof(Server) == 80 && sizeof(Stats) == 48 && sizeof(Shared) == 1592 && sizeof(Debug) == 120 && sizeof(Look) == 504);
+              sizeof(Server) == 80 && sizeof(Stats) == 48 && sizeof(Shared) == 1608 && sizeof(Debug) == 120 && sizeof(Look) == 504);
+static_assert(offsetof(Shared, combo) == 1592 && offsetof(Shared, comboFlags) == 1596 && offsetof(Shared, comboAt) == 1600);
 static_assert(std::is_trivially_copyable<Shared>::value);
 // Hitbox colours by kind (player, item, entity, mob) and Shared.hitboxRgb.
 constexpr uint32_t HitboxDefaultRgb[4] = {0xFF4646, 0xFFD23C, 0xEBEBEB, 0x5ADC78};
@@ -134,9 +148,13 @@ inline void SetServer(Server& server, const char* host, uint32_t port, uint32_t 
     server.at = now; server.port = port; server.transport = transport;
     for (size_t i = 0; host && host[i] && i < sizeof(server.host) - 1; ++i) server.host[i] = host[i];
 }
-// HUD side: the pingable endpoint, or false (stale, no server, not RakNet, odd characters).
+// HUD side: the pingable endpoint, or false (stale, no server, other transport, odd characters).
+// Transport 0 is RakNet; 4 is NetherNet, used by featured servers (2026-11-19, Hive from the featured list:
+// host='109.224.231.202' port=19132 transport=4). The game still reports the server's address and port, so the
+// HUD sends its RakNet ping there too.
+inline bool PingableTransport(uint32_t transport) { return transport == 0 || transport == 4; }
 inline bool PingTarget(const Server& server, uint64_t now, char (&host)[64], uint32_t& port) {
-    if (!Fresh(server.at, now, 6000) || server.transport != 0 || server.port == 0 || server.port > 65535) return false;
+    if (!Fresh(server.at, now, 6000) || !PingableTransport(server.transport) || server.port == 0 || server.port > 65535) return false;
     size_t length = 0;
     while (length < sizeof(server.host) && server.host[length]) ++length;
     if (length == 0 || length >= sizeof(server.host)) return false;
@@ -299,6 +317,15 @@ inline uint32_t EncodeOptimize(bool mobs, bool items, bool misc, bool hideNameTa
     const uint32_t steps = std::min(playerBlocks / EntityDistanceStep, EntityDistanceMax / EntityDistanceStep);
     return (mobs ? CullMobsBit : 0u) | (items ? CullItemsBit : 0u) | (misc ? CullMiscBit : 0u) |
            (hideNameTags ? HideNameTagsBit : 0u) | (steps << 4) | (uncapFps ? UncapFpsBit : 0u);
+}
+// Bits 22..24 (10..21 hold the extras below): FPS limit (Optimization): 0 none, 1 = 60, 2 = 120, 3 = 144, 4 = 165, 5 = 240, 6 = the display's rate.
+// Older HUDs leave them 0 (no limit), older DLLs ignore them.
+constexpr uint32_t FpsLimitShift = 22, FpsLimitMask = 7u << FpsLimitShift;
+inline uint32_t EncodeFpsLimit(uint32_t code) { return (std::min(code, 6u) << FpsLimitShift) & FpsLimitMask; }
+inline uint32_t FpsLimitCodeOf(uint32_t optimize) { return (optimize & FpsLimitMask) >> FpsLimitShift; }
+inline uint32_t FpsLimitOf(uint32_t code, uint32_t displayHz) {
+    switch (code) { case 1: return 60; case 2: return 120; case 3: return 144; case 4: return 165; case 5: return 240;
+                    case 6: return displayHz ? displayHz : 144; default: return 0; }
 }
 inline uint32_t PlayerDistanceBlocks(uint32_t optimize) {
     return std::min((optimize >> 4) & 0x1Fu, EntityDistanceMax / EntityDistanceStep) * EntityDistanceStep;

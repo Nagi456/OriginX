@@ -48,6 +48,14 @@ bool InGameImage(const void* address);
 // How many hooks were put in, and the text of the last failure, for the log.
 unsigned Installed();
 const char* LastError();
+// Diagnostics (2026-11-11, the FPS regression): a hook named in %LOCALAPPDATA%\MyClient\disabled-hooks.txt (one
+// struct name per line, # comments) is not put in at all (hook() returns -2, as if its target were missing), so
+// its cost can be measured by starting the game with and without it. Every hook that is put in counts the calls
+// that reach its origin(); CallReport() lists the busiest since the last report, per second.
+bool Disabled(const char* name);
+void Track(const char* name, std::atomic<std::uint64_t>* calls);
+std::string CallReport(double seconds, std::size_t top = 15);
+std::string DisabledReport();
 
 template <class Fn>
 void* ToPointer(Fn fn)
@@ -82,9 +90,12 @@ struct AutoInstall
 
 #ifndef MYCLIENT_HOOK_NO_LEVILAMINA
 #define MYCLIENT_HOOK_THROUGH_LEVILAMINA(DEF_TYPE)                                                                     \
-    if (!::MyClientHook::InGameImage(_HookTarget))                                                                     \
-        return ::ll::memory::hook(_HookTarget, ::MyClientHook::ToPointer(&DEF_TYPE::detour),                           \
-                                  reinterpret_cast<void**>(&_OriginalFunc), ::ll::memory::HookPriority::Normal);
+    if (!::MyClientHook::InGameImage(_HookTarget)) {                                                                   \
+        const int viaLoader = ::ll::memory::hook(_HookTarget, ::MyClientHook::ToPointer(&DEF_TYPE::detour),            \
+                                  reinterpret_cast<void**>(&_OriginalFunc), ::ll::memory::HookPriority::Normal);       \
+        if (viaLoader == 0) ::MyClientHook::Track(#DEF_TYPE, &_Calls);                                                 \
+        return viaLoader;                                                                                              \
+    }
 #else
 #define MYCLIENT_HOOK_THROUGH_LEVILAMINA(DEF_TYPE)
 #endif
@@ -95,6 +106,7 @@ struct AutoInstall
 #define MYCLIENT_HOOK_IMPL(REGISTER, FUNC_PTR, STATIC, CALL, DEF_TYPE, TYPE, IDENTIFIER, RET_TYPE, ...)               \
     struct DEF_TYPE : public TYPE {                                                                                    \
         [[maybe_unused]] inline static ::std::atomic_uint _AutoHookCount{};                                                            \
+        alignas(64) inline static ::std::atomic<::std::uint64_t> _Calls{};  /* own cache line: hot hooks */            \
                                                                                                                        \
     private:                                                                                                           \
         using _OriginFuncType = RET_TYPE FUNC_PTR(__VA_ARGS__);                                                        \
@@ -104,15 +116,19 @@ struct AutoInstall
     public:                                                                                                            \
         template <class... Args>                                                                                       \
         STATIC RET_TYPE origin(Args&&... params) {                                                                     \
+            _Calls.fetch_add(1, ::std::memory_order_relaxed);                                                          \
             return CALL(::std::forward<Args>(params)...);                                                              \
         }                                                                                                              \
         STATIC RET_TYPE detour(__VA_ARGS__);                                                                           \
         static int hook(bool = true) {                                                                                 \
+            if (::MyClientHook::Disabled(#DEF_TYPE)) return -2;                                                        \
             if (!_HookTarget) _HookTarget = ::MyClientHook::Resolve(IDENTIFIER);                                       \
             if (!_HookTarget) return -1;                                                                               \
             MYCLIENT_HOOK_THROUGH_LEVILAMINA(DEF_TYPE)                                                                 \
-            return ::MyClientHook::Install(_HookTarget, ::MyClientHook::ToPointer(&DEF_TYPE::detour),                  \
-                                           reinterpret_cast<void**>(&_OriginalFunc));                                  \
+            const int result = ::MyClientHook::Install(_HookTarget, ::MyClientHook::ToPointer(&DEF_TYPE::detour),     \
+                                                       reinterpret_cast<void**>(&_OriginalFunc));                      \
+            if (result == 0) ::MyClientHook::Track(#DEF_TYPE, &_Calls);                                                \
+            return result;                                                                                             \
         }                                                                                                              \
     };                                                                                                                 \
     REGISTER;                                                                                                          \

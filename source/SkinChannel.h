@@ -92,6 +92,17 @@ inline bool MatchesSelection(const std::string& instance, const std::string& sel
            std::all_of(instance.begin() + prefix.size(), instance.end(), [](char c) { return c >= '0' && c <= '9'; });
 }
 
+// One budget per world/selected appearance, not per native notification. This is not shared-memory data.
+struct ReapplyBudget {
+    uint64_t last = 0;
+    unsigned attempts = 0;
+    bool CanTry(uint64_t now) const {
+        return attempts < 5 && (!attempts || (now >= last && now - last >= 1000));
+    }
+    void Tried(uint64_t now) { last = now; ++attempts; }
+    void Reset() { last = 0; attempts = 0; }
+};
+
 // Bounded recovery for a menu texture load that never completes. Normal asynchronous loads keep their key.
 struct AvatarLoadRetry {
     uint64_t since = 0;
@@ -121,12 +132,15 @@ struct AvatarLifecycle {
     uint32_t generation = 0;
     bool nativeReady = false, overriding = false, initialized = false;
     struct Change { bool changed, rebuild; };
-    Change Select(uint32_t nextGeneration, bool selected, bool retainedNative = false) {
+    Change Select(uint32_t nextGeneration, bool selected, bool retainedNative = false, bool resourcesReloaded = false) {
+        // A completed reload invalidates the account avatar too, even with no Closet selection.
+        // Animation ownership/initialization survives; texture readiness must be observed again.
+        if (resourcesReloaded) nativeReady = false;
         // A loaded animation can rebuild from an owned skin even if the account pack
         // is temporarily unavailable after reload. This is NOT texture readiness.
         const bool want = selected && (nativeReady || (initialized && retainedNative));
-        const bool changed = generation != nextGeneration || overriding != want;
-        const bool rebuild = changed && (overriding || want);
+        const bool changed = resourcesReloaded || generation != nextGeneration || overriding != want;
+        const bool rebuild = resourcesReloaded || (changed && (overriding || want));
         generation = nextGeneration;
         overriding = want;
         return {changed, rebuild};
@@ -181,9 +195,19 @@ inline const char* ResourcePatch(bool slim) {
 // HUD -> DLL: "wear this skin" (the Closet). Like Shared, the DLL owns the mapping; the HUD writes a
 // request (serial goes up). The DLL applies it on a world tick (Sent), or saves it from the title avatar
 // callback without a server/player (Saved), then answers in handled/result. Saved is not proof of rendering.
-constexpr uint32_t RequestMagic = 0x4d435352, RequestVersion = 2;   // "MCSR"; v2 adds independent capes
-constexpr uint32_t CapeWidth = 64, CapeHeight = 32, CapeBytes = CapeWidth * CapeHeight * 4;
-enum class Cape : uint32_t { Account = 0, Founding = 1, Supporter = 2 };
+constexpr uint32_t RequestMagic = 0x4d435352, RequestVersion = 3;   // "MCSR"; v2 adds independent capes; v3 HD capes
+// v3 (r57-test14): capes are 512x256, eight times the classic 64x32. On 64x32 the back of a cape is only 10x16
+// pixels and the 2048x1024 artwork was squeezed into that. Whether the game draws a cape this size is being tried.
+constexpr uint32_t CapeWidth = 512, CapeHeight = 256, CapeBytes = CapeWidth * CapeHeight * 4;
+constexpr uint32_t ClassicCapeWidth = 64, ClassicCapeHeight = 32, ClassicCapeBytes = ClassicCapeWidth * ClassicCapeHeight * 4;
+// A v2 (64x32) cape made 512x256 by repeating each pixel (a saved choice from before v3).
+inline void UpscaleClassicCape(const uint8_t* classic, uint8_t* out) {
+    const uint32_t f = CapeWidth / ClassicCapeWidth;
+    for (uint32_t y = 0; y < CapeHeight; ++y)
+        for (uint32_t x = 0; x < CapeWidth; ++x)
+            for (int c = 0; c < 4; ++c) out[(y * CapeWidth + x) * 4 + c] = classic[((y / f) * ClassicCapeWidth + x / f) * 4 + c];
+}
+enum class Cape : uint32_t { Account = 0, Founding = 1, Supporter = 2 /* shown as Standard */, Silver = 3, Creator = 4, Moderator = 5, Nebula = 6 };
 enum class Operation : uint32_t { Skin = 0, Cape = 1 };
 enum class Result : uint32_t { None = 0, Sent = 1, NoPlayer = 2, Failed = 3, Saved = 4, Unsupported = 5 };
 struct Request {
@@ -205,11 +229,22 @@ inline bool Valid(const Request& data, uint32_t pid) {
     return data.magic == RequestMagic && data.version == RequestVersion && data.size == sizeof(Request) && data.pid == pid;
 }
 
+// A cape id this build knows (0 = your own, 1..4 OriginX capes).
+inline bool KnownCape(uint32_t id) { return id <= static_cast<uint32_t>(Cape::Nebula); }
+
 // The skin of a request, checked: the size must be a classic skin shape and the bytes must fit.
 inline bool UsableRequest(const Request& r) {
     return r.width >= 64 && r.width <= MaxSide && r.width % 64 == 0 && (r.height == r.width || r.height == r.width / 2) &&
-        r.capeId <= static_cast<uint32_t>(Cape::Supporter);
+        r.capeId <= static_cast<uint32_t>(Cape::Nebula);
 }
+// A cape-less native echo may retain the saved cape only when picture and arm model match exactly.
+inline bool MatchesCapeEcho(const Request& desired, uint32_t width, uint32_t height, bool slim,
+                            const std::vector<uint8_t>& rgba) {
+    const size_t size = static_cast<size_t>(desired.width) * desired.height * 4;
+    return desired.capeId != 0 && UsableRequest(desired) && width == desired.width && height == desired.height &&
+           slim == (desired.slim != 0) && rgba.size() == size && std::memcmp(rgba.data(), desired.rgba, size) == 0;
+}
+
 
 #ifdef _WIN32
 class Channel {
@@ -347,7 +382,7 @@ public:
         return sent;
     }
     bool SendCape(DWORD pid, uint32_t cape, const std::vector<uint8_t>& rgba, uint32_t& serial) {
-        if (!data_ || cape > 2 || (cape && rgba.size() != CapeBytes) || !Lock(20)) return false;
+        if (!data_ || cape > 6 || (cape && rgba.size() != CapeBytes) || !Lock(20)) return false;
         bool sent = false;
         if (Valid(*data_, pid) && data_->serial == data_->handled) {
             data_->operation = static_cast<uint32_t>(Operation::Cape);
@@ -361,7 +396,7 @@ public:
         return sent;
     }
     void PublishCapeChoice(DWORD pid, uint32_t cape) {
-        if (!data_ || cape > 2 || !Lock(20)) return;
+        if (!data_ || cape > 6 || !Lock(20)) return;
         if (Valid(*data_, pid)) data_->equippedCapeId = cape;
         Unlock();
     }
@@ -369,7 +404,7 @@ public:
         if (!data_ || !Lock()) return 0;
         const uint32_t choice = Valid(*data_, pid) ? data_->equippedCapeId : 0;
         Unlock();
-        return choice <= 2 ? choice : 0;
+        return KnownCape(choice) ? choice : 0;
     }
     // HUD: the DLL's answer to `serial` (Result::None while it has not answered yet).
     Result Answer(DWORD pid, uint32_t serial) {

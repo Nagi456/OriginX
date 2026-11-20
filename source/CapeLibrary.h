@@ -7,11 +7,11 @@
 // PlayerSkin cape uses a standard 64x32 atlas, decoded once when the Closet first needs it.
 namespace CapeLibrary {
 inline const wchar_t* Name(uint32_t id) {
-    return id == 1 ? L"Founding" : id == 2 ? L"Supporter" : L"元のマント";
+    return id == 1 ? L"Founder" : id == 2 ? L"Member" : id == 3 ? L"Patron" : id == 4 ? L"Creator" : id == 5 ? L"Moderator" : id == 6 ? L"Nebula" : L"なし";   // id 2 (blue) is free for everyone: named after the roles (2026-11-13)
 }
 inline bool Load(uint32_t id, std::vector<uint8_t>& rgba) {
     rgba.clear();
-    if (id < 1 || id > 2) return false;
+    if (id < 1 || id > 6) return false;
     const HMODULE module = GetModuleHandleW(nullptr);
     if (!module) return false;
     const HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(100 + id), MAKEINTRESOURCEW(10));

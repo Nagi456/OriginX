@@ -15,6 +15,18 @@ namespace LitePack {
 
 namespace fs = std::filesystem;
 
+// Keep failed pack updates pending, with bounded retry traffic on the HUD thread.
+struct HomeBrandRetry {
+    bool target = false, settled = false, attempted = false;
+    uint64_t last = 0;
+    bool Due(bool wanted, uint64_t now) const {
+        return wanted != target || (!settled && (!attempted || (now >= last && now - last >= 2000)));
+    }
+    void Finished(bool wanted, bool ok, uint64_t now) {
+        target = wanted; settled = ok; attempted = true; last = now;
+    }
+};
+
 inline const char* kPackUuid = "0f1e7a3c-5d2b-4c8e-9a61-4f0b7c2d9e11";
 // A dedicated repository source, containing only the generated pack. Do not rescan or register every user's
 // Minecraft resource_packs directory just to discover this one pack.
@@ -27,6 +39,8 @@ inline const char* kModuleUuid = "6b9d1c42-83a7-4e55-b0f3-2a7e8c4d1f22";
 struct Options {
     bool clouds = true, sky = true, fog = true, weather = true;
     bool fastUi = false, leftHand = false;
+    bool javaChat = false;   // Java Chat: the game's own chat moved to the bottom left (ui/hud_screen.json)
+    bool homeBrand = false;  // legacy option; shared Lite writes never emit branding (HomeBrandPack owns it)
     bool noCrit = false, noPotion = false;   // No Critical Hit Effect / No Potion Effect
     bool noParticles = false, noShadows = false;   // No particles (every one the game defines) / No shadows
     // Particle identifiers to silence for those (found in the game's own pack, see MatchParticles).
@@ -193,6 +207,8 @@ inline int ContentVersion(const Options& o)
 {
     std::string key;
     for (bool b : {o.clouds, o.sky, o.fog, o.weather, o.fastUi, o.leftHand, o.noCrit, o.noPotion}) key += b ? '1' : '0';
+    if (o.javaChat) key += "|j1";
+    if (o.homeBrand) key += "|home-brand1";
     if (o.noParticles || o.noShadows) key += std::string("|x") + (o.noParticles ? '1' : '0') + (o.noShadows ? '1' : '0');
     if (o.noCrit) for (const auto& id : o.critParticles) key += "|c" + id;
     if (o.noPotion) for (const auto& id : o.potionParticles) key += "|p" + id;
@@ -230,6 +246,93 @@ inline std::string FogJson()
            "        \"render_distance_type\": \"render\"\n      }\n    }\n  }\n}\n";
 }
 
+// Patch only the existing version label; retain the game's font, anchors, color and background.
+// #version remains a native binding (e.g. v26.51 or v26.60), not a HUD/launcher version guess.
+inline const char* HomeBrandJson()
+{
+    return R"JSON({
+  "namespace": "start",
+  "version/label": {
+    "text": "#originx_version",
+    "modifications": [
+      {
+        "array_name": "bindings",
+        "operation": "insert_back",
+        "value": [
+          {
+            "binding_type": "view",
+            "source_property_name": "('OriginX Client ' + #version)",
+            "target_property_name": "#originx_version"
+          }
+        ]
+      }
+    ]
+  }
+}
+)JSON";
+}
+
+// Java Chat: the game's own chat (hud.chat_panel), not a copy of it, moved from the top left to the bottom left
+// above the hotbar, as in Java Edition. The vanilla "chat_stack" (top left: paper doll / GUI paddings, position,
+// days played, tips, chat) is replaced by the same stack without the chat, and the chat is added on its own at the
+// bottom left with the same visibility binding. Only the layout changes: the game still makes, times and fades
+// every message.
+inline const char* JavaChatHudJson()
+{
+    return R"JSON({
+  "namespace": "hud",
+  "root_panel": {
+    "modifications": [
+      {
+        "array_name": "controls",
+        "operation": "replace",
+        "control_name": "chat_stack",
+        "value": {
+          "chat_stack": {
+            "type": "stack_panel",
+            "orientation": "vertical",
+            "size": [ "40%", "100%" ],
+            "anchor_from": "top_left",
+            "anchor_to": "top_left",
+            "controls": [
+              { "paper_doll_padding": { "type": "panel", "size": [ "100%", 50 ],
+                  "bindings": [ { "binding_name": "#paper_doll_visible" },
+                                { "binding_name": "#editor_chat_layout_active", "binding_condition": "always" },
+                                { "binding_type": "view", "source_property_name": "(#paper_doll_visible and not #editor_chat_layout_active)", "target_property_name": "#visible" } ] } },
+              { "non_centered_gui_padding": { "type": "panel", "size": [ "100%", 32 ],
+                  "bindings": [ { "binding_name": "#hud_visible_not_centered", "binding_type": "global" },
+                                { "binding_name": "#editor_chat_layout_active", "binding_condition": "always" },
+                                { "binding_type": "view", "source_property_name": "(#hud_visible_not_centered and not #editor_chat_layout_active)", "target_property_name": "#visible" } ] } },
+              { "player_position@hud.player_position": {} },
+              { "number_of_days_played@hud.number_of_days_played": {} },
+              { "game_tip@game_tip.game_tip_chat_stack_factory": { "size": [ "100%", "100%c" ] } }
+            ],
+            "bindings": [ { "binding_name": "#editor_chat_offset", "binding_name_override": "#offset", "binding_condition": "always" } ]
+          }
+        }
+      },
+      {
+        "array_name": "controls",
+        "operation": "insert_back",
+        "value": [
+          {
+            "originx_java_chat@hud.chat_panel": {
+              "anchor_from": "bottom_left",
+              "anchor_to": "bottom_left",
+              "offset": [ 2, -48 ],
+              "size": [ "40%", "100%c" ],
+              "max_size": [ "40%", "50%" ],
+              "bindings": [ { "binding_name": "#editor_chat_visible", "binding_name_override": "#visible", "binding_condition": "always" } ]
+            }
+          }
+        ]
+      }
+    ]
+  }
+}
+)JSON";
+}
+
 // Fast Inventory: the vanilla screen transitions (ui/_global_variables.json, 0.25-0.6 s) cut to 0.1 s.
 // Only these variables are listed, so the rest of the game's global UI variables stay untouched.
 inline const char* kFastUiSeconds = "0.1";
@@ -265,10 +368,11 @@ inline bool WriteFile(const fs::path& path, const std::string& data)
     return static_cast<bool>(out);
 }
 
-inline void Remove(const fs::path& path)
+inline bool Remove(const fs::path& path)
 {
     std::error_code ec;
     fs::remove(path, ec);
+    return !ec; // an already absent file is also a successful cleanup
 }
 
 // Rewrites the pack folder to match the options. Returns false if a file could not be written.
@@ -289,6 +393,11 @@ inline bool Write(const fs::path& folder, const Options& o)
     if (o.fog) ok = WriteFile(fog, FogJson()) && ok; else Remove(fog);
     const fs::path hand = folder / "animations" / "player_firstperson.animation.json";
     if (o.leftHand) ok = WriteFile(hand, kLeftHandAnimations) && ok; else Remove(hand);
+    const fs::path hud = folder / "ui" / "hud_screen.json";
+    ok = Remove(hud) && ok; // migrated to the OriginX-only JavaChatPack source
+    const fs::path start = folder / "ui" / "start_screen.json";
+    // Home branding belongs exclusively to the session-only generated source, never a shared Lite copy.
+    ok = Remove(start) && ok;
     const fs::path ui = folder / "ui" / "_global_variables.json";
     if (o.fastUi) ok = WriteFile(ui, FastUiJson()) && ok; else Remove(ui);
     // Silenced particles: the folder holds only what is switched on now.
